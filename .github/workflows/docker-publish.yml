@@ -20,7 +20,9 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  SINGBOX_TAGS: with_gvisor,with_quic,with_wireguard,with_utls
+  # with_quic conflicts with bogdanfinn/tls-client's quic-go/qpack version;
+  # Hysteria/TUIC remain available via rebuild with with_quic after resolving deps.
+  SINGBOX_TAGS: with_gvisor,with_wireguard,with_utls
 
 jobs:
   verify:

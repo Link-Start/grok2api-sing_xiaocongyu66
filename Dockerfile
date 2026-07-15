@@ -42,7 +42,8 @@ COPY backend/cmd ./cmd
 COPY backend/internal ./internal
 COPY backend/docs/docs.go ./docs/docs.go
 # Align with sing-box client defaults: full outbound protocols in-process.
-ARG SINGBOX_TAGS="with_gvisor,with_quic,with_wireguard,with_utls"
+# Default image tags: full proxy set except Hysteria/TUIC (needs with_quic + qpack pin).
+ARG SINGBOX_TAGS="with_gvisor,with_wireguard,with_utls"
 RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=grok2api-go-build,target=/root/.cache/go-build,sharing=locked \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
