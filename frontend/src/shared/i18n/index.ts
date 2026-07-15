@@ -8,7 +8,7 @@ const resources = {
       accountBulk: {
         convertAllToBuild: "转换为 Build",
         convertAllToBuildTitle: "转换所有 Grok Web 账号？",
-        convertAllToBuildDescription: "将转换号池内全部尚未关联、且已启用/状态正常的 Grok Web 账号（失效账号自动跳过），最多 1000 个，并按系统并发执行。",
+        convertAllToBuildDescription: "将转换号池内全部尚未关联、且已启用/状态正常的 Grok Web 账号（失效账号自动跳过），大号池会自动分批，并按系统并发执行。",
       },
       webConsoleSync: {
         action: "转换为 Console",
@@ -740,7 +740,7 @@ const resources = {
       accountBulk: {
         convertAllToBuild: "Convert to Build",
         convertAllToBuildTitle: "Convert all Grok Web accounts?",
-        convertAllToBuildDescription: "Convert up to 1000 unlinked, enabled, healthy Grok Web accounts (invalid accounts are skipped), using the configured concurrency limit.",
+        convertAllToBuildDescription: "Convert every unlinked, enabled, healthy Grok Web account (invalid accounts are skipped). Large pools are processed in batches with the configured concurrency limit.",
       },
       webConsoleSync: {
         action: "Convert to Console",

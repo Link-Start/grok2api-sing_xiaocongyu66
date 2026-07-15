@@ -1313,18 +1313,67 @@ func (s *Service) SyncWebAccountsToConsoleWithProgress(ctx context.Context, ids 
 }
 
 // SyncAllWebAccountsToConsoleWithProgress 同步完整 Web 号池，避免前端分页遗漏账号。
+// Large pools are processed in chunks of maxWebConsoleSyncAccounts.
 func (s *Service) SyncAllWebAccountsToConsoleWithProgress(ctx context.Context, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
-	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
-		Page:   repository.PageQuery{Limit: maxWebConsoleSyncAccounts + 1},
+	// First page also gives total so progress can report overall completion.
+	first, total, err := s.accounts.List(ctx, repository.AccountListQuery{
+		Page:   repository.PageQuery{Limit: maxWebConsoleSyncAccounts, Offset: 0},
 		Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderWeb)},
 	})
 	if err != nil {
 		return ImportResult{}, err
 	}
-	if total > maxWebConsoleSyncAccounts || len(values) > maxWebConsoleSyncAccounts {
-		return ImportResult{}, invalidInput("Grok Web 账号超过 1000 个，请分批勾选同步")
+	if total == 0 || len(first) == 0 {
+		if progress != nil {
+			if err := progress(0, 0); err != nil {
+				return ImportResult{}, err
+			}
+		}
+		return ImportResult{}, nil
 	}
-	return s.syncWebCredentialsToConsole(ctx, values, observer, progress)
+	overall := ImportResult{}
+	processed := 0
+	offset := 0
+	report := func(chunkCompleted, _ int) error {
+		if progress == nil {
+			return nil
+		}
+		// Map chunk-local progress onto overall pool size.
+		return progress(processed+chunkCompleted, int(total))
+	}
+	for {
+		var values []accountdomain.Credential
+		if offset == 0 {
+			values = first
+		} else {
+			values, _, err = s.accounts.List(ctx, repository.AccountListQuery{
+				Page:   repository.PageQuery{Limit: maxWebConsoleSyncAccounts, Offset: offset},
+				Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderWeb)},
+			})
+			if err != nil {
+				return overall, err
+			}
+		}
+		if len(values) == 0 {
+			break
+		}
+		chunk, chunkErr := s.syncWebCredentialsToConsole(ctx, values, observer, report)
+		overall.Created += chunk.Created
+		overall.Updated += chunk.Updated
+		overall.AccountIDs = append(overall.AccountIDs, chunk.AccountIDs...)
+		processed += len(values)
+		if chunkErr != nil {
+			return overall, chunkErr
+		}
+		if len(values) < maxWebConsoleSyncAccounts {
+			break
+		}
+		offset += len(values)
+		if int64(offset) >= total {
+			break
+		}
+	}
+	return overall, nil
 }
 
 func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []accountdomain.Credential, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
@@ -1396,15 +1445,14 @@ func (s *Service) ConvertAllWebAccountsToBuildWithObserver(ctx context.Context, 
 }
 
 // ConvertAllWebAccountsToBuildWithProgress 转换完整未关联号池，并向调用方报告真实完成数。
+// Large pools are snapshotted once then converted in chunks of maxBuildConversionAccounts
+// so failed accounts are not retried endlessly within the same run.
 func (s *Service) ConvertAllWebAccountsToBuildWithProgress(ctx context.Context, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
-	ids, err := s.accounts.ListUnlinkedWebAccountIDs(ctx, maxBuildConversionAccounts+1)
+	allIDs, err := s.accounts.ListUnlinkedWebAccountIDs(ctx, 0)
 	if err != nil {
 		return BuildConversionResult{}, err
 	}
-	if len(ids) > maxBuildConversionAccounts {
-		return BuildConversionResult{}, invalidInput("未关联账号超过 1000 个，请分批勾选转换")
-	}
-	if len(ids) == 0 {
+	if len(allIDs) == 0 {
 		if progress != nil {
 			if err := progress(0, 0); err != nil {
 				return BuildConversionResult{}, err
@@ -1412,7 +1460,41 @@ func (s *Service) ConvertAllWebAccountsToBuildWithProgress(ctx context.Context, 
 		}
 		return BuildConversionResult{}, nil
 	}
-	return s.convertWebAccountsToBuild(ctx, ids, observer, progress)
+	totalEligible := len(allIDs)
+	overall := BuildConversionResult{BuildAccountIDs: make([]uint64, 0)}
+	seenBuild := make(map[uint64]struct{})
+	for start := 0; start < len(allIDs); start += maxBuildConversionAccounts {
+		if err := ctx.Err(); err != nil {
+			return overall, err
+		}
+		end := start + maxBuildConversionAccounts
+		if end > len(allIDs) {
+			end = len(allIDs)
+		}
+		ids := allIDs[start:end]
+		chunkProgress := func(completed, _ int) error {
+			if progress == nil {
+				return nil
+			}
+			return progress(start+completed, totalEligible)
+		}
+		chunk, chunkErr := s.convertWebAccountsToBuild(ctx, ids, observer, chunkProgress)
+		overall.Created += chunk.Created
+		overall.Linked += chunk.Linked
+		overall.Skipped += chunk.Skipped
+		overall.Failed += chunk.Failed
+		for _, buildID := range chunk.BuildAccountIDs {
+			if _, ok := seenBuild[buildID]; ok {
+				continue
+			}
+			seenBuild[buildID] = struct{}{}
+			overall.BuildAccountIDs = append(overall.BuildAccountIDs, buildID)
+		}
+		if chunkErr != nil {
+			return overall, chunkErr
+		}
+	}
+	return overall, nil
 }
 
 func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {

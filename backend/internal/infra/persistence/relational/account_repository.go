@@ -259,21 +259,21 @@ func (r *AccountRepository) ListEnabledAccountIDs(ctx context.Context, provider 
 }
 
 func (r *AccountRepository) ListUnlinkedWebAccountIDs(ctx context.Context, limit int) ([]uint64, error) {
-	if limit < 1 {
-		return []uint64{}, nil
-	}
 	var ids []uint64
 	// Only healthy Web accounts: enabled + active auth. Failed/reauth accounts
 	// must not enter convert-all and burn proxies/device-flow attempts.
-	err := r.db.db.WithContext(ctx).
+	// limit <= 0 means return the full unlinked set (used for convert-all progress total).
+	query := r.db.db.WithContext(ctx).
 		Table("provider_accounts AS account").
 		Select("account.id").
 		Joins("LEFT JOIN account_provider_links AS link ON link.web_account_id = account.id").
 		Where("account.provider = ? AND account.enabled = ? AND account.auth_status = ? AND link.web_account_id IS NULL",
 			account.ProviderWeb, true, account.AuthStatusActive).
-		Order("account.id ASC").
-		Limit(limit).
-		Scan(&ids).Error
+		Order("account.id ASC")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	err := query.Scan(&ids).Error
 	return ids, err
 }
 

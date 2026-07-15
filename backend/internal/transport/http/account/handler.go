@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -711,7 +712,7 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64)
 	var total atomic.Int64
 	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
 	if err != nil {
-		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
+		stream.WriteError(accountStreamErrorCode(err, "accountConsoleSyncFailed"), accountStreamErrorMessage(err, "Grok Web 账号同步到 Console 失败"))
 		return
 	}
 	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
@@ -738,10 +739,42 @@ func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uin
 	var total atomic.Int64
 	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
 	if err != nil {
-		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
+		stream.WriteError(accountStreamErrorCode(err, "accountConversionFailed"), accountStreamErrorMessage(err, "Grok Web 账号转换失败"))
 		return
 	}
 	_ = stream.Write("complete", newBuildConversionResponse(result, syncResult))
+}
+
+func accountStreamErrorCode(err error, fallback string) string {
+	switch {
+	case errors.Is(err, accountapp.ErrInvalidInput), errors.Is(err, accountapp.ErrInvalidImport):
+		return "invalidRequest"
+	case errors.Is(err, accountapp.ErrConversionBusy):
+		return "accountConversionBusy"
+	case errors.Is(err, accountapp.ErrUnsupported):
+		return "accountOperationUnsupported"
+	case errors.Is(err, accountapp.ErrNotFound):
+		return "accountNotFound"
+	default:
+		return fallback
+	}
+}
+
+func accountStreamErrorMessage(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	if errors.Is(err, accountapp.ErrInvalidInput) || errors.Is(err, accountapp.ErrInvalidImport) ||
+		errors.Is(err, accountapp.ErrConversionBusy) || errors.Is(err, accountapp.ErrUnsupported) ||
+		errors.Is(err, accountapp.ErrNotFound) {
+		return err.Error()
+	}
+	// Prefer detailed message when present; keep fallback for opaque internals.
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return fallback
+	}
+	return msg
 }
 
 func newBuildConversionResponse(result accountapp.BuildConversionResult, syncResult accountsyncapp.Result) buildConversionResponse {
