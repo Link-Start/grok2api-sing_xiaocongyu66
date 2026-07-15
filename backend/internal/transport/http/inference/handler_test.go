@@ -314,6 +314,17 @@ func TestExtractUsageFromCompletedEvent(t *testing.T) {
 	}
 }
 
+func TestExtractUsageFromAnthropicAndChatCacheFields(t *testing.T) {
+	anthropic := extractMetadata([]byte(`{"id":"msg_1","type":"message","usage":{"input_tokens":20,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":12}}`))
+	if anthropic.Usage.CachedInputTokens != 12 || anthropic.Usage.InputTokens != 20 {
+		t.Fatalf("anthropic usage = %#v", anthropic.Usage)
+	}
+	chat := extractMetadata([]byte(`{"id":"chatcmpl_1","object":"chat.completion","usage":{"prompt_tokens":30,"completion_tokens":4,"total_tokens":34,"prompt_tokens_details":{"cached_tokens":18}}}`))
+	if chat.Usage.CachedInputTokens != 18 || chat.Usage.InputTokens != 30 || chat.Usage.OutputTokens != 4 {
+		t.Fatalf("chat usage = %#v", chat.Usage)
+	}
+}
+
 func TestUsageInspectorHandlesChunkedSSE(t *testing.T) {
 	inspector := &responseInspector{}
 	inspector.Inspect([]byte("data: {\"response\":{\"id\":\"resp_stream\",\"usage\":{\"input_tokens\":2,"))

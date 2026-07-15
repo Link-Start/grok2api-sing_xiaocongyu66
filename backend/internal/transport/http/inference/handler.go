@@ -928,10 +928,14 @@ type responseUsageDTO struct {
 	NumSourcesUsed         int64                     `json:"num_sources_used"`
 	NumServerSideToolsUsed int64                     `json:"num_server_side_tools_used"`
 	InputTokensDetails     responseInputDetailsDTO   `json:"input_tokens_details"`
+	PromptTokensDetails    responseInputDetailsDTO   `json:"prompt_tokens_details"` // OpenAI Chat Completions
 	OutputTokensDetails    responseOutputDetailsDTO  `json:"output_tokens_details"`
 	ContextDetails         responseContextDetailsDTO `json:"context_details"`
 	PromptTokens           int64                     `json:"prompt_tokens"`
 	CompletionTokens       int64                     `json:"completion_tokens"`
+	// Anthropic Messages cache fields (Web estimated prompt-cache hits).
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 }
 
 type responseInputDetailsDTO struct {
@@ -969,8 +973,19 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 	if total == 0 {
 		total = input + output
 	}
+	// Prompt-cache hits: Responses cached_tokens, Chat prompt_tokens_details, or Anthropic cache_read.
+	cached := value.InputTokensDetails.CachedTokens
+	if cached == 0 {
+		cached = value.PromptTokensDetails.CachedTokens
+	}
+	if cached == 0 {
+		cached = value.CacheReadInputTokens
+	}
+	if cached > input && input > 0 {
+		cached = input
+	}
 	return gateway.Usage{
-		InputTokens: input, CachedInputTokens: value.InputTokensDetails.CachedTokens,
+		InputTokens: input, CachedInputTokens: cached,
 		OutputTokens: output, ReasoningTokens: value.OutputTokensDetails.ReasoningTokens,
 		TotalTokens: total, CostInUSDTicks: value.CostInUSDTicks,
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,

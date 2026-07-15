@@ -133,6 +133,8 @@ Messages 转换层兼容 Claude Code 常见载荷：标准顶层 `system` 与误
 
 Grok Web 未提供与公开 API 等价的精确 Token 计量，因此聊天审计标记 `usageSource: estimated`；图片和视频标记 `usageSource: none`，不会伪造 Token，用量费用仅按已配置的官方媒体单价估算。
 
+Web 文本对话会估算 `input_tokens` / `output_tokens`；当客户端使用 `previous_response_id` 续轮时，上游已持有会话上下文，网关会把上一轮 `input+output` 记入 `input_tokens_details.cached_tokens`（Chat 为 `prompt_tokens_details.cached_tokens`，Messages 为 `cache_read_input_tokens`），便于看板与计费按缓存输入价估算。这不是 xAI 官方 cache 计量，而是对服务端会话复用的兼容近似。Grok Build / Console 仍原样透传上游返回的 `cached_tokens`，并用 `prompt_cache_key` 做账号粘滞以命中上游 prompt cache。
+
 Grok Web 付费账号使用 `GrokBuildBilling/GetGrokCreditsConfig` 返回的统一周额度池：保存真实使用百分比、产品枚举分解、周期起止和重置时间，并作为 Chat、Imagine、图片编辑和视频共享的路由总闸门。成功调用后异步刷新周池，不按未知权重进行本地伪扣减；耗尽后按真实周重置时间进入单次恢复队列。
 
 Free 账号先探测 gRPC 周池；没有有效周池时固定使用 `/rest/rate-limits` 的 `fast` 窗口及其真实重置时间。明确导入为 Super/Heavy 的账号只请求 gRPC 周池；`auto` 账号发现有效周池后先归为 Super，Heavy 需由导入等级明确指定，直到获得可验证的官方等级字段。全量同步会替换旧额度快照，避免升降级后残留窗口误导路由和 UI。
