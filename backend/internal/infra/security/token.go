@@ -87,12 +87,14 @@ func NewHexToken(bytesLength int) (string, error) {
 }
 
 // HashToken returns a fast, irreversible SHA-256 hex digest for API-key / refresh-token
-// lookup indexes and rate-limit keys. This is not password storage: secrets are high-entropy
-// random tokens, compared with constant-time equality after hashing.
+// lookup indexes and rate-limit keys.
 //
-// codeql[go/weak-sensitive-data-hashing]: intentional SHA-256 fingerprint for opaque tokens, not password KDF
+// Not password storage: inputs are high-entropy opaque tokens (client keys, refresh
+// tokens, rate-limit subjects). Password-style KDFs (bcrypt/scrypt/argon2) would make
+// O(1) auth lookup impossible; comparison is constant-time on the digest.
 func HashToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
+	// codeql[go/weak-sensitive-data-hashing]: SHA-256 fingerprint of opaque API tokens for DB lookup, not a password KDF
+	sum := sha256.Sum256([]byte(raw)) // lgtm[go/weak-sensitive-data-hashing]
 	return hex.EncodeToString(sum[:])
 }
 
