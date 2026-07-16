@@ -500,6 +500,8 @@ func (s *Service) DeleteFailedAccounts(ctx context.Context, providerValue accoun
 	if !providerValue.IsValid() {
 		return 0, ErrInvalidInput
 	}
+	// Map to a fixed label so logs never carry raw request strings (CodeQL log-injection).
+	providerLog := providerLogLabel(providerValue)
 	const chunk = 500
 	const maxRounds = 20000 // safety: 20000 * 500 = 10M rows
 	var deleted int64
@@ -514,14 +516,14 @@ func (s *Service) DeleteFailedAccounts(ctx context.Context, providerValue accoun
 		}
 		if len(ids) == 0 {
 			if s.logger != nil {
-				s.logger.Info("delete_failed_accounts_done", "provider", providerValue, "include_disabled", includeDisabled, "deleted", deleted, "rounds", round)
+				s.logger.Info("delete_failed_accounts_done", "provider", providerLog, "include_disabled", includeDisabled, "deleted", deleted, "rounds", round)
 			}
 			return deleted, nil
 		}
 		n, err := s.BatchDelete(ctx, ids)
 		deleted += n
 		if s.logger != nil {
-			s.logger.Info("delete_failed_accounts_chunk", "provider", providerValue, "batch", len(ids), "deleted_rows", n, "total_deleted", deleted)
+			s.logger.Info("delete_failed_accounts_chunk", "provider", providerLog, "batch", len(ids), "deleted_rows", n, "total_deleted", deleted)
 		}
 		if err != nil {
 			return deleted, err
@@ -532,12 +534,25 @@ func (s *Service) DeleteFailedAccounts(ctx context.Context, providerValue accoun
 		}
 		if len(ids) < chunk {
 			if s.logger != nil {
-				s.logger.Info("delete_failed_accounts_done", "provider", providerValue, "include_disabled", includeDisabled, "deleted", deleted, "rounds", round+1)
+				s.logger.Info("delete_failed_accounts_done", "provider", providerLog, "include_disabled", includeDisabled, "deleted", deleted, "rounds", round+1)
 			}
 			return deleted, nil
 		}
 	}
 	return deleted, fmt.Errorf("%w: 删除失效账号超过安全轮次上限", ErrInvalidInput)
+}
+
+func providerLogLabel(providerValue accountdomain.Provider) string {
+	switch providerValue {
+	case accountdomain.ProviderBuild:
+		return "grok_build"
+	case accountdomain.ProviderWeb:
+		return "grok_web"
+	case accountdomain.ProviderConsole:
+		return "grok_console"
+	default:
+		return "unknown"
+	}
 }
 
 // SSOEmailDedupResult summarizes email-based SSO token deduplication.
@@ -826,10 +841,9 @@ func (s *Service) ValidateAccounts(ctx context.Context, ids []uint64, progress B
 	})
 	s.logBatchSummary("account_validate", s.syncPool, summary, runErr)
 	result := AccountValidationResult{Total: len(ids)}
-	for index, execution := range results {
+	for _, execution := range results {
 		item := execution.Value
 		if execution.Err != nil {
-			item.id = ids[index]
 			item.err = execution.Err
 		}
 		if item.skipped {

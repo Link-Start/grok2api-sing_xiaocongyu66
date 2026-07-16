@@ -634,10 +634,11 @@ func validateAPIKeyHeaders(headers []string) error {
 			return errors.New("auth.apiKeyHeaders 无需重复配置 Authorization 或 X-API-Key")
 		}
 		if !isHTTPHeaderToken(name) {
-			return fmt.Errorf("auth.apiKeyHeaders 含非法头名 %q", name)
+			// Do not echo the raw header name into errors (may surface in logs).
+			return errors.New("auth.apiKeyHeaders 含非法头名")
 		}
 		if _, ok := seen[lower]; ok {
-			return fmt.Errorf("auth.apiKeyHeaders 重复: %s", name)
+			return errors.New("auth.apiKeyHeaders 存在重复项")
 		}
 		seen[lower] = struct{}{}
 	}
