@@ -6,6 +6,8 @@ import (
 )
 
 // Known client type IDs stored on request audits and shown on the dashboard.
+// Product IDs follow common CLI/agent names; runtime IDs (go/python/…) match
+// agent-traffic-classifier "programmatic" class (library UA, not a product).
 const (
 	ClaudeCode = "claude_code"
 	Codex      = "codex"
@@ -19,6 +21,10 @@ const (
 	RooCode    = "roo_code"
 	Windsurf   = "windsurf"
 	ZCode      = "zcode"
+	GeminiCLI  = "gemini_cli" // Google-Gemini-CLI (agent-traffic-classifier)
+	Kiro       = "kiro"       // Amazon Kiro-CLI
+	MCP        = "mcp"        // ModelContextProtocol clients
+	Copilot    = "copilot"    // VS Code / GitHub Copilot agent UA contains "Code/"
 	OpenAISDK  = "openai_sdk"
 	Anthropic  = "anthropic_sdk"
 	NodeHTTP   = "node"
@@ -26,13 +32,17 @@ const (
 	GoHTTP     = "go"
 	JavaHTTP   = "java"
 	RustHTTP   = "rust"
+	RubyHTTP   = "ruby"
+	PerlHTTP   = "perl"
 	Curl       = "curl"
+	Wget       = "wget"
 	// Legacy is empty client_type on audits written before client detection existed.
 	Legacy  = "legacy"
 	Unknown = "unknown"
 )
 
 // Labels maps stable IDs to short dashboard labels (codex:60 style).
+// "Go 客户端" = programmatic Go net/http default UA, not a mystery product.
 var Labels = map[string]string{
 	ClaudeCode: "Claude Code",
 	Codex:      "Codex",
@@ -46,14 +56,21 @@ var Labels = map[string]string{
 	RooCode:    "Roo Code",
 	Windsurf:   "Windsurf",
 	ZCode:      "ZCode",
+	GeminiCLI:  "Gemini CLI",
+	Kiro:       "Kiro",
+	MCP:        "MCP Client",
+	Copilot:    "GitHub Copilot",
 	OpenAISDK:  "OpenAI SDK",
 	Anthropic:  "Anthropic SDK",
-	NodeHTTP:   "Node",
-	PythonHTTP: "Python",
+	NodeHTTP:   "Node / undici",
+	PythonHTTP: "Python HTTP",
 	GoHTTP:     "Go 客户端",
-	JavaHTTP:   "Java",
-	RustHTTP:   "Rust",
+	JavaHTTP:   "Java / OkHttp",
+	RustHTTP:   "Rust HTTP",
+	RubyHTTP:   "Ruby HTTP",
+	PerlHTTP:   "Perl",
 	Curl:       "curl",
+	Wget:       "Wget",
 	Legacy:     "历史请求",
 	Unknown:    "未知客户端",
 }
@@ -105,13 +122,24 @@ func Detect(userAgent string, headers map[string]string) string {
 		return id
 	}
 
-	// User-Agent / originator product tokens (multi-agent and IDE clients first).
+	// Product / agent UA tokens first (patterns aligned with agent-traffic-classifier
+	// defaults/agents.ts + bots.json "agent" category, plus our gateway-specific list).
 	switch {
-	case matchAny(ua, "claude-code", "claude-cli", "claude_code", "claude code", "@anthropic-ai/claude-code"):
+	// Anthropic coding agents (ATC: Claude-User / Claude-Agent)
+	case matchAny(ua, "claude-user", "claude-agent", "claude-code", "claude-cli", "claude_code", "claude code", "@anthropic-ai/claude-code"):
 		return ClaudeCode
 	case matchAny(ua, "codex_cli_rs", "codex-cli", "openai-codex", "gpt-codex", "openai codex", "codex/") ||
 		matchAny(originator, "codex_cli_rs", "codex-cli"):
 		return Codex
+	case matchAny(ua, "google-gemini-cli", "gemini-cli", "gemini cli"):
+		return GeminiCLI
+	case matchAny(ua, "kiro-cli", "kiro/"):
+		return Kiro
+	case matchAny(ua, "modelcontextprotocol", "mcp-client", "mcp/"):
+		return MCP
+	// VS Code Copilot agent traffic often includes "Code/" (ATC pattern); avoid bare "code".
+	case matchAny(ua, "github copilot", "copilot/") || (strings.Contains(ua, "code/") && matchAny(ua, "vscode", "visual studio", "copilot")):
+		return Copilot
 	case matchAny(ua, "hermes-agent", "hermes-cli", "hermes/", "nous-hermes", "openhermes", "hermes agent"):
 		return Hermes
 	case matchAny(ua, "opencode", "open-code", "sst/opencode", "anomalyco/opencode"):
@@ -143,19 +171,27 @@ func Detect(userAgent string, headers map[string]string) string {
 	// pure Anthropic SDK usually sets anthropic/ or @anthropic-ai/sdk in UA.
 	case hasHeader(headers, "anthropic-version") && (ua == "" || matchAny(ua, "node", "undici", "axios", "fetch")):
 		return ClaudeCode
-	case matchAny(ua, "python-httpx", "python-requests", "aiohttp/", "httpx/", "python-urllib"):
+	// Programmatic HTTP libraries (agent-traffic-classifier DEFAULT_PROGRAMMATIC).
+	// These are language runtimes, not product names — UI labels explain that.
+	case matchAny(ua, "python-httpx", "python-requests", "aiohttp/", "httpx/", "python-urllib", "urllib", "trafilatura"):
 		return PythonHTTP
-	case matchAny(ua, "node-fetch", "undici", "axios/", "got/", "node.js", "nodejs"):
+	case matchAny(ua, "node-fetch", "undici", "axios/", "got/", "got (", "node.js", "nodejs", "bun/"):
 		return NodeHTTP
-	// Go default transport + common Go HTTP stacks (often empty product name).
-	case matchAny(ua, "go-http-client", "go-resty", "fasthttp", "go-http/", "golang/", "net/http"):
+	// Go default transport — this is the "Go 客户端" you see in audits (not mysterious).
+	case matchAny(ua, "go-http-client", "go-resty", "fasthttp", "go-http/", "golang/", "net/http", "colly"):
 		return GoHTTP
 	case matchAny(ua, "okhttp", "apache-httpclient", "java/"):
 		return JavaHTTP
 	case matchAny(ua, "reqwest", "rustls", "ureq/"):
 		return RustHTTP
-	case matchAny(ua, "curl/"):
+	case matchAny(ua, "http.rb", "ruby", "faraday"):
+		return RubyHTTP
+	case matchAny(ua, "libwww-perl", "lwp::", "www-mechanize"):
+		return PerlHTTP
+	case matchAny(ua, "curl/", "curl "):
 		return Curl
+	case matchAny(ua, "wget/", "wget "):
+		return Wget
 	// Federated social stacks that call OpenAI-compatible gateways.
 	case matchAny(ua, "misskey/", "sharkey/", "megalodon/", "firefish/", "iceshrimp/"):
 		return OpenAISDK
@@ -178,10 +214,18 @@ func detectFromProductToken(token string) string {
 		return Unknown
 	}
 	switch {
-	case matchAny(token, "claude-code", "claude_code", "claude code", "claude-cli"):
+	case matchAny(token, "claude-code", "claude_code", "claude code", "claude-cli", "claude-user", "claude-agent"):
 		return ClaudeCode
 	case matchAny(token, "codex"):
 		return Codex
+	case matchAny(token, "gemini-cli", "gemini_cli", "google-gemini"):
+		return GeminiCLI
+	case matchAny(token, "kiro"):
+		return Kiro
+	case matchAny(token, "mcp", "modelcontextprotocol"):
+		return MCP
+	case matchAny(token, "copilot"):
+		return Copilot
 	case matchAny(token, "hermes"):
 		return Hermes
 	case matchAny(token, "opencode", "open-code"):
@@ -210,6 +254,8 @@ func detectFromProductToken(token string) string {
 		return GoHTTP
 	case matchAny(token, "curl"):
 		return Curl
+	case matchAny(token, "wget"):
+		return Wget
 	default:
 		return Unknown
 	}

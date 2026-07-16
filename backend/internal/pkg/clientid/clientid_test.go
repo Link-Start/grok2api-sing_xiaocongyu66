@@ -91,3 +91,32 @@ func TestDetectProductHeadersAndGo(t *testing.T) {
 		t.Fatalf("unknown = %s", got)
 	}
 }
+
+func TestDetectATCPatterns(t *testing.T) {
+	// agent-traffic-classifier curated agent UAs
+	if got := Detect("Claude-User/1.0", nil); got != ClaudeCode {
+		t.Fatalf("Claude-User = %s", got)
+	}
+	if got := Detect("Google-Gemini-CLI/0.1", nil); got != GeminiCLI {
+		t.Fatalf("Gemini CLI = %s", got)
+	}
+	if got := Detect("Kiro-CLI/1.0", nil); got != Kiro {
+		t.Fatalf("Kiro = %s", got)
+	}
+	if got := Detect("ModelContextProtocol/1.0", nil); got != MCP {
+		t.Fatalf("MCP = %s", got)
+	}
+	// programmatic libraries (ATC DEFAULT_PROGRAMMATIC)
+	if got := Detect("httpx/0.27.0", nil); got != PythonHTTP {
+		t.Fatalf("httpx = %s", got)
+	}
+	if got := Detect("undici", nil); got != NodeHTTP {
+		t.Fatalf("undici = %s", got)
+	}
+	if got := Detect("Go-http-client/2.0", nil); got != GoHTTP {
+		t.Fatalf("go = %s", got)
+	}
+	if got := Detect("Wget/1.21", nil); got != Wget {
+		t.Fatalf("wget = %s", got)
+	}
+}
