@@ -1,12 +1,24 @@
 package app
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 )
 
-func TestClampBatchForDatabaseReservesRequestPath(t *testing.T) {
+func TestMaxBatchConcurrencyUsesConfiguredValues(t *testing.T) {
+	got := maxBatchConcurrency(config.BatchConfig{
+		ImportConcurrency: 3, ConversionConcurrency: 7,
+		SyncConcurrency: 5, RefreshConcurrency: 12,
+	})
+	if got != 12 {
+		t.Fatalf("max = %d want 12", got)
+	}
+}
+
+func TestWarnBatchVsPostgresDoesNotPanic(t *testing.T) {
+	// Smoke: high settings only warn; concurrency stays as configured by caller.
 	cfg := config.Config{
 		Database: config.DatabaseConfig{
 			Driver:   "postgres",
@@ -17,19 +29,8 @@ func TestClampBatchForDatabaseReservesRequestPath(t *testing.T) {
 			SyncConcurrency: 25, RefreshConcurrency: 25,
 		},
 	}
-	got := clampBatchForDatabase(cfg)
-	// half of 20 = 10 budget; refresh capped further.
-	if got.ImportConcurrency != 10 || got.ConversionConcurrency != 10 || got.SyncConcurrency != 10 {
-		t.Fatalf("import/sync/conversion = %#v", got)
-	}
-	if got.RefreshConcurrency != 8 {
-		t.Fatalf("refresh = %d want 8", got.RefreshConcurrency)
-	}
-
-	// SQLite must not clamp.
-	cfg.Database.Driver = "sqlite"
-	got = clampBatchForDatabase(cfg)
-	if got.RefreshConcurrency != 25 {
-		t.Fatalf("sqlite refresh clamped unexpectedly: %d", got.RefreshConcurrency)
+	warnBatchVsPostgres(slog.Default(), cfg)
+	if cfg.Batch.RefreshConcurrency != 25 {
+		t.Fatalf("settings must not be mutated, got refresh=%d", cfg.Batch.RefreshConcurrency)
 	}
 }
