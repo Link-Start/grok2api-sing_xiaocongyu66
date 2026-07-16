@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/toolslimit"
 )
 
 func convertMessagesRequest(body []byte, model string) ([]byte, ResponseOptions, error) {
@@ -487,8 +489,9 @@ func markAnthropicToolError(output any) any {
 }
 
 func convertAnthropicTools(tools []map[string]json.RawMessage) ([]any, error) {
-	if len(tools) > maxUpstreamTools {
-		return nil, fmt.Errorf("tools 数量超过上游上限：提供了 %d 个，最多 %d 个（xAI/Grok Build 限制）", len(tools), maxUpstreamTools)
+	toolslimit.Observe(len(tools))
+	if err := toolslimit.Check(len(tools)); err != nil {
+		return nil, err
 	}
 	result := make([]any, 0, len(tools))
 	for index, tool := range tools {

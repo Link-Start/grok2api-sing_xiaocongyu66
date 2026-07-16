@@ -525,7 +525,7 @@ func TestConvertChatRequestRejectsTooManyTools(t *testing.T) {
 		"tools": tools,
 	})
 	_, err := convertChatRequest(body, "grok-test")
-	if err == nil || !strings.Contains(err.Error(), "最多 250") {
+	if err == nil || (!strings.Contains(err.Error(), "250") && !strings.Contains(err.Error(), "动态上限")) {
 		t.Fatalf("expected tools limit error, got %v", err)
 	}
 }

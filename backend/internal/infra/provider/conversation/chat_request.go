@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/toolslimit"
 )
 
 // convertChatRequest 将 Chat Completions 请求完整转换为标准 Responses 输入。
@@ -171,16 +173,14 @@ func convertAssistantToolCalls(raw json.RawMessage) ([]any, error) {
 	return result, nil
 }
 
-// maxUpstreamTools matches xAI/Grok Build's hard tools array ceiling.
-const maxUpstreamTools = 250
-
 func convertChatTools(raw json.RawMessage) ([]any, error) {
 	var tools []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &tools); err != nil {
 		return nil, errors.New("tools 必须是数组")
 	}
-	if len(tools) > maxUpstreamTools {
-		return nil, fmt.Errorf("tools 数量超过上游上限：提供了 %d 个，最多 %d 个（xAI/Grok Build 限制）", len(tools), maxUpstreamTools)
+	toolslimit.Observe(len(tools))
+	if err := toolslimit.Check(len(tools)); err != nil {
+		return nil, err
 	}
 	result := make([]any, 0, len(tools))
 	for _, tool := range tools {
