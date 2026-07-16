@@ -220,11 +220,29 @@ func TestValidateStatsigModes(t *testing.T) {
 	}
 	remote.Provider.Web.StatsigSignerURL = DefaultStatsigSignerURL
 	if err := remote.Validate(); err == nil {
-		t.Fatal("third-party default Statsig signer URL was accepted")
+		t.Fatal("third-party default Statsig signer URL was accepted without normalize")
 	}
 	remote.Provider.Web.StatsigSignerURL = ""
 	if err := remote.Validate(); err == nil {
-		t.Fatal("empty Statsig signer URL was accepted")
+		t.Fatal("empty Statsig signer URL was accepted without normalize")
+	}
+	// Normalize rewrites legacy/empty URL so upgrades boot without crash-loop.
+	legacy := base
+	legacy.Provider.Web.StatsigMode = StatsigModeURL
+	legacy.Provider.Web.StatsigSignerURL = DefaultStatsigSignerURL
+	NormalizeLegacyStatsig(&legacy)
+	if legacy.Provider.Web.StatsigSignerURL != DefaultLocalStatsigSignerURL {
+		t.Fatalf("legacy signer not rewritten: %q", legacy.Provider.Web.StatsigSignerURL)
+	}
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("normalized legacy Statsig rejected: %v", err)
+	}
+	empty := base
+	empty.Provider.Web.StatsigMode = StatsigModeURL
+	empty.Provider.Web.StatsigSignerURL = ""
+	NormalizeLegacyStatsig(&empty)
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("normalized empty Statsig rejected: %v", err)
 	}
 }
 

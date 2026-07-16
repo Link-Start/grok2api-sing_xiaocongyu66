@@ -293,10 +293,35 @@ func Load(path string) (Config, error) {
 		}
 	}
 	NormalizeRoutingRetry(&cfg)
+	NormalizeLegacyStatsig(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// DefaultLocalStatsigSignerURL is the boot-safe placeholder when no trusted signer is configured.
+// Operators should replace it with a real self-hosted signer or switch StatsigMode to manual.
+const DefaultLocalStatsigSignerURL = "http://127.0.0.1:8788/sign"
+
+// NormalizeLegacyStatsig rewrites empty or historically-default third-party Statsig signer URLs
+// so upgrades do not crash-loop on persisted runtime settings.
+func NormalizeLegacyStatsig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	mode := strings.TrimSpace(cfg.Provider.Web.StatsigMode)
+	if mode == "" {
+		mode = StatsigModeURL
+		cfg.Provider.Web.StatsigMode = mode
+	}
+	if mode != StatsigModeURL {
+		return
+	}
+	signer := strings.TrimSpace(cfg.Provider.Web.StatsigSignerURL)
+	if signer == "" || strings.EqualFold(signer, DefaultStatsigSignerURL) {
+		cfg.Provider.Web.StatsigSignerURL = DefaultLocalStatsigSignerURL
+	}
 }
 
 func resolveRelativePaths(cfg *Config, configPath string) error {
@@ -571,7 +596,7 @@ func defaultConfig() Config {
 			},
 			Web: WebProviderConfig{
 				// Default to a local/self-hosted signer hostname, never the historical third-party public host.
-				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: "http://127.0.0.1:8788/sign",
+				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultLocalStatsigSignerURL,
 				QuotaTimeout: Duration(25 * time.Second),
 				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),

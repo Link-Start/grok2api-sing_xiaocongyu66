@@ -177,6 +177,9 @@ func LoadPersisted(ctx context.Context, base config.Config, repository repositor
 	}
 	// 持久化层使用强类型时长，避免数据库格式受 HTTP DTO 字符串影响。
 	loaded := applyDomainConfig(base, value)
+	// Migrate legacy third-party Statsig defaults before hard validation so upgrades boot.
+	config.NormalizeRoutingRetry(&loaded)
+	config.NormalizeLegacyStatsig(&loaded)
 	if err := loaded.Validate(); err != nil {
 		return config.Config{}, time.Time{}, 0, fmt.Errorf("校验运行设置: %w", err)
 	}
@@ -315,6 +318,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		RetryStatusCodes: append([]int(nil), value.Routing.RetryStatusCodes...), RetryServerErrors: value.Routing.RetryServerErrors,
 	}
 	config.NormalizeRoutingRetry(&base)
+	config.NormalizeLegacyStatsig(&base)
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
 	}
@@ -499,6 +503,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Routing.PromptCacheAffinity.Fingerprint = input.PromptCacheAffinity.Fingerprint
 	next.Routing.PromptCacheAffinity.Expire = input.PromptCacheAffinity.Expire
 	config.NormalizeRoutingRetry(&next)
+	config.NormalizeLegacyStatsig(&next)
 	if err := next.Validate(); err != nil {
 		return config.Config{}, err
 	}
