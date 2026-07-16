@@ -57,6 +57,7 @@ type Service struct {
 	bulkPool *batch.Pool
 	policyMu sync.RWMutex
 	policy   accountapp.UpstreamSyncPolicy
+	policySet bool
 }
 
 func NewService(logger *slog.Logger, accounts accountReader, billing billingSynchronizer, quota quotaSynchronizer, models modelSynchronizer) *Service {
@@ -69,6 +70,7 @@ func NewService(logger *slog.Logger, accounts accountReader, billing billingSync
 func (s *Service) SetUpstreamSyncPolicy(policy accountapp.UpstreamSyncPolicy) {
 	s.policyMu.Lock()
 	s.policy = policy
+	s.policySet = true
 	s.policyMu.Unlock()
 }
 
@@ -187,11 +189,15 @@ sendLoop:
 }
 
 func (s *Service) syncAccount(ctx context.Context, accountID uint64) error {
-	// CPA default (all proactive flags off): import pipeline only needs to drain IDs;
-	// skip DB reads and upstream HTTP entirely.
-	syncPolicy := s.upstreamSyncPolicy()
-	if !syncPolicy.Billing && !syncPolicy.WebQuota && !syncPolicy.ModelCatalogCatchup {
+	s.policyMu.RLock()
+	syncPolicy, policySet := s.policy, s.policySet
+	s.policyMu.RUnlock()
+	// Production always calls SetUpstreamSyncPolicy. Unset = unit tests / upstream-style allow-all.
+	if policySet && !syncPolicy.Billing && !syncPolicy.WebQuota && !syncPolicy.ModelCatalogCatchup {
 		return nil
+	}
+	if !policySet {
+		syncPolicy = accountapp.UpstreamSyncPolicy{Billing: true, WebQuota: true, ModelCatalogCatchup: true, AllowManualBillingRefresh: true, AllowManualQuotaRefresh: true}
 	}
 	var syncErr error
 	view, err := s.accounts.Get(ctx, accountID)

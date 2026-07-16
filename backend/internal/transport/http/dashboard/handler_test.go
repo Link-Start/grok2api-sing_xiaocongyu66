@@ -73,6 +73,6 @@ type dashboardRepositoryStub struct {
 	aggregate dashboarddomain.Aggregate
 }
 
-func (s *dashboardRepositoryStub) Snapshot(context.Context, []time.Time, time.Time) (dashboarddomain.Aggregate, error) {
+func (s *dashboardRepositoryStub) Snapshot(context.Context, []time.Time, time.Time, time.Time, time.Time, time.Duration) (dashboarddomain.Aggregate, error) {
 	return s.aggregate, nil
 }

@@ -38,6 +38,8 @@ var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失
 // UpstreamSyncPolicy controls proactive xAI billing/quota HTTP calls.
 // Defaults (zero value) match CLIProxy: no proactive /billing or rate-limits.
 type UpstreamSyncPolicy struct {
+	// set is true after SetUpstreamSyncPolicy; zero-value (tests) keeps upstream-style allow-all.
+	set                       bool
 	Billing                   bool
 	WebQuota                  bool
 	ModelCatalogCatchup       bool
@@ -295,6 +297,7 @@ func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
 // SetUpstreamSyncPolicy updates proactive billing/quota sync gates (hot-reload safe).
 func (s *Service) SetUpstreamSyncPolicy(policy UpstreamSyncPolicy) {
 	s.policyMu.Lock()
+	policy.set = true
 	s.upstreamSync = policy
 	s.policyMu.Unlock()
 }
@@ -308,6 +311,10 @@ func (s *Service) UpstreamSyncPolicy() UpstreamSyncPolicy {
 
 func (s *Service) billingSyncAllowed(ctx context.Context) bool {
 	policy := s.UpstreamSyncPolicy()
+	if !policy.set {
+		// Unconfigured (unit tests / legacy): allow like upstream default.
+		return true
+	}
 	if syncSourceFrom(ctx) == SyncSourceAuto {
 		return policy.Billing
 	}
@@ -316,6 +323,9 @@ func (s *Service) billingSyncAllowed(ctx context.Context) bool {
 
 func (s *Service) quotaSyncAllowed(ctx context.Context) bool {
 	policy := s.UpstreamSyncPolicy()
+	if !policy.set {
+		return true
+	}
 	if syncSourceFrom(ctx) == SyncSourceAuto {
 		return policy.WebQuota
 	}
@@ -1928,9 +1938,8 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 
 // QueueQuotaRefresh 在成功调用后异步同步远端窗口额度；当前 Web Free 账号同步 Chat 模式。
 func (s *Service) QueueQuotaRefresh(id uint64, mode string) {
-	// CPA default: proactive webQuota off — drop post-success refresh work early so
-	// inference hot path never enqueues no-op jobs into the worker pool.
-	if !s.UpstreamSyncPolicy().WebQuota {
+	// When policy is configured with webQuota off, skip enqueue (CPA default in production).
+	if policy := s.UpstreamSyncPolicy(); policy.set && !policy.WebQuota {
 		return
 	}
 	mode = strings.TrimSpace(mode)
@@ -1997,7 +2006,8 @@ func (s *Service) RunWebQuotaRefresh(ctx context.Context) {
 }
 
 func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRefreshRequest) {
-	if !s.UpstreamSyncPolicy().WebQuota {
+	// Unset policy (tests) allows refresh; production sets policy with webQuota=false to skip.
+	if policy := s.UpstreamSyncPolicy(); policy.set && !policy.WebQuota {
 		return
 	}
 	for {

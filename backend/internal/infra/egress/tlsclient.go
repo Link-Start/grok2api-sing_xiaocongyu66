@@ -70,10 +70,11 @@ func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
 }
 
 func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
-	header := http.Header(fresponse.Header)
+	// Always clone headers so callers cannot mutate the fhttp response map (Trailer may still
+	// receive deferred keys after body EOF and must keep the same map reference).
+	header := http.Header(fresponse.Header).Clone()
 	contentLength := fresponse.ContentLength
 	if fresponse.Uncompressed {
-		header = header.Clone()
 		header.Del("Content-Encoding")
 		header.Del("Content-Length")
 		contentLength = -1
@@ -81,7 +82,7 @@ func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
 	return &http.Response{
 		Status: fresponse.Status, StatusCode: fresponse.StatusCode, Proto: fresponse.Proto,
 		ProtoMajor: fresponse.ProtoMajor, ProtoMinor: fresponse.ProtoMinor, Header: header,
-		Body: fresponse.Body, ContentLength: contentLength, TransferEncoding: fresponse.TransferEncoding,
+		Body: fresponse.Body, ContentLength: contentLength, TransferEncoding: append([]string(nil), fresponse.TransferEncoding...),
 		Close: fresponse.Close, Uncompressed: fresponse.Uncompressed, Trailer: http.Header(fresponse.Trailer),
 	}
 }

@@ -57,7 +57,12 @@ func TestInitializeSchemaUpgradesProviderChecksForConsole(t *testing.T) {
 		if err := database.db.WithContext(ctx).Raw("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&sql).Error; err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(sql, "grok_console") {
+		ok := strings.Contains(sql, "grok_console")
+		if table == "egress_nodes" {
+			// Multi-scope nodes use length(trim(scope)) instead of a provider enum list.
+			ok = ok || strings.Contains(sql, "length(trim(scope))")
+		}
+		if !ok {
 			t.Fatalf("table %s was not upgraded: %s", table, sql)
 		}
 	}

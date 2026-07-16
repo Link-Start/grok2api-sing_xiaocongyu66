@@ -62,7 +62,7 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 		}
 	}
 
-	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardBoundaries(now.Add(-24*time.Hour), 2*time.Hour, 12), now)
+	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardBoundaries(now.Add(-24*time.Hour), 2*time.Hour, 12), now, now.Add(-24*time.Hour), now, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestDashboardRepositoryRanksTopModels(t *testing.T) {
 	if err := database.db.WithContext(ctx).Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardBoundaries(now.Add(-24*time.Hour), time.Hour, 24), now)
+	snapshot, err := NewDashboardRepository(database).Snapshot(ctx, testDashboardBoundaries(now.Add(-24*time.Hour), time.Hour, 24), now, now.Add(-24*time.Hour), now, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

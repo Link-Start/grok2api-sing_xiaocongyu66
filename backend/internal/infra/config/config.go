@@ -338,6 +338,22 @@ func NormalizeRoutingRetry(cfg *Config) {
 	cfg.Routing.RetryStatusCodes = normalized
 }
 
+// IsRetryableStatus reports whether an upstream status should trigger account failover.
+func IsRetryableStatus(status int, codes []int, retryServerErrors bool) bool {
+	if retryServerErrors && status >= 500 {
+		return true
+	}
+	if len(codes) == 0 {
+		codes = DefaultRetryStatusCodes
+	}
+	for _, code := range codes {
+		if status == code {
+			return true
+		}
+	}
+	return false
+}
+
 func validateRetryStatusCodes(codes []int) error {
 	if len(codes) == 0 {
 		return nil

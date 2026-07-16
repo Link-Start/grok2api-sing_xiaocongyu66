@@ -1,6 +1,8 @@
 package relational
 
 import (
+	"strings"
+	"fmt"
 	"context"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -43,6 +45,9 @@ func (r *EgressRepository) GetEgressNode(ctx context.Context, id uint64) (egress
 }
 
 func (r *EgressRepository) CreateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error) {
+	if err := validateEgressNode(value); err != nil {
+		return egress.Node{}, err
+	}
 	row := fromEgressDomain(value)
 	if err := r.db.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return egress.Node{}, mapError(err)
@@ -51,6 +56,9 @@ func (r *EgressRepository) CreateEgressNode(ctx context.Context, value egress.No
 }
 
 func (r *EgressRepository) UpdateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error) {
+	if err := validateEgressNode(value); err != nil {
+		return egress.Node{}, err
+	}
 	row := fromEgressDomain(value)
 	result := r.db.db.WithContext(ctx).Save(&row)
 	if result.Error != nil {
@@ -94,3 +102,20 @@ func fromEgressDomain(value egress.Node) egressNodeModel {
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
+
+func validateEgressNode(value egress.Node) error {
+	scopes := value.EffectiveScopes()
+	if len(scopes) == 0 {
+		return fmt.Errorf("%w: 出口节点作用域不能为空", repository.ErrInvalidInput)
+	}
+	for _, scope := range scopes {
+		if !scope.IsValid() {
+			return fmt.Errorf("%w: 出口节点作用域无效", repository.ErrInvalidInput)
+		}
+	}
+	if strings.TrimSpace(value.Name) == "" {
+		return fmt.Errorf("%w: 出口节点名称不能为空", repository.ErrInvalidInput)
+	}
+	return nil
+}
+
