@@ -126,6 +126,9 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 		_, failed, batchErr := s.runAccountBatch(ctx, "credential_auto_refresh", ids, s.refreshPool, nil, func(workCtx context.Context, id uint64) error {
 			taskCtx, cancel := context.WithTimeout(workCtx, credentialRefreshTimeout)
 			defer cancel()
+			if s.refreshSkipping(id, s.now()) {
+				return nil
+			}
 			credential, err := s.accounts.Get(taskCtx, id)
 			if err != nil {
 				return err

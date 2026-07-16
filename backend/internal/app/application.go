@@ -183,6 +183,16 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		database.Close()
 		return nil, err
 	}
+	cfg.Batch = clampBatchForDatabase(cfg)
+	if cfg.Database.Driver == "postgres" {
+		logger.Info("batch_concurrency_budget",
+			"max_open_conns", cfg.Database.Postgres.MaxOpenConns,
+			"import", cfg.Batch.ImportConcurrency,
+			"conversion", cfg.Batch.ConversionConcurrency,
+			"sync", cfg.Batch.SyncConcurrency,
+			"refresh", cfg.Batch.RefreshConcurrency,
+		)
+	}
 	bulkPool := batch.NewSharedPool(maxBatchConcurrency(cfg.Batch), concurrency, "bulk:upstream")
 	importPool := batch.NewSharedChildPool(cfg.Batch.ImportConcurrency, concurrency, "bulk:import", bulkPool)
 	conversionPool := batch.NewSharedChildPool(cfg.Batch.ConversionConcurrency, concurrency, "bulk:conversion", bulkPool)
@@ -282,6 +292,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			Enabled: next.Routing.PromptCacheAffinity.Enabled, Fingerprint: next.Routing.PromptCacheAffinity.Fingerprint,
 			Expire: next.Routing.PromptCacheAffinity.Expire, TTL: next.Routing.PromptCacheAffinity.TTL.Value(),
 		})
+		// Re-apply Postgres connection budget so admin hot-reload cannot starve the request path.
+		next.Batch = clampBatchForDatabase(next)
 		bulkPool.UpdateLimit(maxBatchConcurrency(next.Batch))
 		importPool.UpdateLimit(next.Batch.ImportConcurrency)
 		conversionPool.UpdateLimit(next.Batch.ConversionConcurrency)
@@ -326,6 +338,47 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 
 func maxBatchConcurrency(value config.BatchConfig) int {
 	return max(value.ImportConcurrency, value.ConversionConcurrency, value.SyncConcurrency, value.RefreshConcurrency)
+}
+
+// clampBatchForDatabase keeps bulk workers from exhausting the Postgres connection budget.
+// With maxOpenConns=20 (common on small Aiven plans), default refresh=25 previously caused
+// SQLSTATE 53300, audit drops, and cascading oauth_transport_error storms.
+func clampBatchForDatabase(cfg config.Config) config.BatchConfig {
+	batchCfg := cfg.Batch
+	if cfg.Database.Driver != "postgres" {
+		return batchCfg
+	}
+	maxOpen := cfg.Database.Postgres.MaxOpenConns
+	if maxOpen < 1 {
+		return batchCfg
+	}
+	// Reserve at least half of the pool for HTTP request path (selector, audits, admin).
+	budget := maxOpen / 2
+	if budget < 1 {
+		budget = 1
+	}
+	// Refresh is the hottest concurrent writer; keep it at most budget and slightly lower
+	// than other bulk categories so import/sync cannot fully starve refresh either.
+	refreshBudget := budget
+	if refreshBudget > 8 {
+		// Cap proactive refresh even on larger plans; request-path refresh still uses locks.
+		refreshBudget = max(8, budget/2)
+	}
+	batchCfg.RefreshConcurrency = minPositive(batchCfg.RefreshConcurrency, refreshBudget)
+	batchCfg.ImportConcurrency = minPositive(batchCfg.ImportConcurrency, budget)
+	batchCfg.ConversionConcurrency = minPositive(batchCfg.ConversionConcurrency, budget)
+	batchCfg.SyncConcurrency = minPositive(batchCfg.SyncConcurrency, budget)
+	return batchCfg
+}
+
+func minPositive(value, ceiling int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > ceiling {
+		return ceiling
+	}
+	return value
 }
 
 func webProviderConfig(cfg config.Config) webprovider.Config {

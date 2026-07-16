@@ -710,8 +710,10 @@ func defaultConfig() Config {
 			},
 		},
 		Batch: BatchConfig{
-			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
-			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
+			// Keep bulk workers modest so small Postgres plans (e.g. Aiven 20 slots)
+			// still have headroom for the request path. Refresh is the hottest writer.
+			ImportConcurrency: 10, ConversionConcurrency: 10, SyncConcurrency: 10,
+			RefreshConcurrency: 8, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{
 			Driver: "local", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 30,

@@ -73,12 +73,17 @@ const (
 	estimatedFreeTokenLimit     int64         = 1_000_000
 	freeUsageWindow             time.Duration = 24 * time.Hour
 	forcedRefreshMinInterval    time.Duration = 30 * time.Second
+	// refreshStateWriteCooldown skips re-attempting OAuth refresh when the failure
+	// schedule could not be persisted (typically Postgres connection exhaustion).
+	// Without this, due accounts are re-selected every tick and amplify 53300 storms.
+	refreshStateWriteCooldown     time.Duration = 2 * time.Minute
 	paidProbeRetryInterval      time.Duration = 15 * time.Minute
 	credentialRefreshAdvance    time.Duration = 3 * time.Minute
 	credentialRefreshSafetyPoll time.Duration = time.Minute
 	credentialRefreshTimeout    time.Duration = 30 * time.Second
 	credentialRefreshStateTTL   time.Duration = 5 * time.Second
-	credentialRefreshBatchSize                = 200
+	// Smaller batches leave Postgres headroom for the request path under load.
+	credentialRefreshBatchSize                = 50
 	// credentialScheduleReconcileEvery bounds expensive schedule backfill so the
 	// refresh loop is not blocked by scanning all unscheduling rows every tick.
 	credentialScheduleReconcileEvery          = 5 * time.Minute
@@ -279,6 +284,8 @@ type Service struct {
 	quotaSyncs            singleflight.Group
 	refreshMu             sync.Mutex
 	lastRefreshAt         map[uint64]time.Time
+	// refreshSkipUntil holds in-memory cooldowns when RefreshDueAt could not be written.
+	refreshSkipUntil      map[uint64]time.Time
 	quotaRefreshMu        sync.Mutex
 	quotaRefreshes        map[string]*webQuotaRefreshState
 	quotaRefreshQueue     chan webQuotaRefreshRequest
@@ -341,10 +348,11 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 	return &Service{
 		accounts: accounts, audits: audits, deviceSessions: deviceSessions, sticky: sticky,
 		providers: providers, cipher: cipher, refreshLock: refreshLock,
-		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*webQuotaRefreshState),
+		lastRefreshAt: make(map[uint64]time.Time), refreshSkipUntil: make(map[uint64]time.Time),
+		quotaRefreshes:        make(map[string]*webQuotaRefreshState),
 		quotaRefreshQueue:     make(chan webQuotaRefreshRequest, webQuotaRefreshQueueSize),
 		credentialRefreshWake: make(chan struct{}, 1),
-		conversionPool:        batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
+		conversionPool:        batch.NewPool(8), syncPool: batch.NewPool(10), refreshPool: batch.NewPool(8), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -1825,6 +1833,11 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		return value, nil
 	}
 	now := s.now()
+	// In-memory skip after a failed RefreshDueAt write (DB pool exhaustion). Keep access
+	// token usable without re-hammering OAuth/DB until the cooldown expires.
+	if !bypassCooldown && s.refreshSkipping(value.ID, now) {
+		return value, nil
+	}
 	if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, value, now, force); handled {
 		return credential, err
 	}
@@ -1976,12 +1989,14 @@ func (s *Service) credentialRefreshCoolingDown(credential accountdomain.Credenti
 func (s *Service) markRefreshSuccess(accountID uint64, now time.Time) {
 	s.refreshMu.Lock()
 	s.lastRefreshAt[accountID] = now
+	delete(s.refreshSkipUntil, accountID)
 	s.refreshMu.Unlock()
 }
 
 func (s *Service) clearRefreshState(accountID uint64) {
 	s.refreshMu.Lock()
 	delete(s.lastRefreshAt, accountID)
+	delete(s.refreshSkipUntil, accountID)
 	s.refreshMu.Unlock()
 }
 
@@ -2016,7 +2031,11 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		retryAt = now
 	}
 	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failureCount, retryAt, errorCode, permanent); err != nil {
-		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err)
+		// DB write failed: schedule could not move RefreshDueAt forward. Apply an
+		// in-memory skip so the same due set is not hammered every scheduler tick.
+		s.markRefreshSkip(credential.ID, now.Add(refreshStateWriteCooldown))
+		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err, "skip_until", now.Add(refreshStateWriteCooldown))
+		return
 	}
 	if permanent && accessTokenAlive {
 		s.logger.Warn("credential_refresh_permanent_but_token_alive", "account_id", credential.ID, "error_code", errorCode, "expires_at", credential.ExpiresAt, "retry_at", retryAt)
@@ -2031,6 +2050,35 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	}
 	s.logger.Warn("credential_refresh_deferred", "account_id", credential.ID, "failure_count", failureCount, "retry_at", retryAt, "error_code", errorCode)
 	s.WakeCredentialRefresh()
+}
+
+func (s *Service) markRefreshSkip(accountID uint64, until time.Time) {
+	if s == nil || accountID == 0 || until.IsZero() {
+		return
+	}
+	s.refreshMu.Lock()
+	if s.refreshSkipUntil == nil {
+		s.refreshSkipUntil = make(map[uint64]time.Time)
+	}
+	s.refreshSkipUntil[accountID] = until
+	s.refreshMu.Unlock()
+}
+
+func (s *Service) refreshSkipping(accountID uint64, now time.Time) bool {
+	if s == nil || accountID == 0 {
+		return false
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	until, ok := s.refreshSkipUntil[accountID]
+	if !ok {
+		return false
+	}
+	if until.After(now) {
+		return true
+	}
+	delete(s.refreshSkipUntil, accountID)
+	return false
 }
 
 // resolvePermanentRefreshFailure 阻止再次请求已确认失效的 refresh token，并在 access token 到期后收敛账号状态。
