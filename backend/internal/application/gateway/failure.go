@@ -120,6 +120,28 @@ func newTransportUpstreamFailure(err error, accountID uint64, accountName string
 	}
 }
 
+// sanitizeTransportError keeps operator logs short and free of proxy credentials.
+func sanitizeTransportError(err error) string {
+	if err == nil {
+		return ""
+	}
+	value := err.Error()
+	if len(value) > 240 {
+		value = value[:240]
+	}
+	// Strip userinfo from any URL-like segments (scheme://user:pass@host).
+	if at := strings.Index(value, "://"); at >= 0 {
+		rest := value[at+3:]
+		if slash := strings.IndexAny(rest, "/?"); slash >= 0 {
+			rest = rest[:slash]
+		}
+		if credAt := strings.LastIndex(rest, "@"); credAt >= 0 {
+			value = strings.Replace(value, rest[:credAt+1], "***@", 1)
+		}
+	}
+	return value
+}
+
 func newCredentialUpstreamFailure(err error, accountID uint64, accountName string) *UpstreamFailure {
 	return &UpstreamFailure{
 		HTTPStatus: http.StatusBadGateway, Code: "upstream_credential_unavailable", PublicMessage: "上游账号凭据不可用",

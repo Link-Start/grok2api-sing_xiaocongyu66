@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -8,6 +9,16 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
+
+func TestSanitizeTransportErrorRedactsProxyUserinfo(t *testing.T) {
+	got := sanitizeTransportError(errors.New(`socks connect tcp socks5://user:secret@1.2.3.4:1080: dial timeout`))
+	if strings.Contains(got, "secret") || strings.Contains(got, "user:") {
+		t.Fatalf("credentials leaked: %q", got)
+	}
+	if !strings.Contains(got, "***@") {
+		t.Fatalf("expected redacted userinfo, got %q", got)
+	}
+}
 
 func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 	tests := []struct {

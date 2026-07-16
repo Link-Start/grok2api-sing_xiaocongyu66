@@ -413,34 +413,48 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		}
 		return
 	}
-	value, err := m.repository.GetEgressNode(ctx, nodeID)
-	if err != nil {
+	// Account/auth limits are not proxy outcomes.
+	if status == http.StatusUnauthorized || status == http.StatusTooManyRequests {
 		return
 	}
+	// Build 403 可能是账号权限、额度、Token 或出口策略，响应体由网关层
+	// 分类；仅凭状态码不能把标准 CLI 出口误判为 Web anti-bot。
+	if scope == domain.ScopeBuild && status == http.StatusForbidden {
+		return
+	}
+
+	success := transportErr == nil && status >= 200 && status < 400
+	value, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil {
+		// DB pressure must not skip process-local rates or client invalidation;
+		// otherwise failing proxies stay selected and model calls keep 502-ing.
+		if success {
+			m.recordRequest(nodeID, true)
+		} else {
+			m.recordRequest(nodeID, false)
+			m.mu.Lock()
+			m.invalidateClientLocked(nodeID)
+			m.mu.Unlock()
+		}
+		return
+	}
+	if status == http.StatusForbidden && m.isStickyProxyNode(value) {
+		// A 403 on an account-bound Resin lease usually means that account's
+		// clearance is stale. Do not cool or invalidate the shared node for
+		// unrelated accounts.
+		return
+	}
+
 	now := time.Now().UTC()
 	switch {
-	case transportErr == nil && status >= 200 && status < 400:
-		// Process-local admin rates (restart clears). Must record here: health
-		// alone is persisted to DB, but success/failure rates used to stay 0.
+	case success:
+		// Process-local admin rates (restart clears).
 		m.recordRequest(nodeID, true)
 		value.Health = min(1, value.Health+0.1)
 		value.FailureCount = 0
 		value.CooldownUntil = nil
 		value.LastError = ""
-	case status == http.StatusUnauthorized || status == http.StatusTooManyRequests:
-		// Account/auth limits — not a proxy outcome for the report rates.
-		return
-	case scope == domain.ScopeBuild && status == http.StatusForbidden:
-		// Build 403 可能是账号权限、额度、Token 或出口策略，响应体由网关层
-		// 分类；仅凭状态码不能把标准 CLI 出口误判为 Web anti-bot。
-		return
 	case status == http.StatusForbidden:
-		if m.isStickyProxyNode(value) {
-			// A 403 on an account-bound Resin lease usually means that account's
-			// clearance is stale. Do not cool or invalidate the shared node for
-			// unrelated accounts.
-			return
-		}
 		m.recordRequest(nodeID, false)
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)

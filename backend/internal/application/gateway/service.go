@@ -602,6 +602,17 @@ attemptLoop:
 				break
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+			// Transport errors previously returned 502 with no log line, which made
+			// "model call failed" look like a silent gateway bug. Keep the cause
+			// short and free of credentials for operators.
+			s.logger.Warn("upstream_request_failed",
+				"request_id", input.RequestID,
+				"account_id", credential.ID,
+				"provider", credential.Provider,
+				"status", lastFailure.HTTPStatus,
+				"upstream_code", lastFailure.Code,
+				"error", sanitizeTransportError(err),
+			)
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
 				break

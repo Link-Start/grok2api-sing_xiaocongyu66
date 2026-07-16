@@ -314,6 +314,21 @@ func TestFeedbackRecordsRuntimeRequestStats(t *testing.T) {
 	}
 }
 
+func TestFeedbackRecordsStatsWhenRepositoryLookupFails(t *testing.T) {
+	manager := NewManager(egressRepositoryTestStub{}, nil)
+	manager.clients = map[clientCacheKey]cachedClient{
+		{nodeID: 9, scope: domain.ScopeWeb, fingerprint: "web"}: {},
+	}
+	manager.Feedback(context.Background(), 9, 0, errors.New("dial timeout"))
+	success, failure, _, _, _, _, _ := manager.RuntimeStats(9)
+	if success != 0 || failure != 1 {
+		t.Fatalf("runtime stats success=%d failure=%d, want 0/1", success, failure)
+	}
+	if managerHasClientForNode(manager, 9) {
+		t.Fatal("client should be invalidated even when node lookup fails")
+	}
+}
+
 func TestBuildForbiddenDoesNotPoisonEgressNode(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
