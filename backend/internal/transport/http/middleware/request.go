@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -92,24 +91,6 @@ func SecurityHeaders() gin.HandlerFunc {
 	}
 }
 
-// safeLogToken keeps only a conservative token charset so log sinks cannot be split/injected.
-func safeLogToken(value string, max int) string {
-	if value == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(min(len(value), max))
-	for _, r := range value {
-		if b.Len() >= max {
-			break
-		}
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' || r == ':' || r == '/' || r == '*' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 func safeClientIP(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -125,6 +106,100 @@ func safeClientIP(value string) string {
 		return ip.String()
 	}
 	return ""
+}
+
+// classifiedRoute returns only string constants so access logs never sink request-tainted path text.
+func classifiedRoute(c *gin.Context) string {
+	switch c.FullPath() {
+	case "/healthz":
+		return "healthz"
+	case "/readyz":
+		return "readyz"
+	case "/v1/models":
+		return "v1_models"
+	case "/v1/chat/completions":
+		return "v1_chat_completions"
+	case "/v1/responses":
+		return "v1_responses"
+	case "/responses":
+		return "responses"
+	case "/v1/messages":
+		return "v1_messages"
+	case "/v1/images/generations":
+		return "v1_images_generations"
+	case "/v1/images/edits":
+		return "v1_images_edits"
+	case "/v1/videos/generations":
+		return "v1_videos_generations"
+	case "/v1/videos/:requestId":
+		return "v1_videos_get"
+	case "/v1/media/images/:assetId":
+		return "v1_media_image"
+	case "/api/admin/v1/auth/login":
+		return "admin_auth_login"
+	case "/api/admin/v1/auth/refresh":
+		return "admin_auth_refresh"
+	case "/api/admin/v1/auth/logout":
+		return "admin_auth_logout"
+	case "/api/admin/v1/me":
+		return "admin_me"
+	case "/api/admin/v1/me/password":
+		return "admin_me_password"
+	case "/api/admin/v1/accounts":
+		return "admin_accounts"
+	case "/api/admin/v1/accounts/summary":
+		return "admin_accounts_summary"
+	case "/api/admin/v1/accounts/:id":
+		return "admin_account"
+	case "/api/admin/v1/models":
+		return "admin_models"
+	case "/api/admin/v1/client-keys":
+		return "admin_client_keys"
+	case "/api/admin/v1/client-keys/:id":
+		return "admin_client_key"
+	case "/api/admin/v1/client-keys/:id/secret":
+		return "admin_client_key_secret"
+	case "/api/admin/v1/request-audits":
+		return "admin_request_audits"
+	case "/api/admin/v1/request-audits/:id":
+		return "admin_request_audit"
+	case "/api/admin/v1/request-audits/summary":
+		return "admin_request_audits_summary"
+	case "/api/admin/v1/dashboard":
+		return "admin_dashboard"
+	case "/api/admin/v1/settings":
+		return "admin_settings"
+	case "/api/admin/v1/system":
+		return "admin_system"
+	case "/api/admin/v1/egress-nodes":
+		return "admin_egress_nodes"
+	case "/api/admin/v1/egress-nodes/report":
+		return "admin_egress_report"
+	case "/api/admin/v1/egress-nodes/:id":
+		return "admin_egress_node"
+	case "/api/admin/v1/egress-nodes/:id/test":
+		return "admin_egress_node_test"
+	case "/api/admin/v1/media/images":
+		return "admin_media_images"
+	case "/api/admin/v1/media/videos":
+		return "admin_media_videos"
+	case "":
+		return "unmatched"
+	default:
+		return "other"
+	}
+}
+
+func classifiedClientType(value string) string {
+	switch value {
+	case "claude_code", "codex", "grok_cli", "hermes", "opencode", "cline", "cursor",
+		"continue", "aider", "roo_code", "windsurf", "gemini_cli", "kiro", "mcp",
+		"copilot", "openai_sdk", "anthropic_sdk", "node", "python", "go", "java",
+		"rust", "ruby", "perl", "curl", "wget", "legacy", "unknown":
+		return value
+	default:
+		return "other"
+	}
 }
 
 // AccessLog 记录路径、状态、耗时与调用方元数据，不读取请求或响应正文。
@@ -145,12 +220,8 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 				headers[strings.ToLower(name)] = value
 			}
 		}
-		clientType := clientid.Detect(userAgent, headers)
-		// Only log Gin route templates (e.g. /v1/chat/completions), never raw URL.Path.
-		logPath := c.FullPath()
-		if logPath == "" {
-			logPath = "-"
-		}
+		// Detection still uses UA/headers; logging only uses an allowlisted constant class.
+		clientType := classifiedClientType(clientid.Detect(userAgent, headers))
 		logMethod := c.Request.Method
 		switch logMethod {
 		case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
@@ -164,18 +235,18 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 		attrs := []any{
 			"request_id", reqID,
 			"method", logMethod,
-			"path", logPath,
+			"route", classifiedRoute(c),
 			"status", c.Writer.Status(),
 			"duration_ms", time.Since(startedAt).Milliseconds(),
 			"client_ip", safeClientIP(c.ClientIP()),
-			"client_type", safeLogToken(clientType, 64),
-			// Length only — avoid writing free-form User-Agent into logs (log-injection sink).
+			"client_type", clientType,
 			"user_agent_len", len(userAgent),
 			"bytes_out", c.Writer.Size(),
 		}
 		if keyValue, ok := c.Get(ClientKey); ok {
 			if key, ok := keyValue.(clientkeydomain.Key); ok {
-				attrs = append(attrs, "client_key_id", key.ID, "client_key_name", safeLogToken(key.Name, 64), "client_key_prefix", safeLogToken(key.Prefix, 32))
+				// IDs only — never free-form key names in access logs.
+				attrs = append(attrs, "client_key_id", key.ID)
 			}
 		}
 		logger.Info("http_request", attrs...)
