@@ -125,9 +125,9 @@ type AuthConfig struct {
 
 type ProviderConfig struct {
 	ProactiveUpstreamSync ProactiveUpstreamSyncConfig `yaml:"proactiveUpstreamSync"`
-	Build   BuildProviderConfig   `yaml:"build"`
-	Web     WebProviderConfig     `yaml:"web"`
-	Console ConsoleProviderConfig `yaml:"console"`
+	Build                 BuildProviderConfig         `yaml:"build"`
+	Web                   WebProviderConfig           `yaml:"web"`
+	Console               ConsoleProviderConfig       `yaml:"console"`
 }
 
 type BuildProviderConfig struct {
@@ -169,16 +169,33 @@ type BatchConfig struct {
 }
 
 type MediaConfig struct {
+	// Driver selects object storage: "local" or "r2" (Cloudflare R2 / S3-compatible).
 	Driver                  string           `yaml:"driver"`
 	MaxImageBytes           int64            `yaml:"-"`
 	MaxTotalBytes           int64            `yaml:"-"`
 	CleanupThresholdPercent int              `yaml:"-"`
 	CleanupInterval         Duration         `yaml:"-"`
 	Local                   LocalMediaConfig `yaml:"local"`
+	R2                      R2MediaConfig    `yaml:"r2"`
 }
 
 type LocalMediaConfig struct {
 	Path string `yaml:"path"`
+}
+
+// R2MediaConfig is Cloudflare R2 (S3 API) storage for generated images.
+type R2MediaConfig struct {
+	// Endpoint e.g. https://<accountid>.r2.cloudflarestorage.com
+	Endpoint        string `yaml:"endpoint"`
+	AccessKeyID     string `yaml:"accessKeyId"`
+	SecretAccessKey string `yaml:"secretAccessKey"`
+	Bucket          string `yaml:"bucket"`
+	// Region is accepted by the SDK; R2 uses "auto".
+	Region string `yaml:"region"`
+	// Prefix is an optional key prefix inside the bucket (e.g. grok2api).
+	Prefix string `yaml:"prefix"`
+	// PublicBaseURL optional custom domain for objects (informational; gateway still proxies reads).
+	PublicBaseURL string `yaml:"publicBaseURL"`
 }
 
 type ProactiveUpstreamSyncConfig struct {
@@ -466,11 +483,28 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("runtimeStore.driver 必须是 memory 或 redis")
 	}
-	if c.Media.Driver != "local" {
-		return errors.New("media.driver 当前仅支持 local")
-	}
-	if strings.TrimSpace(c.Media.Local.Path) == "" {
-		return errors.New("media.local.path 不能为空")
+	switch strings.ToLower(strings.TrimSpace(c.Media.Driver)) {
+	case "", "local":
+		c.Media.Driver = "local"
+		if strings.TrimSpace(c.Media.Local.Path) == "" {
+			return errors.New("media.local.path 不能为空")
+		}
+	case "r2":
+		c.Media.Driver = "r2"
+		if strings.TrimSpace(c.Media.R2.Endpoint) == "" || strings.TrimSpace(c.Media.R2.AccessKeyID) == "" ||
+			strings.TrimSpace(c.Media.R2.SecretAccessKey) == "" || strings.TrimSpace(c.Media.R2.Bucket) == "" {
+			return errors.New("media.driver=r2 时必须配置 endpoint、accessKeyId、secretAccessKey、bucket")
+		}
+		if _, err := url.ParseRequestURI(strings.TrimSpace(c.Media.R2.Endpoint)); err != nil {
+			return errors.New("media.r2.endpoint 必须是有效 URL")
+		}
+		if pub := strings.TrimSpace(c.Media.R2.PublicBaseURL); pub != "" {
+			if _, err := url.ParseRequestURI(pub); err != nil {
+				return errors.New("media.r2.publicBaseURL 必须是有效 URL")
+			}
+		}
+	default:
+		return errors.New("media.driver 仅支持 local 或 r2")
 	}
 	if c.Media.MaxImageBytes < 1<<20 || c.Media.MaxImageBytes > 32<<20 {
 		return errors.New("media.maxImageBytes 必须在 1 MiB 到 32 MiB 之间")
@@ -685,11 +719,11 @@ func defaultConfig() Config {
 			Local: LocalMediaConfig{Path: "./data/media"},
 		},
 		Routing: RoutingConfig{
-			StickyTTL:    Duration(time.Hour),
-			CooldownBase: Duration(30 * time.Second),
-			CooldownMax:  Duration(30 * time.Minute),
-			CapacityWait: Duration(500 * time.Millisecond),
-			MaxAttempts:  3,
+			StickyTTL:         Duration(time.Hour),
+			CooldownBase:      Duration(30 * time.Second),
+			CooldownMax:       Duration(30 * time.Minute),
+			CapacityWait:      Duration(500 * time.Millisecond),
+			MaxAttempts:       3,
 			RetryStatusCodes:  append([]int(nil), DefaultRetryStatusCodes...),
 			RetryServerErrors: true,
 			PromptCacheAffinity: PromptCacheAffinityConfig{

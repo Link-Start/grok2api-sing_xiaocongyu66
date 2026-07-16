@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,7 +110,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		return nil, err
 	}
 	cfg = loadedConfig
-	localMediaStore, err := inframedia.NewLocalStore(cfg.Media.Local.Path)
+	objectStore, err := openMediaObjectStore(cfg)
 	if err != nil {
 		database.Close()
 		return nil, err
@@ -156,7 +157,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		database.Close()
 		return nil, fmt.Errorf("不支持的运行态驱动: %s", cfg.RuntimeStore.Driver)
 	}
-	mediaService := mediaapp.NewService(mediaAssetRepo, mediaJobRepo, localMediaStore, refreshLock, mediaConfig(cfg))
+	mediaService := mediaapp.NewService(mediaAssetRepo, mediaJobRepo, objectStore, refreshLock, mediaConfig(cfg))
 
 	egressManager := infraegress.NewManager(egressRepo, cipher)
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{BaseURL: cfg.Provider.Build.BaseURL, ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier, TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent}, cipher)
@@ -344,11 +345,34 @@ func consoleProviderConfig(cfg config.Config) consoleprovider.Config {
 	}
 }
 
+func openMediaObjectStore(cfg config.Config) (repository.MediaObjectStorage, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Media.Driver)) {
+	case "", "local":
+		return inframedia.NewLocalStore(cfg.Media.Local.Path)
+	case "r2":
+		return inframedia.NewR2Store(inframedia.R2Config{
+			Endpoint: cfg.Media.R2.Endpoint, AccessKeyID: cfg.Media.R2.AccessKeyID,
+			SecretAccessKey: cfg.Media.R2.SecretAccessKey, Bucket: cfg.Media.R2.Bucket,
+			Region: cfg.Media.R2.Region, Prefix: cfg.Media.R2.Prefix, PublicBaseURL: cfg.Media.R2.PublicBaseURL,
+		})
+	default:
+		return nil, fmt.Errorf("不支持的媒体驱动: %s", cfg.Media.Driver)
+	}
+}
+
 func mediaConfig(cfg config.Config) mediaapp.Config {
+	label := strings.TrimSpace(cfg.Media.Local.Path)
+	if strings.EqualFold(cfg.Media.Driver, "r2") {
+		label = strings.TrimSpace(cfg.Media.R2.Bucket)
+		if prefix := strings.TrimSpace(cfg.Media.R2.Prefix); prefix != "" {
+			label = label + "/" + strings.Trim(prefix, "/")
+		}
+	}
 	return mediaapp.Config{
 		PublicBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(),
 		MaxImageBytes: cfg.Media.MaxImageBytes, MaxTotalBytes: cfg.Media.MaxTotalBytes,
 		CleanupThresholdPercent: cfg.Media.CleanupThresholdPercent, CleanupInterval: cfg.Media.CleanupInterval.Value(),
+		Driver: cfg.Media.Driver, StorageLabel: label,
 	}
 }
 

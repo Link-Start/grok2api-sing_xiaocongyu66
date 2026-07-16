@@ -33,6 +33,8 @@ type Service struct {
 	jobs          repository.MediaJobRepository
 	objects       repository.MediaObjectStorage
 	cleanupLock   repository.DistributedLock
+	driver        string
+	storageLabel  string
 	publicBaseURL string
 	configMu      sync.RWMutex
 	maxImageBytes int64
@@ -50,6 +52,14 @@ type Config struct {
 	MaxTotalBytes           int64
 	CleanupThresholdPercent int
 	CleanupInterval         time.Duration
+	Driver                  string
+	StorageLabel            string // safe display label (path basename or r2 bucket)
+}
+
+// StorageInfo is non-secret object-storage status for the admin files page.
+type StorageInfo struct {
+	Driver string `json:"driver"`
+	Label  string `json:"label"`
 }
 
 type ImageStats struct {
@@ -68,6 +78,7 @@ type VideoStats struct {
 func NewService(assets repository.MediaAssetRepository, jobs repository.MediaJobRepository, objects repository.MediaObjectStorage, cleanupLock repository.DistributedLock, cfg Config) *Service {
 	return &Service{
 		assets: assets, jobs: jobs, objects: objects, cleanupLock: cleanupLock,
+		driver: strings.TrimSpace(cfg.Driver), storageLabel: strings.TrimSpace(cfg.StorageLabel),
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(cfg.PublicBaseURL), "/"), maxImageBytes: cfg.MaxImageBytes,
 		maxTotalBytes: cfg.MaxTotalBytes, cleanupAt: cfg.CleanupThresholdPercent, cleanupEvery: cfg.CleanupInterval,
 		cleanupSignal: make(chan struct{}, 1), configChanged: make(chan struct{}, 1),
@@ -87,6 +98,15 @@ func (s *Service) UpdateConfig(cfg Config) {
 	case s.configChanged <- struct{}{}:
 	default:
 	}
+}
+
+// StorageInfo returns the active object-storage driver without secrets.
+func (s *Service) StorageInfo() StorageInfo {
+	driver := strings.TrimSpace(s.driver)
+	if driver == "" {
+		driver = "local"
+	}
+	return StorageInfo{Driver: driver, Label: s.storageLabel}
 }
 
 // SaveImage 校验并保存一份不可变图片，文件写入失败或元数据落库失败时不会留下半成品。

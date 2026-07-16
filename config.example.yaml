@@ -99,11 +99,23 @@ provider:
     allowManualQuotaRefresh: false
 
 media:
-  # [通常不要修改] 当前仅支持 local；容量和清理策略在管理端设置。
-  driver: local
+  # [按需修改] local = 本机目录；r2 = Cloudflare R2（S3 兼容）。
+  # 容量与清理阈值在管理端设置（仅对 local 统计磁盘占用更有意义）。
+  driver: local # local | r2
   local:
     # [按需修改] 图片二进制目录；数据库只保存资源元数据。
     path: "./data/media"
+  r2:
+    # [必须修改：仅 driver=r2] Cloudflare R2 S3 API 端点。
+    # endpoint: "https://<accountid>.r2.cloudflarestorage.com"
+    # accessKeyId: "replace-with-r2-access-key-id"
+    # secretAccessKey: "replace-with-r2-secret-access-key"
+    # bucket: "grok2api-media"
+    # region: "auto"
+    # [按需修改] 桶内前缀，便于多实例共用一个 bucket。
+    # prefix: "grok2api"
+    # [按需修改] 自定义域名/CDN（可选，网关仍通过 /v1/media/images 代理读取）。
+    # publicBaseURL: "https://media.example.com"
 
 routing:
   # [通常不要修改] 会话粘性与失败换号。

@@ -10,6 +10,11 @@ import {
 } from "@/shared/api/decoder";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
+export type MediaStorageInfoDTO = {
+  driver: string;
+  label: string;
+};
+
 export type ListImagesInput = {
   page: number;
   pageSize: number;
@@ -51,6 +56,10 @@ const mediaJobShape = {
   errorMessage: isString,
 };
 
+const decodeMediaStorageInfo = createObjectDecoder<MediaStorageInfoDTO>("media storage", {
+  driver: isString,
+  label: isString,
+});
 const decodeImageStats = createObjectDecoder<ImageStatsDTO>("image stats", {
   totalImages: isNumber,
   totalBytes: isNumber,
@@ -62,6 +71,10 @@ const decodeVideoStats = createObjectDecoder<VideoStatsDTO>("video stats", {
   inProgress: isNumber,
   queued: isNumber,
 });
+
+export function getMediaStorageInfo(): Promise<MediaStorageInfoDTO> {
+  return apiRequest("/api/admin/v1/media/storage", {}, decodeMediaStorageInfo);
+}
 
 export function listImages(input: ListImagesInput): Promise<PaginatedDTO<MediaAssetDTO>> {
   const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });

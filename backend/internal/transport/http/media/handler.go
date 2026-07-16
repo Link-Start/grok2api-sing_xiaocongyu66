@@ -27,10 +27,16 @@ func (h *Handler) RegisterPublic(router *gin.Engine) {
 
 // RegisterAdmin 注册管理端媒体列表和统计端点。
 func (h *Handler) RegisterAdmin(router *gin.RouterGroup) {
+	router.GET("/media/storage", h.storageInfo)
 	router.GET("/media/images", h.listImages)
 	router.GET("/media/images/stats", h.imageStats)
 	router.GET("/media/videos", h.listVideos)
 	router.GET("/media/videos/stats", h.videoStats)
+}
+
+func (h *Handler) storageInfo(c *gin.Context) {
+	info := h.service.StorageInfo()
+	response.Success(c, http.StatusOK, gin.H{"driver": info.Driver, "label": info.Label})
 }
 
 func (h *Handler) getImage(c *gin.Context) {

@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Box, ChevronDown, Eye, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Settings, Sun, Users, Video, Network} from "lucide-react";
+import { Box, ChevronDown, Eye, FileStack, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Settings, Sun, Users, Video, Network} from "lucide-react";
 import { useTheme } from "next-themes";
 import { useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
@@ -25,6 +25,7 @@ const navigation = [
   { href: "/proxies", label: "nav.proxies", icon: Network },
   { href: "/client-keys", label: "nav.clientKeys", icon: KeyRound },
   { href: "/models", label: "nav.models", icon: Box },
+  { href: "/files", label: "nav.files", icon: FileStack },
   { href: "/gallery", label: "nav.gallery", icon: Image },
   { href: "/video-gallery", label: "nav.videoGallery", icon: Video },
   { href: "/request-audits", label: "nav.audits", icon: Eye },
