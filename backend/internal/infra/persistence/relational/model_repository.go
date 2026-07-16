@@ -129,15 +129,27 @@ func (r *ModelRepository) GetByPublicID(ctx context.Context, publicID string) (m
 	return values[0], nil
 }
 
-// GetByPublicIDCandidates 返回同一下游模型名称当前可用的全部来源路由。
+// GetByPublicIDCandidates 返回同一下游模型名称当前可服务的全部来源路由。
 // 返回顺序遵循 Build、Web、Console 的稳定 Provider 顺序。
+//
+// Prefer routes that already have ready accounts (capability/binding). If the
+// model is configured and enabled but no account can serve it yet (common when
+// model catalog catchup is off or Build ListModels has not run), still return
+// the configured routes so the gateway can answer 503 "no available account"
+// instead of a misleading 404 "model not found".
 func (r *ModelRepository) GetByPublicIDCandidates(ctx context.Context, publicID string) ([]model.Route, error) {
 	db := r.availableRoutes(r.db.db.WithContext(ctx)).Where("enabled = ?", true)
 	rows, err := findModelRoutesByPublicID(db, publicID)
-	if err != nil {
+	if err == nil {
+		return mapModelRows(rows), nil
+	}
+	// Configured-but-unservable: enabled route exists without ready accounts.
+	configured := r.db.db.WithContext(ctx).Where("enabled = ?", true)
+	fallback, fallbackErr := findModelRoutesByPublicID(configured, publicID)
+	if fallbackErr != nil {
 		return nil, mapError(err)
 	}
-	return mapModelRows(rows), nil
+	return mapModelRows(fallback), nil
 }
 
 func (r *ModelRepository) GetByPublicIDIncludingDisabled(ctx context.Context, publicID string) (model.Route, error) {
@@ -183,7 +195,12 @@ func findModelRoutesByPublicID(db *gorm.DB, publicID string) ([]modelRouteModel,
 
 func (r *ModelRepository) GetByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
 	var row modelRouteModel
-	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
+	err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error
+	if err == nil {
+		return toModelDomain(row), nil
+	}
+	// Same configured-but-unservable fallback as GetByPublicIDCandidates.
+	if fallbackErr := r.db.db.WithContext(ctx).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; fallbackErr != nil {
 		return model.Route{}, mapError(err)
 	}
 	return toModelDomain(row), nil

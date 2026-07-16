@@ -278,16 +278,21 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 	}
 	alias, ok := s.providers.ResolveModelAlias(publicModel)
 	if !ok {
+		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel))
 		return nil, "", err
 	}
 	if alias.Provider != "" && alias.UpstreamModel != "" {
 		route, routeErr := s.models.GetByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel)
 		if routeErr != nil {
+			s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_provider", alias.Provider, "alias_upstream", alias.UpstreamModel)
 			return nil, "", routeErr
 		}
 		return []modeldomain.Route{route}, alias.ReasoningEffort, nil
 	}
 	routes, err = s.models.GetByPublicIDCandidates(ctx, alias.PublicModel)
+	if err != nil {
+		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_public_model", alias.PublicModel)
+	}
 	return routes, alias.ReasoningEffort, err
 }
 

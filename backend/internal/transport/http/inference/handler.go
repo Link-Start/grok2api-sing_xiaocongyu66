@@ -1047,7 +1047,7 @@ func writeGatewayError(c *gin.Context, err error) {
 		message = clientkeyapp.ErrBillingLimit.Error()
 	case errors.Is(err, gateway.ErrModelNotFound):
 		status, code = http.StatusNotFound, "model_not_found"
-		message = "模型不存在"
+		message = "模型不存在（请 GET /v1/models 查看已启用且账号池可服务的模型 ID）"
 	case errors.Is(err, gateway.ErrResponseNotFound):
 		status, code = http.StatusNotFound, "response_not_found"
 		message = "Response 不存在或已过期"
@@ -1063,7 +1063,7 @@ func writeGatewayError(c *gin.Context, err error) {
 		status, code, message = selectionErrorResponse(c, selectionFailure)
 	case errors.Is(err, gateway.ErrResponseAccountUnavailable), errors.Is(err, gateway.ErrNoAvailableAccount):
 		status, code = http.StatusServiceUnavailable, "upstream_unavailable"
-		message = "当前没有可用的上游账号"
+		message = "当前没有可用的上游账号（模型已配置但无 active 账号具备该能力；请同步模型或检查账号状态）"
 	}
 	writeOpenAIError(c, status, code, message)
 }
@@ -1079,7 +1079,7 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 		message = clientkeyapp.ErrBillingLimit.Error()
 	case errors.Is(err, gateway.ErrModelNotFound):
 		status, errorType = http.StatusNotFound, "not_found_error"
-		message = "模型不存在"
+		message = "模型不存在（请 GET /v1/models 查看已启用且账号池可服务的模型 ID）"
 	case errors.Is(err, gateway.ErrResponseStateUnsupported), errors.Is(err, gateway.ErrConversationUnsupported):
 		status, errorType = http.StatusBadRequest, "invalid_request_error"
 		message = err.Error()
