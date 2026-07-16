@@ -46,7 +46,11 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	}
 	routes, err := s.models.GetByPublicIDCandidates(ctx, input.PublicModel)
 	if err != nil {
-		return media.Job{}, ErrModelNotFound
+		if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, input.PublicModel); confErr == nil && len(configured) > 0 {
+			routes = configured
+		} else {
+			return media.Job{}, ErrModelNotFound
+		}
 	}
 	route, err := s.selectMediaRoute(routes, input.ClientKey, model.CapabilityVideo, func(providerValue account.Provider) bool {
 		_, ok := s.providers.Videos(providerValue)

@@ -123,8 +123,16 @@ func (s *Service) GetByPublicIDCandidates(ctx context.Context, publicID string) 
 	return s.models.GetByPublicIDCandidates(ctx, publicID)
 }
 
+func (s *Service) GetConfiguredPublicIDCandidates(ctx context.Context, publicID string) ([]modeldomain.Route, error) {
+	return s.models.GetConfiguredPublicIDCandidates(ctx, publicID)
+}
+
 func (s *Service) GetByProviderUpstream(ctx context.Context, providerValue account.Provider, upstreamModel string) (modeldomain.Route, error) {
 	return s.models.GetByProviderUpstream(ctx, providerValue, upstreamModel)
+}
+
+func (s *Service) GetConfiguredByProviderUpstream(ctx context.Context, providerValue account.Provider, upstreamModel string) (modeldomain.Route, error) {
+	return s.models.GetConfiguredByProviderUpstream(ctx, providerValue, upstreamModel)
 }
 
 func (s *Service) Create(ctx context.Context, input CreateInput) (modeldomain.Route, error) {

@@ -131,25 +131,26 @@ func (r *ModelRepository) GetByPublicID(ctx context.Context, publicID string) (m
 
 // GetByPublicIDCandidates 返回同一下游模型名称当前可服务的全部来源路由。
 // 返回顺序遵循 Build、Web、Console 的稳定 Provider 顺序。
-//
-// Prefer routes that already have ready accounts (capability/binding). If the
-// model is configured and enabled but no account can serve it yet (common when
-// model catalog catchup is off or Build ListModels has not run), still return
-// the configured routes so the gateway can answer 503 "no available account"
-// instead of a misleading 404 "model not found".
 func (r *ModelRepository) GetByPublicIDCandidates(ctx context.Context, publicID string) ([]model.Route, error) {
 	db := r.availableRoutes(r.db.db.WithContext(ctx)).Where("enabled = ?", true)
 	rows, err := findModelRoutesByPublicID(db, publicID)
-	if err == nil {
-		return mapModelRows(rows), nil
-	}
-	// Configured-but-unservable: enabled route exists without ready accounts.
-	configured := r.db.db.WithContext(ctx).Where("enabled = ?", true)
-	fallback, fallbackErr := findModelRoutesByPublicID(configured, publicID)
-	if fallbackErr != nil {
+	if err != nil {
 		return nil, mapError(err)
 	}
-	return mapModelRows(fallback), nil
+	return mapModelRows(rows), nil
+}
+
+// GetConfiguredPublicIDCandidates returns enabled routes matching the public
+// model name without requiring a ready account capability/binding. Used by the
+// gateway to distinguish "model not configured" (404) from "configured but no
+// account can serve it" (503).
+func (r *ModelRepository) GetConfiguredPublicIDCandidates(ctx context.Context, publicID string) ([]model.Route, error) {
+	db := r.db.db.WithContext(ctx).Where("enabled = ?", true)
+	rows, err := findModelRoutesByPublicID(db, publicID)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return mapModelRows(rows), nil
 }
 
 func (r *ModelRepository) GetByPublicIDIncludingDisabled(ctx context.Context, publicID string) (model.Route, error) {
@@ -195,12 +196,17 @@ func findModelRoutesByPublicID(db *gorm.DB, publicID string) ([]modelRouteModel,
 
 func (r *ModelRepository) GetByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
 	var row modelRouteModel
-	err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error
-	if err == nil {
-		return toModelDomain(row), nil
+	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
+		return model.Route{}, mapError(err)
 	}
-	// Same configured-but-unservable fallback as GetByPublicIDCandidates.
-	if fallbackErr := r.db.db.WithContext(ctx).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; fallbackErr != nil {
+	return toModelDomain(row), nil
+}
+
+// GetConfiguredByProviderUpstream returns an enabled route even when no account
+// currently has the capability bound (see GetConfiguredPublicIDCandidates).
+func (r *ModelRepository) GetConfiguredByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
+	var row modelRouteModel
+	if err := r.db.db.WithContext(ctx).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
 		return model.Route{}, mapError(err)
 	}
 	return toModelDomain(row), nil

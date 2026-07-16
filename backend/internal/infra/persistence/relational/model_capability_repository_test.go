@@ -382,7 +382,7 @@ func TestWebRediscoveryRestoresCatalogRouteDefaults(t *testing.T) {
 	}
 }
 
-func TestGetByPublicIDCandidatesFallsBackToConfiguredWithoutReadyAccounts(t *testing.T) {
+func TestGetConfiguredPublicIDCandidatesWithoutReadyAccounts(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
 	models := NewModelRepository(database)
@@ -390,15 +390,17 @@ func TestGetByPublicIDCandidatesFallsBackToConfiguredWithoutReadyAccounts(t *tes
 	if err := models.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-orphan"}); err != nil {
 		t.Fatal(err)
 	}
-	routes, err := models.GetByPublicIDCandidates(ctx, "grok-orphan")
+	if _, err := models.GetByPublicIDCandidates(ctx, "grok-orphan"); err == nil {
+		t.Fatal("available candidates should miss when no account is ready")
+	}
+	routes, err := models.GetConfiguredPublicIDCandidates(ctx, "grok-orphan")
 	if err != nil {
 		t.Fatalf("expected configured route without ready accounts, got err=%v", err)
 	}
 	if len(routes) != 1 || routes[0].Provider != account.ProviderBuild {
 		t.Fatalf("routes = %#v", routes)
 	}
-	// Truly missing model still errors.
-	if _, err := models.GetByPublicIDCandidates(ctx, "definitely-not-a-model-xyz"); err == nil {
+	if _, err := models.GetConfiguredPublicIDCandidates(ctx, "definitely-not-a-model-xyz"); err == nil {
 		t.Fatal("expected not found for unknown model")
 	}
 }

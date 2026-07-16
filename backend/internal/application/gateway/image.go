@@ -99,7 +99,11 @@ func (s *Service) executeImage(
 	eventID := newAuditEventID()
 	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
 	if err != nil {
-		return nil, ErrModelNotFound
+		if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, publicModel); confErr == nil && len(configured) > 0 {
+			routes = configured
+		} else {
+			return nil, ErrModelNotFound
+		}
 	}
 	route, err := s.selectMediaRoute(routes, key, capability, supports)
 	if err != nil {

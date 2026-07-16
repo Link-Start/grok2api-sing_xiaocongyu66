@@ -92,7 +92,9 @@ type routeResolver interface {
 	Get(ctx context.Context, id uint64) (modeldomain.Route, error)
 	GetByPublicID(ctx context.Context, publicID string) (modeldomain.Route, error)
 	GetByPublicIDCandidates(ctx context.Context, publicID string) ([]modeldomain.Route, error)
+	GetConfiguredPublicIDCandidates(ctx context.Context, publicID string) ([]modeldomain.Route, error)
 	GetByProviderUpstream(ctx context.Context, providerValue accountdomain.Provider, upstreamModel string) (modeldomain.Route, error)
+	GetConfiguredByProviderUpstream(ctx context.Context, providerValue accountdomain.Provider, upstreamModel string) (modeldomain.Route, error)
 }
 
 type accountModelSyncer interface {
@@ -268,12 +270,19 @@ func (s *Service) CompactResponse(ctx context.Context, input Input) (*Result, er
 }
 
 // resolvePublicModelRoutes 同时支持下游无前缀模型名和显式指定来源的兼容名称。
+// Prefer routes that already have ready accounts. If the model is only
+// configured (enabled) without a ready account, still return those routes so
+// callers get 503 "no available account" instead of a misleading 404.
 func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel string) ([]modeldomain.Route, string, error) {
 	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
 	if err == nil {
 		return routes, "", nil
 	}
+	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, publicModel); confErr == nil && len(configured) > 0 {
+		return configured, "", nil
+	}
 	if s.providers == nil {
+		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel))
 		return nil, "", err
 	}
 	alias, ok := s.providers.ResolveModelAlias(publicModel)
@@ -284,15 +293,22 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 	if alias.Provider != "" && alias.UpstreamModel != "" {
 		route, routeErr := s.models.GetByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel)
 		if routeErr != nil {
+			if configured, confErr := s.models.GetConfiguredByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel); confErr == nil {
+				return []modeldomain.Route{configured}, alias.ReasoningEffort, nil
+			}
 			s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_provider", alias.Provider, "alias_upstream", alias.UpstreamModel)
 			return nil, "", routeErr
 		}
 		return []modeldomain.Route{route}, alias.ReasoningEffort, nil
 	}
 	routes, err = s.models.GetByPublicIDCandidates(ctx, alias.PublicModel)
-	if err != nil {
-		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_public_model", alias.PublicModel)
+	if err == nil {
+		return routes, alias.ReasoningEffort, nil
 	}
+	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, alias.PublicModel); confErr == nil && len(configured) > 0 {
+		return configured, alias.ReasoningEffort, nil
+	}
+	s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_public_model", alias.PublicModel)
 	return routes, alias.ReasoningEffort, err
 }
 
@@ -387,15 +403,27 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if err != nil {
 		return nil, ErrModelNotFound
 	}
-	route, routeErr := s.selectConversationRoute(routes, input.ClientKey, operation, path, input.PreviousResponseID != "", nil)
+	// Select the route first without requiring stored-response support. Console
+	// is intentionally stateless but can still accept a complete input replay;
+	// rejecting it here would prevent the Provider compatibility boundary from
+	// normalizing the request.
+	route, routeErr := s.selectConversationRoute(routes, input.ClientKey, operation, path, false, nil)
 	var ownership *inferencedomain.ResponseOwnership
 	if input.PreviousResponseID != "" && routeErr == nil {
-		value, ownershipErr := s.responses.Get(ctx, input.PreviousResponseID, input.ClientKey.ID, time.Now().UTC())
-		if ownershipErr != nil {
-			return nil, ErrResponseNotFound
+		if s.providers.SupportsStoredResponses(route.Provider) {
+			value, ownershipErr := s.responses.Get(ctx, input.PreviousResponseID, input.ClientKey.ID, time.Now().UTC())
+			if ownershipErr != nil {
+				return nil, ErrResponseNotFound
+			}
+			ownership = &value
+			route, routeErr = s.selectConversationRoute(routes, input.ClientKey, operation, path, true, ownership)
+		} else if route.Provider == accountdomain.ProviderConsole {
+			// Console has no response store. It receives the current request as a
+			// stateless replay; the Provider normalizer removes the stale ID.
+			input.PreviousResponseID = ""
+		} else {
+			return nil, ErrResponseStateUnsupported
 		}
-		ownership = &value
-		route, routeErr = s.selectConversationRoute(routes, input.ClientKey, operation, path, true, ownership)
 	}
 	publicModel := modeldomain.ExternalPublicID(route.Provider, route.PublicID)
 	input.PublicModel = publicModel
