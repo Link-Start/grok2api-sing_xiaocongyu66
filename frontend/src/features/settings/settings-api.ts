@@ -19,7 +19,7 @@ export type SettingsConfigDTO = {
   providerBuild: { baseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string };
   providerWeb: {
     baseURL: string; quotaTimeout: string; chatTimeout: string; imageTimeout: string; videoTimeout: string;
-    statsigMode: "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
+    statsigMode: "local" | "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
     mediaConcurrency: number; allowNSFW: boolean;
     recoveryBackoffBase: string; recoveryBackoffMax: string;
   };
@@ -251,7 +251,7 @@ const settingsConfigValidator = hasShape({
   providerBuild: hasShape({ baseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString }),
   providerWeb: hasShape({
     baseURL: isString, quotaTimeout: isString, chatTimeout: isString, imageTimeout: isString, videoTimeout: isString,
-    statsigMode: isOneOf("manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
+    statsigMode: isOneOf("local", "manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
     statsigSignerURL: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, recoveryBackoffBase: isString, recoveryBackoffMax: isString,
   }),
   providerConsole: hasShape({ baseURL: isString, userAgent: isString, chatTimeout: isString }),

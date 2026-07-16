@@ -15,7 +15,9 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/web/statsig"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/singleflight"
@@ -362,29 +364,54 @@ func validStatsigID(value string) bool {
 	return err == nil && len(decoded) == 70
 }
 
+func statsigLogMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
+		return method
+	default:
+		return "OTHER"
+	}
+}
+
 func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request, token string, lease *infraegress.Lease) {
 	if request == nil {
 		return
 	}
 	cfg := a.config()
 	request.Header.Del("x-statsig-id")
-	if cfg.StatsigMode == "manual" {
+	logMethod := statsigLogMethod(request.Method)
+
+	switch strings.TrimSpace(cfg.StatsigMode) {
+	case config.StatsigModeManual, "manual":
 		if value := strings.TrimSpace(cfg.StatsigManualValue); validStatsigID(value) {
 			request.Header.Set("x-statsig-id", value)
 		}
 		return
+	case config.StatsigModeLocal, "local", "":
+		path := "/"
+		if request.URL != nil {
+			if p := request.URL.EscapedPath(); p != "" {
+				path = p
+			}
+		}
+		value, err := statsig.Generate(path, request.Method, time.Now().Unix())
+		if err != nil || !validStatsigID(value) {
+			a.log().Warn("web_statsig_local_failed", "method", logMethod, "error", err)
+			return
+		}
+		request.Header.Set("x-statsig-id", value)
+		return
+	case config.StatsigModeURL, "url":
+		// Remote signer path (optional / legacy). Prefer local for new installs.
+	default:
+		a.log().Warn("web_statsig_unknown_mode", "mode", cfg.StatsigMode)
+		return
 	}
+
 	if a.statsig == nil {
 		return
 	}
 	value, source, err := a.statsig.Sign(ctx, cfg.BaseURL, cfg.StatsigSignerURL, token, lease, request.Method, request.URL.String())
-	// Log only allowlisted method tokens and a coarse path class — never raw user-controlled path text.
-	logMethod := request.Method
-	switch logMethod {
-	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
-	default:
-		logMethod = "OTHER"
-	}
 	if err == nil {
 		request.Header.Set("x-statsig-id", value)
 		if source == "refresh" {
@@ -397,15 +424,23 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 	a.log().Warn("web_statsig_fetch_failed", "method", logMethod, "error", err)
 }
 
-// WarmStatsig 只使用一个 Web 账号和一个出口租约预热共享签名，不会逐账号访问上游。
+// WarmStatsig 预热 Statsig：local 模式即时可用无需预热；url 模式使用单账号单出口预热共享签名。
 func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential) (int, error) {
 	cfg := a.config()
-	if cfg.StatsigMode == "manual" {
+	switch strings.TrimSpace(cfg.StatsigMode) {
+	case config.StatsigModeManual, "manual":
 		if !validStatsigID(strings.TrimSpace(cfg.StatsigManualValue)) {
 			return 0, fmt.Errorf("手动 Statsig 配置无效")
 		}
 		return 0, nil
+	case config.StatsigModeLocal, "local", "":
+		// Pure-Go signer is ready without network; touch Generate once to fail-fast on init issues.
+		if _, err := statsig.Generate("/rest/app-chat/conversations/new", http.MethodPost, time.Now().Unix()); err != nil {
+			return 0, fmt.Errorf("本地 Statsig 签名失败: %w", err)
+		}
+		return 0, nil
 	}
+
 	if a.statsig == nil {
 		return 0, fmt.Errorf("Statsig 签名器未初始化")
 	}
@@ -428,7 +463,12 @@ func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential
 
 func (a *Adapter) invalidateSignedStatsig(method, target string) bool {
 	cfg := a.config()
-	if cfg.StatsigMode == "url" && a.statsig != nil {
+	mode := strings.TrimSpace(cfg.StatsigMode)
+	if mode == config.StatsigModeLocal || mode == "local" || mode == "" {
+		// Local signatures are timestamped per request; nothing to invalidate.
+		return true
+	}
+	if mode == config.StatsigModeURL && a.statsig != nil {
 		a.statsig.Invalidate(cfg.BaseURL, cfg.StatsigSignerURL, method, target)
 		if parsed, err := url.Parse(target); err == nil {
 			a.log().Info("web_statsig_invalidated", "method", method, "path", parsed.EscapedPath())

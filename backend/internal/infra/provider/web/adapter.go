@@ -60,7 +60,7 @@ func normalizedConfig(cfg Config) Config {
 		cfg.BaseURL = "https://grok.com"
 	}
 	if cfg.StatsigMode == "" {
-		cfg.StatsigMode = "url"
+		cfg.StatsigMode = "local"
 	}
 	// Do not inject a third-party default signer; empty means misconfigured (url mode requires explicit URL).
 	if cfg.QuotaTimeoutSeconds <= 0 {

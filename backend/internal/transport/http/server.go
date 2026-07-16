@@ -45,6 +45,9 @@ type Dependencies struct {
 	PromptCacheAffinity *promptcache.Resolver
 	Connections         connections.Tracker
 	SecureCookies       bool
+	// APIKeyHeaders are optional custom HTTP headers that may carry the client API key
+	// (in addition to Authorization Bearer and X-API-Key). Example: "congyu_15fc".
+	APIKeyHeaders []string
 	// TrustedProxies are reverse-proxy CIDRs/IPs trusted for client IP headers.
 	// Empty disables trusting X-Forwarded-For from untrusted clients.
 	TrustedProxies     []string
@@ -181,7 +184,7 @@ func New(deps Dependencies) *gin.Engine {
 			}})
 		})
 	}
-	v1.Use(middleware.ClientAuthWithConnections(deps.ClientKeys, deps.Connections))
+	v1.Use(middleware.ClientAuthWithConnections(deps.ClientKeys, deps.Connections, deps.APIKeyHeaders...))
 	inferenceHandler := inference.NewHandler(deps.Gateway, deps.Models, deps.MaxBodyBytes)
 		inferenceHandler.SetPromptCacheAffinity(deps.PromptCacheAffinity)
 		inferenceHandler.Register(v1)

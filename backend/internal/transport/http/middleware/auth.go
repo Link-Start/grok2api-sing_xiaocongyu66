@@ -41,17 +41,17 @@ func AdminAuth(service *adminauth.Service) gin.HandlerFunc {
 }
 
 // ClientAuth 校验下游 API Key，并在请求结束时释放并发租约。
-func ClientAuth(service *clientkeyapp.Service) gin.HandlerFunc {
-	return ClientAuthWithConnections(service, nil)
+func ClientAuth(service *clientkeyapp.Service, extraAPIKeyHeaders ...string) gin.HandlerFunc {
+	return ClientAuthWithConnections(service, nil, extraAPIKeyHeaders...)
 }
 
 // ClientAuthWithConnections 在鉴权成功后计入全站与按客户端的实时连接（仪表盘用）。
-func ClientAuthWithConnections(service *clientkeyapp.Service, tracker connections.Tracker) gin.HandlerFunc {
+// extraAPIKeyHeaders 为可选的自定义鉴权头名（配置项 auth.apiKeyHeaders），例如 congyu_15fc。
+// 解析顺序：Authorization Bearer → X-API-Key → 自定义头（配置顺序）。
+func ClientAuthWithConnections(service *clientkeyapp.Service, tracker connections.Tracker, extraAPIKeyHeaders ...string) gin.HandlerFunc {
+	headers := normalizeAPIKeyHeaders(extraAPIKeyHeaders)
 	return func(c *gin.Context) {
-		raw, ok := bearerToken(c.GetHeader("Authorization"))
-		if !ok {
-			raw = strings.TrimSpace(c.GetHeader("X-API-Key"))
-		}
+		raw := extractClientAPIKey(c, headers)
 		value, release, err := service.Authenticate(c.Request.Context(), raw)
 		if err != nil {
 			writeOpenAIError(c, clientErrorStatus(err), clientErrorCode(err), clientErrorMessage(err))
@@ -65,6 +65,50 @@ func ClientAuthWithConnections(service *clientkeyapp.Service, tracker connection
 		c.Set(ClientKey, value)
 		c.Next()
 	}
+}
+
+// extractClientAPIKey reads the client API key from standard and optional custom headers.
+func extractClientAPIKey(c *gin.Context, extraHeaders []string) string {
+	if raw, ok := bearerToken(c.GetHeader("Authorization")); ok {
+		return raw
+	}
+	if raw := strings.TrimSpace(c.GetHeader("X-API-Key")); raw != "" {
+		return raw
+	}
+	for _, name := range extraHeaders {
+		if raw := strings.TrimSpace(c.GetHeader(name)); raw != "" {
+			// Allow "Bearer <key>" even on custom headers for client convenience.
+			if token, ok := bearerToken(raw); ok {
+				return token
+			}
+			return raw
+		}
+	}
+	return ""
+}
+
+func normalizeAPIKeyHeaders(headers []string) []string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(headers))
+	seen := make(map[string]struct{}, len(headers))
+	for _, raw := range headers {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if lower == "authorization" || lower == "x-api-key" {
+			continue
+		}
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		out = append(out, name)
+	}
+	return out
 }
 
 // detectRequestClient classifies the caller for live connection stats (same rules as audits).

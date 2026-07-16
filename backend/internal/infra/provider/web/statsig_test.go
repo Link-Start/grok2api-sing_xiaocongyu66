@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 )
 
@@ -65,6 +66,36 @@ func TestStatsigSignerRejectsInvalidShape(t *testing.T) {
 	})}
 	if _, err := signer.requestSignature(context.Background(), "https://signer.example/sign", "POST", "/rest/test", "meta"); err == nil {
 		t.Fatal("invalid signature was accepted")
+	}
+}
+
+func TestApplySignedStatsigLocalModeGeneratesValidID(t *testing.T) {
+	adapter := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "local"}}
+	request, err := http.NewRequest(http.MethodPost, "https://grok.com/rest/app-chat/conversations/new", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.applySignedStatsig(context.Background(), request, "token", nil)
+	value := request.Header.Get("x-statsig-id")
+	if !validStatsigID(value) {
+		t.Fatalf("local mode did not set a valid x-statsig-id: %q", value)
+	}
+	// Second call should produce a different random key (same path/time may still differ).
+	request2, _ := http.NewRequest(http.MethodPost, "https://grok.com/rest/app-chat/conversations/new", nil)
+	adapter.applySignedStatsig(context.Background(), request2, "token", nil)
+	if request2.Header.Get("x-statsig-id") == "" {
+		t.Fatal("second local signature empty")
+	}
+}
+
+func TestWarmStatsigLocalModeNoNetwork(t *testing.T) {
+	adapter := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "local"}}
+	warmed, err := adapter.WarmStatsig(context.Background(), account.Credential{})
+	if err != nil {
+		t.Fatalf("local warm: %v", err)
+	}
+	if warmed != 0 {
+		t.Fatalf("local warm should not fetch remote keys, warmed=%d", warmed)
 	}
 }
 
@@ -265,6 +296,10 @@ func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	manual := &Adapter{cfg: Config{StatsigMode: "manual"}, statsig: newStatsigSigner()}
 	if manual.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
 		t.Fatal("manual Statsig must not be invalidated automatically")
+	}
+	local := &Adapter{cfg: Config{StatsigMode: "local"}, statsig: newStatsigSigner()}
+	if !local.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
+		t.Fatal("local Statsig should report handled invalidation (per-request, no cache)")
 	}
 	urlMode := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "url", StatsigSignerURL: "https://signer.example/sign"}, statsig: newStatsigSigner()}
 	if !urlMode.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {

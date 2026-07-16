@@ -191,14 +191,28 @@ func TestStatsigManualValueIsWriteOnlyAndClearedByURLMode(t *testing.T) {
 	}
 }
 
-func TestLoadPersistedRejectsIncompleteStatsigPayload(t *testing.T) {
+func TestLoadPersistedMigratesEmptyStatsigToLocal(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)
 	value.ProviderWeb.StatsigMode = ""
 	value.ProviderWeb.StatsigSignerURL = ""
 	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatalf("empty Statsig should migrate to local: %v", err)
+	}
+	if loaded.Provider.Web.StatsigMode != config.StatsigModeLocal {
+		t.Fatalf("StatsigMode = %q, want local", loaded.Provider.Web.StatsigMode)
+	}
+}
+
+func TestLoadPersistedRejectsInvalidStatsigMode(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.ProviderWeb.StatsigMode = "remote-api"
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
 	if _, _, _, err := LoadPersisted(context.Background(), cfg, repository); err == nil {
-		t.Fatal("incomplete Statsig settings were accepted")
+		t.Fatal("invalid Statsig mode was accepted")
 	}
 }
 

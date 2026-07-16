@@ -98,7 +98,8 @@ export function SettingsPage() {
               <SettingsField controlId="web-base-url" className="sm:col-span-2" label={t("settings.web.baseURL")} error={form.formState.errors.providerWeb?.baseURL?.message}><Input id="web-base-url" {...form.register("providerWeb.baseURL")} /></SettingsField>
               <SettingsField controlId="web-statsig-mode" className="sm:col-span-2" label={t("settings.web.statsigMode")} error={form.formState.errors.providerWeb?.statsigMode?.message}>
                 <Controller control={form.control} name="providerWeb.statsigMode" render={({ field }) => (
-                  <div id="web-statsig-mode" role="radiogroup" className="grid h-8 grid-cols-2 rounded-md bg-muted/55 p-0.5">
+                  <div id="web-statsig-mode" role="radiogroup" className="grid h-8 grid-cols-3 rounded-md bg-muted/55 p-0.5">
+                    <Button type="button" role="radio" size="sm" variant={field.value === "local" ? "secondary" : "ghost"} className="h-7 text-xs shadow-none" aria-checked={field.value === "local"} onClick={() => field.onChange("local")}>{t("settings.web.statsigLocal")}</Button>
                     <Button type="button" role="radio" size="sm" variant={field.value === "manual" ? "secondary" : "ghost"} className="h-7 text-xs shadow-none" aria-checked={field.value === "manual"} onClick={() => field.onChange("manual")}>{t("settings.web.statsigManual")}</Button>
                     <Button type="button" role="radio" size="sm" variant={field.value === "url" ? "secondary" : "ghost"} className="h-7 text-xs shadow-none" aria-checked={field.value === "url"} onClick={() => field.onChange("url")}>{t("settings.web.statsigURL")}</Button>
                   </div>
@@ -108,11 +109,15 @@ export function SettingsPage() {
                 <SettingsField controlId="web-statsig-manual" className="sm:col-span-2" label={t("settings.web.statsigValue")} badge={statsigManualConfigured ? t("settings.web.statsigConfigured") : undefined} error={form.formState.errors.providerWeb?.statsigManualValue?.message}>
                   <Input id="web-statsig-manual" type="password" autoComplete="off" placeholder={statsigManualConfigured ? t("settings.web.statsigKeepConfigured") : t("settings.web.statsigValuePlaceholder")} {...form.register("providerWeb.statsigManualValue")} />
                 </SettingsField>
-              ) : (
+              ) : null}
+              {statsigMode === "url" ? (
                 <SettingsField controlId="web-statsig-url" className="sm:col-span-2" label={t("settings.web.statsigSignerURL")} error={form.formState.errors.providerWeb?.statsigSignerURL?.message}>
                   <Input id="web-statsig-url" type="url" placeholder="http://grok-signer-go:8788/sign" {...form.register("providerWeb.statsigSignerURL")} />
                 </SettingsField>
-              )}
+              ) : null}
+              {statsigMode === "local" ? (
+                <p className="sm:col-span-2 text-xs text-muted-foreground">{t("settings.web.statsigLocalHint")}</p>
+              ) : null}
               <SettingsField controlId="web-quota-timeout" label={t("settings.web.quotaTimeout")} error={form.formState.errors.providerWeb?.quotaTimeout?.message}><Controller control={form.control} name="providerWeb.quotaTimeout" render={({ field }) => <DurationInput id="web-quota-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-chat-timeout" label={t("settings.web.chatTimeout")} error={form.formState.errors.providerWeb?.chatTimeout?.message}><Controller control={form.control} name="providerWeb.chatTimeout" render={({ field }) => <DurationInput id="web-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-image-timeout" label={t("settings.web.imageTimeout")} error={form.formState.errors.providerWeb?.imageTimeout?.message}><Controller control={form.control} name="providerWeb.imageTimeout" render={({ field }) => <DurationInput id="web-image-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>

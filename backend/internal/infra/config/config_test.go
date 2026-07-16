@@ -157,6 +157,9 @@ func TestValidateRejectsUnsafeRuntimeLimits(t *testing.T) {
 		"console timeout": func(cfg *Config) {
 			cfg.Provider.Console.ChatTimeout = Duration(time.Second)
 		},
+		"api key header empty": func(cfg *Config) { cfg.Auth.APIKeyHeaders = []string{" "} },
+		"api key header auth":  func(cfg *Config) { cfg.Auth.APIKeyHeaders = []string{"Authorization"} },
+		"api key header bad":   func(cfg *Config) { cfg.Auth.APIKeyHeaders = []string{"bad header"} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -226,13 +229,13 @@ func TestValidateStatsigModes(t *testing.T) {
 	if err := remote.Validate(); err == nil {
 		t.Fatal("empty Statsig signer URL was accepted without normalize")
 	}
-	// Normalize rewrites legacy/empty URL so upgrades boot without crash-loop.
+	// Normalize migrates legacy/empty/placeholder URL modes to pure-Go local signing.
 	legacy := base
 	legacy.Provider.Web.StatsigMode = StatsigModeURL
 	legacy.Provider.Web.StatsigSignerURL = DefaultStatsigSignerURL
 	NormalizeLegacyStatsig(&legacy)
-	if legacy.Provider.Web.StatsigSignerURL != DefaultLocalStatsigSignerURL {
-		t.Fatalf("legacy signer not rewritten: %q", legacy.Provider.Web.StatsigSignerURL)
+	if legacy.Provider.Web.StatsigMode != StatsigModeLocal {
+		t.Fatalf("legacy mode not migrated to local: %q", legacy.Provider.Web.StatsigMode)
 	}
 	if err := legacy.Validate(); err != nil {
 		t.Fatalf("normalized legacy Statsig rejected: %v", err)
@@ -241,8 +244,22 @@ func TestValidateStatsigModes(t *testing.T) {
 	empty.Provider.Web.StatsigMode = StatsigModeURL
 	empty.Provider.Web.StatsigSignerURL = ""
 	NormalizeLegacyStatsig(&empty)
+	if empty.Provider.Web.StatsigMode != StatsigModeLocal {
+		t.Fatalf("empty signer not migrated to local: %q", empty.Provider.Web.StatsigMode)
+	}
 	if err := empty.Validate(); err != nil {
 		t.Fatalf("normalized empty Statsig rejected: %v", err)
+	}
+	local := base
+	local.Provider.Web.StatsigMode = StatsigModeLocal
+	if err := local.Validate(); err != nil {
+		t.Fatalf("local Statsig rejected: %v", err)
+	}
+	blankMode := base
+	blankMode.Provider.Web.StatsigMode = ""
+	NormalizeLegacyStatsig(&blankMode)
+	if blankMode.Provider.Web.StatsigMode != StatsigModeLocal {
+		t.Fatalf("blank mode not defaulted to local: %q", blankMode.Provider.Web.StatsigMode)
 	}
 }
 
@@ -305,5 +322,15 @@ func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
 				t.Fatalf("EffectivePublicAPIBaseURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateAcceptsCustomAPIKeyHeaders(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Auth.APIKeyHeaders = []string{"congyu_15fc", "My-Key"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("custom apiKeyHeaders rejected: %v", err)
 	}
 }

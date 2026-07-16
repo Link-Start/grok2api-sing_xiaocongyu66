@@ -18,6 +18,8 @@ import (
 )
 
 const (
+	// StatsigModeLocal signs x-statsig-id in-process (pure Go, no remote signer).
+	StatsigModeLocal              = "local"
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
@@ -116,6 +118,9 @@ type AuthConfig struct {
 	AccessTokenTTL  Duration `yaml:"accessTokenTTL"`
 	RefreshTokenTTL Duration `yaml:"refreshTokenTTL"`
 	SecureCookies   bool     `yaml:"secureCookies"`
+	// APIKeyHeaders lists extra HTTP headers that may carry the client API key value
+	// (e.g. "congyu_15fc"). Authorization: Bearer and X-API-Key are always accepted.
+	APIKeyHeaders []string `yaml:"apiKeyHeaders"`
 }
 
 type ProviderConfig struct {
@@ -300,27 +305,32 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-// DefaultLocalStatsigSignerURL is the boot-safe placeholder when no trusted signer is configured.
-// Operators should replace it with a real self-hosted signer or switch StatsigMode to manual.
+// DefaultLocalStatsigSignerURL is retained only for migration of historical configs.
+// New installs default to StatsigModeLocal (in-process pure-Go signing).
 const DefaultLocalStatsigSignerURL = "http://127.0.0.1:8788/sign"
 
-// NormalizeLegacyStatsig rewrites empty or historically-default third-party Statsig signer URLs
-// so upgrades do not crash-loop on persisted runtime settings.
+// NormalizeLegacyStatsig migrates empty / third-party / placeholder signer setups to local
+// pure-Go signing so upgrades boot without a remote Statsig service.
 func NormalizeLegacyStatsig(cfg *Config) {
 	if cfg == nil {
 		return
 	}
 	mode := strings.TrimSpace(cfg.Provider.Web.StatsigMode)
 	if mode == "" {
-		mode = StatsigModeURL
-		cfg.Provider.Web.StatsigMode = mode
+		cfg.Provider.Web.StatsigMode = StatsigModeLocal
+		cfg.Provider.Web.StatsigSignerURL = ""
+		return
 	}
 	if mode != StatsigModeURL {
 		return
 	}
 	signer := strings.TrimSpace(cfg.Provider.Web.StatsigSignerURL)
-	if signer == "" || strings.EqualFold(signer, DefaultStatsigSignerURL) {
-		cfg.Provider.Web.StatsigSignerURL = DefaultLocalStatsigSignerURL
+	// Placeholder or banned third-party defaults → pure-Go local signing.
+	if signer == "" ||
+		strings.EqualFold(signer, DefaultStatsigSignerURL) ||
+		strings.EqualFold(signer, DefaultLocalStatsigSignerURL) {
+		cfg.Provider.Web.StatsigMode = StatsigModeLocal
+		cfg.Provider.Web.StatsigSignerURL = ""
 	}
 }
 
@@ -501,6 +511,8 @@ func (c Config) Validate() error {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
 	}
 	switch c.Provider.Web.StatsigMode {
+	case StatsigModeLocal:
+		// Pure-Go in-process signer; no remote endpoint or manual value required.
 	case StatsigModeManual:
 		if !validStatsigID(c.Provider.Web.StatsigManualValue) {
 			return errors.New("provider.web 手动 x-statsig-id 格式无效")
@@ -511,13 +523,13 @@ func (c Config) Validate() error {
 			return errors.New("provider.web.statsigSignerURL 不能为空（url 模式须显式配置自建或受信签名服务）")
 		}
 		if strings.EqualFold(signer, DefaultStatsigSignerURL) {
-			return fmt.Errorf("provider.web.statsigSignerURL 不能使用内置第三方默认地址 %s，请配置自建签名服务或改用 manual 模式", DefaultStatsigSignerURL)
+			return fmt.Errorf("provider.web.statsigSignerURL 不能使用内置第三方默认地址 %s，请使用 local 模式或自建签名服务", DefaultStatsigSignerURL)
 		}
 		if err := signerurl.Validate(signer); err != nil {
 			return fmt.Errorf("provider.web Statsig 签名 URL 无效: %w", err)
 		}
 	default:
-		return errors.New("provider.web Statsig 模式必须是 manual 或 url")
+		return errors.New("provider.web Statsig 模式必须是 local、manual 或 url")
 	}
 	if c.Provider.Web.QuotaTimeout.Value() < time.Second || c.Provider.Web.QuotaTimeout.Value() > 2*time.Minute ||
 		c.Provider.Web.ChatTimeout.Value() < 5*time.Second || c.Provider.Web.ChatTimeout.Value() > 30*time.Minute ||
@@ -562,7 +574,61 @@ func (c Config) Validate() error {
 	if c.ClientKeyDefaults.RPMLimit < 1 || c.ClientKeyDefaults.RPMLimit > clientkeydomain.MaxRPMLimit || c.ClientKeyDefaults.MaxConcurrent < 1 || c.ClientKeyDefaults.MaxConcurrent > clientkeydomain.MaxConcurrent {
 		return errors.New("clientKeyDefaults 超出允许范围")
 	}
+	if err := validateAPIKeyHeaders(c.Auth.APIKeyHeaders); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateAPIKeyHeaders checks optional custom client-key header names.
+// Built-in Authorization / X-API-Key need not be listed.
+func validateAPIKeyHeaders(headers []string) error {
+	if len(headers) > 16 {
+		return errors.New("auth.apiKeyHeaders 最多 16 个")
+	}
+	seen := make(map[string]struct{}, len(headers))
+	for _, raw := range headers {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			return errors.New("auth.apiKeyHeaders 不能包含空名称")
+		}
+		if len(name) > 64 {
+			return errors.New("auth.apiKeyHeaders 名称过长")
+		}
+		lower := strings.ToLower(name)
+		if lower == "authorization" || lower == "x-api-key" {
+			return errors.New("auth.apiKeyHeaders 无需重复配置 Authorization 或 X-API-Key")
+		}
+		if !isHTTPHeaderToken(name) {
+			return fmt.Errorf("auth.apiKeyHeaders 含非法头名 %q", name)
+		}
+		if _, ok := seen[lower]; ok {
+			return fmt.Errorf("auth.apiKeyHeaders 重复: %s", name)
+		}
+		seen[lower] = struct{}{}
+	}
+	return nil
+}
+
+// isHTTPHeaderToken matches RFC 7230 token characters for header field-names.
+func isHTTPHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+		//  "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+			c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func defaultConfig() Config {
@@ -587,6 +653,7 @@ func defaultConfig() Config {
 		Auth: AuthConfig{
 			AccessTokenTTL:  Duration(15 * time.Minute),
 			RefreshTokenTTL: Duration(30 * 24 * time.Hour),
+			APIKeyHeaders:   nil,
 		},
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
@@ -595,8 +662,8 @@ func defaultConfig() Config {
 				UserAgent: RecommendedBuildUserAgent,
 			},
 			Web: WebProviderConfig{
-				// Default to a local/self-hosted signer hostname, never the historical third-party public host.
-				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultLocalStatsigSignerURL,
+				// Default: pure-Go local x-statsig-id (no remote signer process).
+				BaseURL: "https://grok.com", StatsigMode: StatsigModeLocal,
 				QuotaTimeout: Duration(25 * time.Second),
 				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),
