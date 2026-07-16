@@ -34,6 +34,9 @@ type VideoInput struct {
 	AspectRatio   string
 	Resolution    string
 	ReferenceURLs []string
+	ClientType      string
+	ClientUserAgent string
+	ClientIP        string
 }
 
 func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job, error) {

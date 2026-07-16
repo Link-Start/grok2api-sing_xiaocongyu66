@@ -1,5 +1,5 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 import type { PeriodValue } from "@/shared/lib/period";
 
 export type DashboardPeriod = PeriodValue | "custom";
@@ -29,12 +29,14 @@ export type DashboardDTO = {
     billedCostUsdTicks: number;
     successRate: number;
   };
-  /** Site-wide rates for the selected period (raw counts if ≤2m, else avg/min). */
+  /** Site-wide rates for the selected period (raw counts if ≤2m, else avg/min; may be fractional). */
   liveRates: { rpm: number; tpm: number; windowSeconds: number };
   /** Totals for the same selected period as usage (API field name kept for compatibility). */
   today: { requests: number; tokens: number; start: string; end: string };
   series: Array<{ start: string; end: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number; models: Array<{ model: string; tokens: number; billedCostUsdTicks: number }> }>;
   topModels: Array<{ model: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number }>;
+  /** Downstream client breakdown for the selected period (e.g. codex:60). */
+  clients?: Array<{ client: string; label: string; count: number }>;
 };
 
 const dashboardSeriesModel = hasShape({ model: isString, tokens: isNumber, billedCostUsdTicks: isNumber });
@@ -63,6 +65,7 @@ const decodeDashboard = createObjectDecoder<DashboardDTO>("dashboard", {
   today: hasShape({ requests: isNumber, tokens: isNumber, start: isString, end: isString }),
   series: isArrayOf(dashboardSeriesItem),
   topModels: isArrayOf(dashboardModelItem),
+  clients: isOptional(isArrayOf(hasShape({ client: isString, label: isString, count: isNumber }))),
 });
 
 export type DashboardQuery = {

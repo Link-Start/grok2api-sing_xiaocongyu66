@@ -54,6 +54,10 @@ type Input struct {
 	PromptCacheKey     string
 	PreviousResponseID string
 	Operation          audit.Operation
+	// Client metadata for request audits and access analytics (optional).
+	ClientType      string
+	ClientUserAgent string
+	ClientIP        string
 }
 
 type Usage struct {
@@ -337,6 +341,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
 		Provider: string(route.Provider), Operation: operation, UsageSource: usageSource, Streaming: input.Streaming,
+		ClientType: input.ClientType, ClientUserAgent: input.ClientUserAgent, ClientIP: input.ClientIP,
 	}
 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
 		record := auditBase
@@ -718,6 +723,9 @@ type ImageGenerationInput struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	ClientType      string
+	ClientUserAgent string
+	ClientIP        string
 }
 
 type ImageEditInput struct {
@@ -728,6 +736,9 @@ type ImageEditInput struct {
 	ImageURLs      []string
 	Count          int
 	Resolution     string
+	ClientType      string
+	ClientUserAgent string
+	ClientIP        string
 	ResponseFormat string
 }
 
@@ -738,7 +749,7 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution,
 			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming,
 		})
-	}, input.Streaming, input.Resolution, input.Count, 0)
+	}, input.Streaming, input.Resolution, input.Count, 0, input.ClientType, input.ClientUserAgent, input.ClientIP)
 }
 
 func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result, error) {
@@ -747,10 +758,10 @@ func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result,
 			Credential: credential, Model: upstream, Prompt: input.Prompt,
 			ImageURLs: input.ImageURLs, Count: input.Count, Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
 		})
-	}, false, input.Resolution, input.Count, len(input.ImageURLs))
+	}, false, input.Resolution, input.Count, len(input.ImageURLs), input.ClientType, input.ClientUserAgent, input.ClientIP)
 }
 
-func (s *Service) executeImage(ctx context.Context, requestID string, key clientkey.Key, publicModel string, operation audit.Operation, execute func(provider.ImageAdapter, accountdomain.Credential, string) (*provider.Response, error), streaming bool, resolution string, requestedCount, inputImageCount int) (*Result, error) {
+func (s *Service) executeImage(ctx context.Context, requestID string, key clientkey.Key, publicModel string, operation audit.Operation, execute func(provider.ImageAdapter, accountdomain.Credential, string) (*provider.Response, error), streaming bool, resolution string, requestedCount, inputImageCount int, clientType, clientUserAgent, clientIP string) (*Result, error) {
 	startedAt := time.Now()
 	eventID := newAuditEventID()
 	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
@@ -864,6 +875,7 @@ func (s *Service) executeImage(ctx context.Context, requestID string, key client
 				Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone,
 				AccountID: &accountID, AccountName: credential.Name, StatusCode: response.StatusCode,
 				Streaming: streaming, ErrorCode: errorCode,
+				ClientType: clientType, ClientUserAgent: clientUserAgent, ClientIP: clientIP,
 				DurationMS: time.Since(startedAt).Milliseconds(), CreatedAt: time.Now().UTC(),
 			}
 			switch operation {

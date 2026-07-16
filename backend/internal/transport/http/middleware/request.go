@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/clientid"
 	"github.com/gin-gonic/gin"
 )
 
@@ -81,12 +83,46 @@ func SecurityHeaders() gin.HandlerFunc {
 	}
 }
 
-// AccessLog 只记录路径、状态和耗时，不读取请求或响应正文。
+// AccessLog 记录路径、状态、耗时与调用方元数据，不读取请求或响应正文。
 func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		startedAt := time.Now()
 		c.Next()
 		requestID, _ := c.Get(RequestIDKey)
-		logger.Info("http_request", "request_id", requestID, "method", c.Request.Method, "path", c.FullPath(), "status", c.Writer.Status(), "duration_ms", time.Since(startedAt).Milliseconds())
+		path := c.FullPath()
+		if path == "" {
+			path = c.Request.URL.Path
+		}
+		userAgent := strings.TrimSpace(c.Request.UserAgent())
+		if len(userAgent) > 200 {
+			userAgent = userAgent[:200]
+		}
+		headers := map[string]string{}
+		for _, name := range []string{
+			"x-claude-code-session-id", "x-codex-window-id", "x-codex-session-id",
+			"x-grok-conv-id", "x-grok-conversation-id",
+		} {
+			if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+				headers[strings.ToLower(name)] = value
+			}
+		}
+		clientType := clientid.Detect(userAgent, headers)
+		attrs := []any{
+			"request_id", requestID,
+			"method", c.Request.Method,
+			"path", path,
+			"status", c.Writer.Status(),
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+			"client_ip", c.ClientIP(),
+			"client_type", clientType,
+			"user_agent", userAgent,
+			"bytes_out", c.Writer.Size(),
+		}
+		if keyValue, ok := c.Get(ClientKey); ok {
+			if key, ok := keyValue.(clientkeydomain.Key); ok {
+				attrs = append(attrs, "client_key_id", key.ID, "client_key_name", key.Name, "client_key_prefix", key.Prefix)
+			}
+		}
+		logger.Info("http_request", attrs...)
 	}
 }

@@ -154,6 +154,8 @@ func toAuditDomain(value requestAuditModel) audit.Record {
 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, DurationMS: value.DurationMS,
-		ErrorCode: value.ErrorCode, CreatedAt: value.CreatedAt,
+		ErrorCode: value.ErrorCode,
+		ClientType: value.ClientType, ClientUserAgent: value.ClientUserAgent, ClientIP: value.ClientIP,
+		CreatedAt: value.CreatedAt,
 	}
 }

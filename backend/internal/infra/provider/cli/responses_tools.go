@@ -134,6 +134,7 @@ func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesTool
 }
 
 // normalizeClientToolSearchParallel 保证搜索函数先独立完成，再由客户端选择并回传工具定义。
+// Claude Code / Codex 常默认 parallel_tool_calls=true；显式 true 时强制收敛为 false 并给出兼容警告，避免整请求 400。
 func (c *responsesToolCompatibility) normalizeClientToolSearchParallel(payload map[string]json.RawMessage, clientSearch bool) error {
 	if !clientSearch {
 		return nil
@@ -152,10 +153,9 @@ func (c *responsesToolCompatibility) normalizeClientToolSearchParallel(payload m
 		}
 	}
 	if parallel {
-		return &responsesRequestError{
-			Message: "客户端 tool_search 暂不支持并行工具调用",
-			Param:   "parallel_tool_calls", Code: "unsupported_parameter",
-		}
+		payload["parallel_tool_calls"] = mustJSON(false)
+		c.changed = true
+		c.addWarning("client_tool_search_serial_forced")
 	}
 	return nil
 }

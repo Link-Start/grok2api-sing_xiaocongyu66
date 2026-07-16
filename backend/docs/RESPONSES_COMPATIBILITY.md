@@ -85,7 +85,7 @@ Grok Build `0.2.99` 尚未原生接受 OpenAI 新版 `namespace` 与 `tool_searc
 
 - `namespace` 中可立即调用的函数会转换为不超过 `128` 字符的唯一普通函数别名；JSON 与 SSE 中的函数调用会恢复原始 `name` 和 `namespace`，响应根部的 `tools` 也恢复为客户端声明。
 - `execution: "client"` 的 `tool_search` 会转换为内部普通函数。带 `defer_loading: true` 的函数在首次请求中不暴露；客户端回传 `tool_search_output` 后，选中的函数才会进入下一轮上游工具集合。
-- 客户端 Tool Search 会默认写入 `parallel_tool_calls: false`；显式要求并行会返回错误，避免搜索函数与普通函数在工具定义加载完成前同时执行。
+- 客户端 Tool Search 会默认写入 `parallel_tool_calls: false`；若客户端显式提交 `true`，网关会强制收敛为 `false` 并返回兼容警告 `client_tool_search_serial_forced`，避免搜索函数与普通函数在工具定义加载完成前同时执行，同时兼容 Claude Code / Codex 的默认并行设置。
 - 单独声明 `defer_loading: true` 但没有客户端 `tool_search` 时返回参数错误，避免把原本延迟的工具静默改成立即可调用。
 - 服务端托管 Tool Search 需要上游在同一次推理中搜索并注入工具，当前无法等价模拟，因此缺省或 `execution: "server"` 会返回 `400 unsupported_parameter`，不会静默展开全部延迟工具。
 - `additional_tools` 中的定义会进入上游顶层工具集合，同时在原输入位置保留 developer 边界消息，提示这些工具从该位置开始可用。由于 0.2.99 没有位置化工具定义，响应会携带 `additional_tools_position_approximated` 兼容警告。

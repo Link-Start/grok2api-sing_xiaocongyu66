@@ -38,6 +38,9 @@ export type AuditDTO = {
   contextOutputTokens: number;
   durationMs: number;
   errorCode?: string;
+  clientType?: string;
+  clientUserAgent?: string;
+  clientIp?: string;
   createdAt: string;
 };
 
@@ -84,7 +87,9 @@ const auditValidator = hasShape({
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,
   costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString),
   numSourcesUsed: isNumber, numServerSideToolsUsed: isNumber, contextInputTokens: isNumber, contextOutputTokens: isNumber,
-  durationMs: isNumber, errorCode: isOptional(isString), createdAt: isString,
+  durationMs: isNumber, errorCode: isOptional(isString),
+  clientType: isOptional(isString), clientUserAgent: isOptional(isString), clientIp: isOptional(isString),
+  createdAt: isString,
 });
 const decodeAuditPage = createObjectDecoder<AuditCursorPageDTO>("audit page", {
   items: isArrayOf(auditValidator), pageSize: isNumber, nextCursor: isString, hasMore: isBoolean,

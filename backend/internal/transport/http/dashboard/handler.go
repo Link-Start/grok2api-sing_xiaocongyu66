@@ -17,21 +17,28 @@ func NewHandler(service *dashboardapp.Service) *Handler { return &Handler{servic
 func (h *Handler) Register(router *gin.RouterGroup) { router.GET("/dashboard", h.get) }
 
 type responseDTO struct {
-	Period      string          `json:"period"`
-	GeneratedAt time.Time       `json:"generatedAt"`
-	Range       rangeDTO        `json:"range"`
-	Resources   resourcesDTO    `json:"resources"`
-	Usage       usageDTO        `json:"usage"`
-	LiveRates   liveRatesDTO    `json:"liveRates"`
-	Today       dayUsageDTO     `json:"today"`
-	Series      []seriesDTO     `json:"series"`
-	TopModels   []modelUsageDTO `json:"topModels"`
+	Period      string           `json:"period"`
+	GeneratedAt time.Time        `json:"generatedAt"`
+	Range       rangeDTO         `json:"range"`
+	Resources   resourcesDTO     `json:"resources"`
+	Usage       usageDTO         `json:"usage"`
+	LiveRates   liveRatesDTO     `json:"liveRates"`
+	Today       dayUsageDTO      `json:"today"`
+	Series      []seriesDTO      `json:"series"`
+	TopModels   []modelUsageDTO  `json:"topModels"`
+	Clients     []clientUsageDTO `json:"clients"`
 }
 
 type liveRatesDTO struct {
-	RPM           int64 `json:"rpm"`
-	TPM           int64 `json:"tpm"`
-	WindowSeconds int   `json:"windowSeconds"`
+	RPM           float64 `json:"rpm"`
+	TPM           float64 `json:"tpm"`
+	WindowSeconds int     `json:"windowSeconds"`
+}
+
+type clientUsageDTO struct {
+	Client string `json:"client"`
+	Label  string `json:"label"`
+	Count  int64  `json:"count"`
 }
 
 type dayUsageDTO struct {
@@ -141,6 +148,10 @@ func (h *Handler) get(c *gin.Context) {
 	for _, item := range result.TopModels {
 		topModels = append(topModels, modelUsageDTO{Model: item.Model, Requests: item.Requests, InputTokens: item.InputTokens, CachedInputTokens: item.CachedInputTokens, OutputTokens: item.OutputTokens, ReasoningTokens: item.ReasoningTokens, Tokens: item.Tokens, BilledCostUSDTicks: item.BilledCostUSDTicks})
 	}
+	clients := make([]clientUsageDTO, 0, len(result.Clients))
+	for _, item := range result.Clients {
+		clients = append(clients, clientUsageDTO{Client: item.Client, Label: item.Label, Count: item.Count})
+	}
 	response.Success(c, http.StatusOK, responseDTO{
 		Period:      string(result.Period),
 		GeneratedAt: result.GeneratedAt,
@@ -159,5 +170,6 @@ func (h *Handler) get(c *gin.Context) {
 		Today:     dayUsageDTO{Requests: result.Today.Requests, Tokens: result.Today.Tokens, Start: result.Today.Start, End: result.Today.End},
 		Series:    series,
 		TopModels: topModels,
+		Clients:   clients,
 	})
 }

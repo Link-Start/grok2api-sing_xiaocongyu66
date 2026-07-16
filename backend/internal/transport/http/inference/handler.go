@@ -18,6 +18,7 @@ import (
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/pkg/clientid"
 	"github.com/chenyme/grok2api/backend/internal/pkg/promptcache"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	"github.com/gin-gonic/gin"
@@ -217,10 +218,10 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 		metadataUserID = request.Metadata.UserID
 	}
 	promptCacheKey := h.resolvePromptCacheKey(c, clientKey, request.PromptCacheKey, request.User, metadataUserID)
-	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), gateway.Input{
+	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), withClientMeta(c, gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: promptCacheKey,
-	})
+	}))
 	if err != nil {
 		writeGatewayError(c, err)
 		return
@@ -261,15 +262,38 @@ func (h *Handler) createMessage(c *gin.Context) {
 		metadataUserID = request.Metadata.UserID
 	}
 	promptCacheKey := h.resolvePromptCacheKey(c, clientKey, "", "", metadataUserID)
-	result, err := h.gateway.CreateMessage(c.Request.Context(), gateway.Input{
+	result, err := h.gateway.CreateMessage(c.Request.Context(), withClientMeta(c, gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: promptCacheKey,
-	})
+	}))
 	if err != nil {
 		writeGatewayAnthropicError(c, err)
 		return
 	}
 	h.writeResult(c, result, request.Stream)
+}
+
+// withClientMeta attaches detected downstream client type / UA / IP for request audits.
+func withClientMeta(c *gin.Context, input gateway.Input) gateway.Input {
+	input.ClientType, input.ClientUserAgent, input.ClientIP = detectClient(c)
+	return input
+}
+
+func detectClient(c *gin.Context) (clientType, userAgent, clientIP string) {
+	userAgent = strings.TrimSpace(c.Request.UserAgent())
+	if len(userAgent) > 256 {
+		userAgent = userAgent[:256]
+	}
+	headers := map[string]string{}
+	for _, name := range []string{
+		"x-claude-code-session-id", "x-codex-window-id", "x-codex-session-id",
+		"x-grok-conv-id", "x-grok-conversation-id",
+	} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			headers[strings.ToLower(name)] = value
+		}
+	}
+	return clientid.Detect(userAgent, headers), userAgent, c.ClientIP()
 }
 
 // resolvePromptCacheKey picks a stable conversation affinity key for xAI prompt caching.
@@ -346,10 +370,12 @@ func (h *Handler) generateImage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	clientType, clientUA, clientIP := detectClient(c)
 	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
 		Resolution: request.Resolution, ResponseFormat: request.ResponseFormat, Streaming: request.Stream,
+		ClientType: clientType, ClientUserAgent: clientUA, ClientIP: clientIP,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -502,9 +528,11 @@ func (h *Handler) editImage(c *gin.Context) {
 	if !ok {
 		return
 	}
+	clientType, clientUA, clientIP := detectClient(c)
 	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
 		ImageURLs: imageURLs, Count: count, Resolution: resolution, ResponseFormat: request.ResponseFormat,
+		ClientType: clientType, ClientUserAgent: clientUA, ClientIP: clientIP,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -600,10 +628,12 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	if !ok {
 		return
 	}
+	clientType, clientUA, clientIP := detectClient(c)
 	job, err := h.gateway.CreateVideo(c.Request.Context(), gateway.VideoInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
 		Prompt: prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
 		ReferenceURLs: referenceURLs,
+		ClientType: clientType, ClientUserAgent: clientUA, ClientIP: clientIP,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -738,7 +768,7 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		metadataUserID = request.Metadata.UserID
 	}
 	promptCacheKey := h.resolvePromptCacheKey(c, clientKey, request.PromptCacheKey, request.User, metadataUserID)
-	input := gateway.Input{RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model, Body: body, Streaming: request.Stream, PromptCacheKey: promptCacheKey, PreviousResponseID: request.PreviousResponseID}
+	input := withClientMeta(c, gateway.Input{RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model, Body: body, Streaming: request.Stream, PromptCacheKey: promptCacheKey, PreviousResponseID: request.PreviousResponseID})
 	var result *gateway.Result
 	if compact {
 		result, err = h.gateway.CompactResponse(c.Request.Context(), input)

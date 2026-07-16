@@ -27,13 +27,22 @@ type Usage struct {
 // LiveRates is site-wide traffic over the selected dashboard period.
 // For short windows (≤2 minutes) values are raw counts (new-api style).
 // For longer ranges RPM/TPM are average per-minute rates across the period.
+// RPM/TPM use float64 so low-traffic long ranges (e.g. 2039 req / 30d ≈ 0.05 RPM)
+// are not rounded to zero.
 type LiveRates struct {
 	// RPM is requests/min (or raw request count when WindowSeconds ≤ 120).
-	RPM int64
+	RPM float64
 	// TPM is tokens/min (or raw token count when WindowSeconds ≤ 120).
-	TPM int64
+	TPM float64
 	// WindowSeconds is the observation window length in seconds.
 	WindowSeconds int
+}
+
+// ClientUsage is request count for one detected downstream client type in the period.
+type ClientUsage struct {
+	Client string // stable id: codex, claude_code, hermes, …
+	Label  string // short display label: Codex, Claude Code, …
+	Count  int64
 }
 
 // DayUsage is totals for the selected dashboard period (same window as Usage).
@@ -85,4 +94,5 @@ type Aggregate struct {
 	Buckets      []Bucket
 	TopModels    []ModelUsage
 	ModelBuckets []ModelBucket
+	Clients      []ClientUsage
 }

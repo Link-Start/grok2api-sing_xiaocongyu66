@@ -280,6 +280,9 @@ type requestAuditModel struct {
 	ContextOutputTokens     int64     `gorm:"not null;default:0"`
 	DurationMS              int64     `gorm:"not null;default:0"`
 	ErrorCode               string    `gorm:"size:100;check:chk_request_audits_error_code,length(error_code) <= 100"`
+	ClientType              string    `gorm:"size:32;not null;default:''"`
+	ClientUserAgent         string    `gorm:"size:256;not null;default:''"`
+	ClientIP                string    `gorm:"size:64;not null;default:''"`
 	CreatedAt               time.Time `gorm:"not null"`
 }
 

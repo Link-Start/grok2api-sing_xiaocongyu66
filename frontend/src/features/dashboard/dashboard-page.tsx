@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, Box, CircleDollarSign, Gauge, RefreshCw, Users, Zap } from "lucide-react";
+import { Activity, Box, CircleDollarSign, Gauge, MonitorSmartphone, RefreshCw, Users, Zap } from "lucide-react";
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Area, Bar, CartesianGrid, ComposedChart, Line, XAxis, YAxis } from "recharts";
@@ -124,6 +124,8 @@ export function DashboardPage() {
     ? t("dashboard.tpmAverageDetail", { period: periodLabel })
     : t("dashboard.tpmDetail", { seconds: windowSeconds });
   const periodTotalsDetail = t("dashboard.periodTotalsDetail", { period: periodLabel });
+  const clients = dashboard?.clients ?? [];
+  const rateDigits = rateIsAverage ? 2 : 0;
 
   return (
     <div className="space-y-8">
@@ -181,11 +183,33 @@ export function DashboardPage() {
           <span className="text-[11px] text-muted-foreground">{t("dashboard.sharedPeriodHint", { period: periodLabel })}</span>
         </div>
         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricCard icon={<Gauge />} label={t("dashboard.rpm")} value={formatNumber(liveRates?.rpm ?? 0, i18n.language)} detail={rpmDetail} loading={loading} />
-          <MetricCard icon={<Zap />} label={t("dashboard.tpm")} value={formatNumber(liveRates?.tpm ?? 0, i18n.language)} detail={tpmDetail} loading={loading} />
-          <MetricCard icon={<Activity />} label={t("dashboard.periodRequests")} value={formatNumber(today?.requests ?? 0, i18n.language)} detail={periodTotalsDetail} loading={loading} />
-          <MetricCard icon={<Box />} label={t("dashboard.periodTokens")} value={formatNumber(today?.tokens ?? 0, i18n.language)} detail={periodTotalsDetail} loading={loading} />
+          <MetricCard icon={<Gauge />} label={t("dashboard.rpm")} value={formatNumber(liveRates?.rpm ?? 0, i18n.language, rateDigits)} detail={rpmDetail} loading={loading} />
+          <MetricCard icon={<Zap />} label={t("dashboard.tpm")} value={formatNumber(liveRates?.tpm ?? 0, i18n.language, rateDigits)} detail={tpmDetail} loading={loading} />
+          <MetricCard icon={<Activity />} label={t("dashboard.periodRequests")} value={formatNumber(today?.requests ?? 0, i18n.language, 0)} detail={periodTotalsDetail} loading={loading} />
+          <MetricCard icon={<Box />} label={t("dashboard.periodTokens")} value={formatNumber(today?.tokens ?? 0, i18n.language, 0)} detail={periodTotalsDetail} loading={loading} />
         </div>
+      </section>
+
+      <section className="space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="shrink-0 text-sm font-medium">{t("dashboard.clients")}</h2>
+          <span className="text-[11px] text-muted-foreground">{t("dashboard.clientsHint", { period: periodLabel })}</span>
+        </div>
+        {loading ? (
+          <div className="flex min-h-16 items-center rounded-lg bg-card px-4"><Spinner /></div>
+        ) : clients.length === 0 ? (
+          <p className="rounded-lg bg-card px-4 py-6 text-center text-xs text-muted-foreground">{t("dashboard.clientsEmpty")}</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {clients.map((item) => (
+              <div key={item.client} className="inline-flex min-w-[7.5rem] items-center gap-2 rounded-lg bg-card px-3 py-2" title={item.client}>
+                <MonitorSmartphone className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="text-xs text-muted-foreground">{item.label || item.client}</span>
+                <span className="ml-auto text-sm font-medium tabular-nums">{formatNumber(item.count, i18n.language, 0)}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="space-y-4">

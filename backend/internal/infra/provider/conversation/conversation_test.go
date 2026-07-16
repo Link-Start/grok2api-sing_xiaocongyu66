@@ -455,3 +455,37 @@ func TestConvertResponsesStreamEmitsDoneOnlyToolArguments(t *testing.T) {
 		t.Fatalf("tool block closed multiple times: %s", text)
 	}
 }
+
+// TestConvertResponsesStreamClosesTextBeforeTool 回归 Claude Code “Content block not found”：
+// text/thinking 未 stop 就发出 tool_use content_block_start 时，客户端会按 index 查找失败。
+func TestConvertResponsesStreamClosesTextBeforeTool(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.5","status":"in_progress"}}`, "",
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"Let me read that."}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"Read","arguments":""}}`, "",
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"item_1","arguments":"{\"path\":\"a.go\"}"}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":2}}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStreamWithOptions(io.NopCloser(strings.NewReader(stream)), OperationMessages, ResponseOptions{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	textStart := strings.Index(text, `"type":"text"`)
+	textStop := strings.Index(text, `"type":"content_block_stop"`)
+	toolStart := strings.Index(text, `"type":"tool_use"`)
+	if textStart < 0 || textStop < 0 || toolStart < 0 {
+		t.Fatalf("missing blocks:\n%s", text)
+	}
+	if !(textStart < textStop && textStop < toolStart) {
+		t.Fatalf("text must stop before tool_use start:\n%s", text)
+	}
+	if strings.Count(text, `"type":"content_block_start"`) != 2 || strings.Count(text, `"type":"content_block_stop"`) != 2 {
+		t.Fatalf("expected one text + one tool block fully closed:\n%s", text)
+	}
+}

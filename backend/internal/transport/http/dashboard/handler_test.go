@@ -87,14 +87,19 @@ func TestHandlerReturnsLiveRatesAndToday(t *testing.T) {
 	var envelope struct {
 		Data struct {
 			LiveRates struct {
-				RPM           int64 `json:"rpm"`
-				TPM           int64 `json:"tpm"`
-				WindowSeconds int   `json:"windowSeconds"`
+				RPM           float64 `json:"rpm"`
+				TPM           float64 `json:"tpm"`
+				WindowSeconds int     `json:"windowSeconds"`
 			} `json:"liveRates"`
 			Today struct {
 				Requests int64 `json:"requests"`
 				Tokens   int64 `json:"tokens"`
 			} `json:"today"`
+			Clients []struct {
+				Client string `json:"client"`
+				Label  string `json:"label"`
+				Count  int64  `json:"count"`
+			} `json:"clients"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {

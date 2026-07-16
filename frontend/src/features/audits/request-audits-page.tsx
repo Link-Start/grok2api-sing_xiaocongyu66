@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
-import { Table, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui/table";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { listModels } from "@/entities/model/model-api";
 import { getRequestAudits, getRequestAuditSummary, type AuditDTO, type AuditPeriod } from "@/features/audits/request-audits-api";
@@ -155,20 +155,22 @@ export function RequestAuditsPage() {
         {auditsQuery.isPending || (result && result.items.length > 0) ? (
           <Table className="min-w-[1280px] table-fixed text-xs">
             <colgroup>
-              <col className="w-[13%]" />
               <col className="w-[12%]" />
-              <col className="w-[14%]" />
+              <col className="w-[10%]" />
               <col className="w-[9%]" />
-              <col className="w-[22%]" />
-              <col className="w-[7%]" />
-              <col className="w-[9%]" />
-              <col className="w-[6%]" />
+              <col className="w-[13%]" />
               <col className="w-[8%]" />
+              <col className="w-[18%]" />
+              <col className="w-[7%]" />
+              <col className="w-[8%]" />
+              <col className="w-[6%]" />
+              <col className="w-[9%]" />
             </colgroup>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <SortableTableHead field="request" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.request")}</SortableTableHead>
                 <SortableTableHead field="key" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.key")}</SortableTableHead>
+                <TableHead className="text-left">{t("audits.client")}</TableHead>
                 <SortableTableHead field="model" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.model")}</SortableTableHead>
                 <SortableTableHead field="billing" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.billing")}</SortableTableHead>
                 <SortableTableHead field="tokens" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.tokens")}</SortableTableHead>
@@ -179,13 +181,16 @@ export function RequestAuditsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {auditsQuery.isPending ? <TableLoadingRow colSpan={9} /> : result?.items.map((audit) => (
+              {auditsQuery.isPending ? <TableLoadingRow colSpan={10} /> : result?.items.map((audit) => (
                 <TableRow key={audit.id}>
                   <TableCell className="py-3">
                     <span className="block truncate text-xs" title={audit.requestId}>{audit.requestId}</span>
                   </TableCell>
                   <TableCell className="py-3">
                     <ClientKeyValue name={audit.clientKeyName} id={audit.clientKeyId} />
+                  </TableCell>
+                  <TableCell className="py-3">
+                    <ClientTypeValue type={audit.clientType} userAgent={audit.clientUserAgent} ip={audit.clientIp} />
                   </TableCell>
                   <TableCell className="py-3">
                     <ModelRouteValue
@@ -269,6 +274,35 @@ function formatClientKeyLabel(name: string | undefined, id: string): string {
   const trimmed = name?.trim() ?? "";
   if (trimmed) return trimmed;
   return id ? `#${id}` : "-";
+}
+
+const CLIENT_LABELS: Record<string, string> = {
+  claude_code: "Claude Code",
+  codex: "Codex",
+  grok_cli: "Grok CLI",
+  hermes: "Hermes",
+  opencode: "OpenCode",
+  cline: "Cline",
+  cursor: "Cursor",
+  continue: "Continue",
+  aider: "Aider",
+  openai_sdk: "OpenAI SDK",
+  anthropic_sdk: "Anthropic SDK",
+  python: "Python",
+  curl: "curl",
+  unknown: "Unknown",
+};
+
+function ClientTypeValue({ type, userAgent, ip }: { type?: string; userAgent?: string; ip?: string }) {
+  const id = (type ?? "").trim() || "unknown";
+  const label = CLIENT_LABELS[id] ?? id;
+  const title = [userAgent, ip].filter(Boolean).join(" · ") || id;
+  return (
+    <div className="min-w-0" title={title}>
+      <span className="block truncate text-xs font-medium">{label}</span>
+      {ip ? <span className="mt-0.5 block truncate text-[11px] tabular-nums text-muted-foreground">{ip}</span> : null}
+    </div>
+  );
 }
 
 function ClientKeyValue({ name, id }: { name?: string; id: string }) {

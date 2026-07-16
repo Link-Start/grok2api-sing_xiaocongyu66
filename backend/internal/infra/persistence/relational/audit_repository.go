@@ -96,7 +96,9 @@ func toAuditModel(value audit.Record) requestAuditModel {
 		EstimatedCostInUSDTicks: nonNegative(value.EstimatedCostInUSDTicks), PricingModel: truncate(value.PricingModel, 100), PricingVersion: truncate(value.PricingVersion, 20),
 		NumSourcesUsed: nonNegative(value.NumSourcesUsed), NumServerSideToolsUsed: nonNegative(value.NumServerSideToolsUsed),
 		ContextInputTokens: nonNegative(value.ContextInputTokens), ContextOutputTokens: nonNegative(value.ContextOutputTokens), DurationMS: nonNegative(value.DurationMS),
-		ErrorCode: truncate(value.ErrorCode, 100), CreatedAt: value.CreatedAt,
+		ErrorCode: truncate(value.ErrorCode, 100),
+		ClientType: truncate(value.ClientType, 32), ClientUserAgent: truncate(value.ClientUserAgent, 256), ClientIP: truncate(value.ClientIP, 64),
+		CreatedAt: value.CreatedAt,
 	}
 }
 

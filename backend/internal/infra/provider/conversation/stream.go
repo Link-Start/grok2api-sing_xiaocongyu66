@@ -43,6 +43,7 @@ type streamConverter struct {
 	started         bool
 	finished        bool
 	textStarted     bool
+	textClosed      bool
 	textIndex       int
 	thinkingStarted bool
 	thinkingClosed  bool
@@ -203,13 +204,8 @@ func (c *streamConverter) textDelta(delta string) error {
 	if c.operation == OperationChat {
 		return c.chatDelta(map[string]any{"content": delta})
 	}
-	if !c.textStarted {
-		c.textStarted = true
-		c.textIndex = c.nextIndex
-		c.nextIndex++
-		if err := c.writeEvent("content_block_start", map[string]any{"type": "content_block_start", "index": c.textIndex, "content_block": map[string]any{"type": "text", "text": ""}}); err != nil {
-			return err
-		}
+	if err := c.startText(); err != nil {
+		return err
 	}
 	emit, matched := c.stopFilter.Push(delta)
 	if matched != "" {
@@ -221,14 +217,33 @@ func (c *streamConverter) textDelta(delta string) error {
 	return c.writeEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": c.textIndex, "delta": map[string]any{"type": "text_delta", "text": emit}})
 }
 
+// startText 在开启 text block 前关闭 thinking，保证 Anthropic 客户端一次只维护一个 open content block。
+func (c *streamConverter) startText() error {
+	if c.textStarted && !c.textClosed {
+		return nil
+	}
+	if err := c.closeThinking(responseItem{}); err != nil {
+		return err
+	}
+	c.textStarted = true
+	c.textClosed = false
+	c.textIndex = c.nextIndex
+	c.nextIndex++
+	return c.writeEvent("content_block_start", map[string]any{"type": "content_block_start", "index": c.textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
+}
+
 func (c *streamConverter) thinkingStart(itemID string) error {
-	if !c.options.AnthropicThinking || c.thinkingStarted {
+	if !c.options.AnthropicThinking || (c.thinkingStarted && !c.thinkingClosed) {
 		return nil
 	}
 	if err := c.start(); err != nil {
 		return err
 	}
+	if err := c.closeText(); err != nil {
+		return err
+	}
 	c.thinkingStarted = true
+	c.thinkingClosed = false
 	c.thinkingIndex = c.nextIndex
 	c.nextIndex++
 	c.thinkingItemID = itemID
@@ -252,6 +267,10 @@ func (c *streamConverter) thinkingDelta(delta string) error {
 }
 
 func (c *streamConverter) thinkingDone(item responseItem) error {
+	return c.closeThinking(item)
+}
+
+func (c *streamConverter) closeThinking(item responseItem) error {
 	if c.operation != OperationMessages || !c.options.AnthropicThinking || !c.thinkingStarted || c.thinkingClosed {
 		return nil
 	}
@@ -267,6 +286,14 @@ func (c *streamConverter) thinkingDone(item responseItem) error {
 	return c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.thinkingIndex})
 }
 
+func (c *streamConverter) closeText() error {
+	if c.operation != OperationMessages || !c.textStarted || c.textClosed {
+		return nil
+	}
+	c.textClosed = true
+	return c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.textIndex})
+}
+
 func (c *streamConverter) chatDelta(delta map[string]any) error {
 	if err := c.start(); err != nil {
 		return err
@@ -280,6 +307,15 @@ func (c *streamConverter) chatDelta(delta map[string]any) error {
 func (c *streamConverter) toolStart(item responseItem, outputIndex int) error {
 	if err := c.start(); err != nil {
 		return err
+	}
+	if c.operation == OperationMessages {
+		// Claude Code 等客户端在收到新 block 时要求前一个 content block 已 stop。
+		if err := c.closeThinking(responseItem{}); err != nil {
+			return err
+		}
+		if err := c.closeText(); err != nil {
+			return err
+		}
 	}
 	tool := streamTool{Index: outputIndex, ID: item.CallID, Name: item.Name, Arguments: item.Arguments}
 	if c.operation == OperationMessages {
@@ -378,16 +414,11 @@ func (c *streamConverter) done(status string) error {
 			}
 		}
 	}
-	if c.thinkingStarted && !c.thinkingClosed {
-		c.thinkingClosed = true
-		if err := c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.thinkingIndex}); err != nil {
-			return err
-		}
+	if err := c.closeThinking(responseItem{}); err != nil {
+		return err
 	}
-	if c.textStarted {
-		if err := c.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": c.textIndex}); err != nil {
-			return err
-		}
+	if err := c.closeText(); err != nil {
+		return err
 	}
 	openTools := make([]streamTool, 0)
 	for itemID, tool := range c.tools {
@@ -425,13 +456,8 @@ func (c *streamConverter) textDeltaWithoutFilter(delta string) error {
 	if delta == "" {
 		return nil
 	}
-	if !c.textStarted {
-		c.textStarted = true
-		c.textIndex = c.nextIndex
-		c.nextIndex++
-		if err := c.writeEvent("content_block_start", map[string]any{"type": "content_block_start", "index": c.textIndex, "content_block": map[string]any{"type": "text", "text": ""}}); err != nil {
-			return err
-		}
+	if err := c.startText(); err != nil {
+		return err
 	}
 	return c.writeEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": c.textIndex, "delta": map[string]any{"type": "text_delta", "text": delta}})
 }

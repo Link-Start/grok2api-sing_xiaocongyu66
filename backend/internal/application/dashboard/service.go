@@ -62,6 +62,12 @@ type ModelUsage struct {
 	BilledCostUSDTicks int64
 }
 
+type ClientUsage struct {
+	Client string
+	Label  string
+	Count  int64
+}
+
 type Result struct {
 	Period      Period
 	GeneratedAt time.Time
@@ -73,6 +79,7 @@ type Result struct {
 	Today       dashboarddomain.DayUsage
 	Series      []SeriesPoint
 	TopModels   []ModelUsage
+	Clients     []ClientUsage
 }
 
 // Service 负责 Dashboard 时间范围校验和固定时间桶编排。
@@ -178,12 +185,16 @@ func (s *Service) load(ctx context.Context, period Period, bucketCount, bucketDa
 	for _, item := range aggregate.TopModels {
 		topModels = append(topModels, ModelUsage{Model: item.Model, Requests: item.Requests, InputTokens: item.InputTokens, CachedInputTokens: item.CachedInputTokens, OutputTokens: item.OutputTokens, ReasoningTokens: item.ReasoningTokens, Tokens: item.Tokens, BilledCostUSDTicks: item.BilledCostUSDTicks})
 	}
+	clients := make([]ClientUsage, 0, len(aggregate.Clients))
+	for _, item := range aggregate.Clients {
+		clients = append(clients, ClientUsage{Client: item.Client, Label: item.Label, Count: item.Count})
+	}
 	return Result{
 		Period: period, GeneratedAt: generatedAt,
 		Range:     Range{Start: boundaries[0], End: boundaries[len(boundaries)-1]},
 		Resources: aggregate.Resources, Usage: aggregate.Usage, SuccessRate: successRate,
 		LiveRates: aggregate.LiveRates, Today: aggregate.Today,
-		Series: series, TopModels: topModels,
+		Series: series, TopModels: topModels, Clients: clients,
 	}, nil
 }
 

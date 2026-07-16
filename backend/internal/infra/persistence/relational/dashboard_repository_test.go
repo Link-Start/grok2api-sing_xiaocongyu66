@@ -91,11 +91,12 @@ func TestDashboardRepositorySnapshot(t *testing.T) {
 	if len(snapshot.TopModels) != 2 || snapshot.TopModels[0].Model != "grok-primary" || snapshot.TopModels[0].Requests != 2 || snapshot.TopModels[0].Tokens != 110 {
 		t.Fatalf("top models = %#v", snapshot.TopModels)
 	}
-	// RPM/TPM share the selected period (24h here → average per minute ≈ 0 for 3 req / 160 tokens).
+	// RPM/TPM share the selected period (24h → float averages, not rounded to zero).
 	if snapshot.LiveRates.WindowSeconds != 24*3600 {
 		t.Fatalf("liveRates window = %#v", snapshot.LiveRates)
 	}
-	if snapshot.LiveRates.RPM != 0 || snapshot.LiveRates.TPM != 0 {
+	// 3 / 1440 ≈ 0.00208 RPM; 160 / 1440 ≈ 0.111 TPM
+	if snapshot.LiveRates.RPM <= 0 || snapshot.LiveRates.RPM > 0.01 || snapshot.LiveRates.TPM <= 0 || snapshot.LiveRates.TPM > 0.2 {
 		t.Fatalf("liveRates = %#v", snapshot.LiveRates)
 	}
 	// Period totals match usage for the same [start, end) window.
@@ -146,8 +147,8 @@ func TestDashboardRepositoryLiveRatesWindow(t *testing.T) {
 	if snapshot.LiveRates.WindowSeconds != 24*3600 {
 		t.Fatalf("long liveRates window = %#v", snapshot.LiveRates)
 	}
-	// 3 requests / 1440 minutes → 0 RPM; 1149 tokens / 1440 → 1 TPM (rounded).
-	if snapshot.LiveRates.RPM != 0 || snapshot.LiveRates.TPM != 1 {
+	// 3 requests / 1440 minutes ≈ 0.002 RPM; 1149 tokens / 1440 ≈ 0.798 TPM (float, not rounded away).
+	if snapshot.LiveRates.RPM <= 0 || snapshot.LiveRates.RPM > 0.01 || snapshot.LiveRates.TPM < 0.7 || snapshot.LiveRates.TPM > 0.9 {
 		t.Fatalf("long liveRates = %#v", snapshot.LiveRates)
 	}
 	if snapshot.Today.Requests != 3 || snapshot.Today.Tokens != 1149 {

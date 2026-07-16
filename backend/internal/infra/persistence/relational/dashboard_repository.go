@@ -7,6 +7,7 @@ import (
 	"time"
 
 	dashboarddomain "github.com/chenyme/grok2api/backend/internal/domain/dashboard"
+	"github.com/chenyme/grok2api/backend/internal/pkg/clientid"
 	"gorm.io/gorm"
 )
 
@@ -81,20 +82,20 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, bucketBoundaries []t
 		}
 
 		// RPM/TPM follow the same period as usage totals (single time control).
-		// ≤2 minutes: raw counts (new-api 60s style). Longer: average per minute.
+		// ≤2 minutes: raw counts (new-api 60s style). Longer: average per minute (float, no zero-rounding).
 		windowSeconds := int(end.Sub(start).Seconds())
 		if windowSeconds < 1 {
 			windowSeconds = 1
 		}
 		requests, tokens := result.Usage.Requests, result.Usage.Tokens
-		rpm, tpm := requests, tokens
+		rpm, tpm := float64(requests), float64(tokens)
 		if windowSeconds > 120 {
 			minutes := float64(windowSeconds) / 60.0
 			if minutes < 1 {
 				minutes = 1
 			}
-			rpm = int64(float64(requests)/minutes + 0.5)
-			tpm = int64(float64(tokens)/minutes + 0.5)
+			rpm = float64(requests) / minutes
+			tpm = float64(tokens) / minutes
 		}
 		result.LiveRates = dashboarddomain.LiveRates{RPM: rpm, TPM: tpm, WindowSeconds: windowSeconds}
 
@@ -173,6 +174,28 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, bucketBoundaries []t
 			for _, item := range modelBuckets {
 				result.ModelBuckets = append(result.ModelBuckets, dashboarddomain.ModelBucket{Index: item.BucketIndex, Model: item.Model, Tokens: item.Tokens, BilledCostUSDTicks: item.BilledCostUSDTicks})
 			}
+		}
+
+		// Downstream client breakdown (Claude Code / Codex / Hermes / …).
+		clientExpression := "CASE WHEN TRIM(client_type) = '' OR client_type IS NULL THEN 'unknown' ELSE client_type END"
+		var clients []struct {
+			Client string
+			Count  int64
+		}
+		if err := tx.Model(&requestAuditModel{}).
+			Select(clientExpression+" AS client, COUNT(*) AS count").
+			Where("created_at >= ? AND created_at < ?", start, end).
+			Group(clientExpression).
+			Order("count DESC, client ASC").
+			Limit(20).
+			Scan(&clients).Error; err != nil {
+			return err
+		}
+		result.Clients = make([]dashboarddomain.ClientUsage, 0, len(clients))
+		for _, item := range clients {
+			result.Clients = append(result.Clients, dashboarddomain.ClientUsage{
+				Client: item.Client, Label: clientid.Label(item.Client), Count: item.Count,
+			})
 		}
 		return nil
 	})

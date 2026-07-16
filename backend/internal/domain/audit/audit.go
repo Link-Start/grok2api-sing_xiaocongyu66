@@ -56,6 +56,10 @@ type Record struct {
 	ContextOutputTokens     int64
 	DurationMS              int64
 	ErrorCode               string
+	// ClientType is a stable id (claude_code, codex, hermes, …); ClientUserAgent is truncated raw UA.
+	ClientType              string
+	ClientUserAgent         string
+	ClientIP                string
 	CreatedAt               time.Time
 }
 

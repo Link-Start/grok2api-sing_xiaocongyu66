@@ -55,6 +55,9 @@ type auditResponse struct {
 	ContextOutputTokens     int64     `json:"contextOutputTokens"`
 	DurationMS              int64     `json:"durationMs"`
 	ErrorCode               string    `json:"errorCode,omitempty"`
+	ClientType              string    `json:"clientType,omitempty"`
+	ClientUserAgent         string    `json:"clientUserAgent,omitempty"`
+	ClientIP                string    `json:"clientIp,omitempty"`
 	CreatedAt               time.Time `json:"createdAt"`
 }
 
@@ -202,6 +205,8 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, DurationMS: value.DurationMS,
-		ErrorCode: value.ErrorCode, CreatedAt: value.CreatedAt,
+		ErrorCode: value.ErrorCode,
+		ClientType: value.ClientType, ClientUserAgent: value.ClientUserAgent, ClientIP: value.ClientIP,
+		CreatedAt: value.CreatedAt,
 	}
 }
