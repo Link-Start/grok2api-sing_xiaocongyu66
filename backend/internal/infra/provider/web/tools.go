@@ -11,6 +11,8 @@ import (
 )
 
 const (
+	// maxFunctionTools is Grok Web's practical function-tool ceiling (prompt injection path).
+	// Build/upstream Responses allow up to 250; Web keeps a tighter budget.
 	maxFunctionTools       = 128
 	maxToolDescriptionSize = 16 << 10
 )

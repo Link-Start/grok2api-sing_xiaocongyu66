@@ -487,6 +487,9 @@ func markAnthropicToolError(output any) any {
 }
 
 func convertAnthropicTools(tools []map[string]json.RawMessage) ([]any, error) {
+	if len(tools) > maxUpstreamTools {
+		return nil, fmt.Errorf("tools 数量超过上游上限：提供了 %d 个，最多 %d 个（xAI/Grok Build 限制）", len(tools), maxUpstreamTools)
+	}
 	result := make([]any, 0, len(tools))
 	for index, tool := range tools {
 		var typeName string

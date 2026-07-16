@@ -171,10 +171,16 @@ func convertAssistantToolCalls(raw json.RawMessage) ([]any, error) {
 	return result, nil
 }
 
+// maxUpstreamTools matches xAI/Grok Build's hard tools array ceiling.
+const maxUpstreamTools = 250
+
 func convertChatTools(raw json.RawMessage) ([]any, error) {
 	var tools []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &tools); err != nil {
 		return nil, errors.New("tools 必须是数组")
+	}
+	if len(tools) > maxUpstreamTools {
+		return nil, fmt.Errorf("tools 数量超过上游上限：提供了 %d 个，最多 %d 个（xAI/Grok Build 限制）", len(tools), maxUpstreamTools)
 	}
 	result := make([]any, 0, len(tools))
 	for _, tool := range tools {

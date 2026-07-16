@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -503,5 +504,28 @@ func TestConvertResponsesStreamMessagesInputTokens(t *testing.T) {
 
 	if !strings.Contains(text, `"input_tokens":194`) {
 		t.Fatalf("message_delta should contain input_tokens from response.completed usage:\n%s", text)
+	}
+}
+
+func TestConvertChatRequestRejectsTooManyTools(t *testing.T) {
+	tools := make([]map[string]any, 0, 251)
+	for i := 0; i < 251; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        fmt.Sprintf("tool_%d", i),
+				"description": "x",
+				"parameters":  map[string]any{"type": "object"},
+			},
+		})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model": "grok-test",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools": tools,
+	})
+	_, err := convertChatRequest(body, "grok-test")
+	if err == nil || !strings.Contains(err.Error(), "最多 250") {
+		t.Fatalf("expected tools limit error, got %v", err)
 	}
 }

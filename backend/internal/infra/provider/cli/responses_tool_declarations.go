@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+// maxUpstreamTools is the hard ceiling enforced by xAI / Grok Build (and
+// reported as: "Maximum tools limit reached. N tools have been provided but the maximum is 250.").
+// Reject early so clients get a clear 400 instead of a long upstream round-trip.
+const maxUpstreamTools = 250
+
 func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesToolCompatibility, error) {
 	compatibility := newResponsesToolCompatibility()
 	tools, hasTools, err := decodeOptionalArray(payload["tools"], "tools")
@@ -13,6 +18,13 @@ func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesTool
 		return nil, err
 	}
 	if hasTools {
+		if len(tools) > maxUpstreamTools {
+			return nil, &responsesRequestError{
+				Message: fmt.Sprintf("tools 数量超过上游上限：提供了 %d 个，最多 %d 个（xAI/Grok Build 限制）", len(tools), maxUpstreamTools),
+				Param:   "tools",
+				Code:    "invalid_parameter",
+			}
+		}
 		compatibility.visibleTools = cloneJSONArray(tools)
 	}
 	clientSearch, err := inspectToolSearch(tools)
@@ -56,6 +68,14 @@ func normalizeResponsesTools(payload map[string]json.RawMessage) (*responsesTool
 		normalizedTools = append(normalizedTools, searchTool)
 	}
 	normalizedTools = dedupeNormalizedTools(normalizedTools)
+	// Namespace/tool_search expansion can inflate the count past the client-declared size.
+	if len(normalizedTools) > maxUpstreamTools {
+		return nil, &responsesRequestError{
+			Message: fmt.Sprintf("tools 规范化后数量超过上游上限：%d 个（含 namespace 展开），最多 %d 个", len(normalizedTools), maxUpstreamTools),
+			Param:   "tools",
+			Code:    "invalid_parameter",
+		}
+	}
 	if len(normalizedTools) > 0 {
 		payload["tools"] = mustJSON(normalizedTools)
 	} else if hasTools && compatibility.webSearchDisabled {

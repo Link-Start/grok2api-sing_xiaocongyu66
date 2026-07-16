@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"encoding/json"
 	"io"
 	"strings"
@@ -230,5 +231,23 @@ func TestResponsesCompatibilityRestoresNamespaceAndToolSearchStream(t *testing.T
 		if !strings.Contains(text, expected) {
 			t.Fatalf("流式响应缺少 %s:\n%s", expected, text)
 		}
+	}
+}
+
+
+func TestNormalizeResponsesToolsRejectsTooMany(t *testing.T) {
+	tools := make([]any, 0, 251)
+	for i := 0; i < 251; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"name": fmt.Sprintf("tool_%d", i),
+			"parameters": map[string]any{"type": "object"},
+		})
+	}
+	body, _ := json.Marshal(map[string]any{"model": "public", "input": "hi", "tools": tools})
+	_, _, err := normalizeResponsesRequest(body, "grok-4.5")
+	requestErr, ok := err.(*responsesRequestError)
+	if !ok || requestErr.Param != "tools" {
+		t.Fatalf("err = %v", err)
 	}
 }
