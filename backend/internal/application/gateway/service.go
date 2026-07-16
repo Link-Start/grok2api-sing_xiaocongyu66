@@ -282,12 +282,12 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 		return configured, "", nil
 	}
 	if s.providers == nil {
-		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel))
+		s.logModelResolveMiss(publicModel, "no_providers")
 		return nil, "", err
 	}
 	alias, ok := s.providers.ResolveModelAlias(publicModel)
 	if !ok {
-		s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel))
+		s.logModelResolveMiss(publicModel, "no_alias")
 		return nil, "", err
 	}
 	if alias.Provider != "" && alias.UpstreamModel != "" {
@@ -296,7 +296,8 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 			if configured, confErr := s.models.GetConfiguredByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel); confErr == nil {
 				return []modeldomain.Route{configured}, alias.ReasoningEffort, nil
 			}
-			s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_provider", alias.Provider, "alias_upstream", alias.UpstreamModel)
+			// Log only fixed enum labels for provider; never raw alias strings (CodeQL log-injection).
+			s.logModelResolveMiss(publicModel, "alias_upstream_miss")
 			return nil, "", routeErr
 		}
 		return []modeldomain.Route{route}, alias.ReasoningEffort, nil
@@ -308,8 +309,30 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, alias.PublicModel); confErr == nil && len(configured) > 0 {
 		return configured, alias.ReasoningEffort, nil
 	}
-	s.logger.Info("model_resolve_miss", "public_model", strings.TrimSpace(publicModel), "alias_public_model", alias.PublicModel)
+	s.logModelResolveMiss(publicModel, "alias_public_miss")
 	return routes, alias.ReasoningEffort, err
+}
+
+// logModelResolveMiss records a miss without logging raw client model strings
+// (CodeQL go/log-injection). Fingerprint is a truncated SHA-256 of the trimmed name.
+func (s *Service) logModelResolveMiss(publicModel, reason string) {
+	if s == nil || s.logger == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(publicModel)
+	// Bound log size even if client sends multi-KB model fields.
+	if len(trimmed) > 512 {
+		trimmed = trimmed[:512]
+	}
+	fp := security.HashToken(trimmed)
+	if len(fp) > 16 {
+		fp = fp[:16]
+	}
+	s.logger.Info("model_resolve_miss",
+		"reason", reason,
+		"model_len", len(strings.TrimSpace(publicModel)),
+		"model_fp", fp,
+	)
 }
 
 // selectConversationRoute 从同名模型的可用来源中选择满足权限、协议和会话归属的路由。
