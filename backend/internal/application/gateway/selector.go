@@ -265,7 +265,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		}
 		if ok {
 			if candidate, found := normalByID[stickyID]; found {
-				lease, acquireErr := s.claimAccountSlot(ctx, candidate.Credential)
+				// Prompt-cache hits require the same upstream account. Wait on the sticky
+				// account's concurrency slot instead of switching accounts (which resets cache).
+				lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate.Credential)
 				if acquireErr != nil {
 					return nil, acquireErr
 				}
@@ -274,21 +276,21 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 					lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
 					s.log(slog.LevelInfo, "schedule_account_selected",
 						"provider", provider, "model", upstreamModel, "account_id", candidate.Credential.ID,
-						"reason", "sticky", "max_concurrent", accountConcurrencyLimit(candidate.Credential),
+						"reason", "sticky_prompt_cache", "max_concurrent", accountConcurrencyLimit(candidate.Credential),
 						"normal_pool", len(normalCandidates), "probe_pool", len(probeCandidates),
 					)
 					return lease, nil
 				}
-				s.log(slog.LevelInfo, "schedule_sticky_saturated",
+				s.log(slog.LevelWarn, "schedule_sticky_wait_exhausted",
 					"provider", provider, "model", upstreamModel, "account_id", stickyID,
 					"max_concurrent", accountConcurrencyLimit(candidate.Credential),
 					"normal_pool", len(normalCandidates),
-					"hint", "sticky account at concurrency cap; trying other accounts",
+					"hint", "sticky account still saturated after capacityWait; falling through (prompt cache may miss)",
 				)
 			} else {
 				s.log(slog.LevelInfo, "schedule_sticky_unavailable",
 					"provider", provider, "model", upstreamModel, "account_id", stickyID,
-					"hint", "sticky account not in normal pool (cooldown/quota/disabled)",
+					"hint", "sticky account not in normal pool (cooldown/quota/disabled); prompt cache may miss",
 				)
 			}
 		}

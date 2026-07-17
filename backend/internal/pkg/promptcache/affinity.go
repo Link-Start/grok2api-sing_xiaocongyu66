@@ -262,8 +262,10 @@ type MessageSeed struct {
 
 func compressSeedText(value string) string {
 	value = strings.Join(strings.Fields(value), " ")
-	if len(value) > 512 {
-		value = value[:512]
+	// Longer prefix keeps agent/system prompts stable across multi-turn tool loops
+	// where only the latest user turn changes near the end of the input list.
+	if len(value) > 2048 {
+		value = value[:2048]
 	}
 	return value
 }

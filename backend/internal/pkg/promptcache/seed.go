@@ -117,6 +117,12 @@ func ConversationSeedFromResponsesBody(body []byte) string {
 		}
 		messages = append(messages, MessageSeed{Role: role, Text: text})
 	}
+	// Agent/tool loops often only change the latest user turn while instructions stay
+	// large and stable. Prefer instructions-only seed so prompt_cache_key does not
+	// rotate every turn (which forces 0 cached_tokens upstream).
+	if len(system) >= 128 {
+		return ConversationSeedFromMessages(system, nil)
+	}
 	return ConversationSeedFromMessages(system, messages)
 }
 
