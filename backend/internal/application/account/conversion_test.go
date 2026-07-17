@@ -257,6 +257,18 @@ func (r *conversionBatchRepository) Get(_ context.Context, id uint64) (accountdo
 	}, nil
 }
 
+func (r *conversionBatchRepository) GetMany(_ context.Context, ids []uint64) ([]accountdomain.Credential, error) {
+	out := make([]accountdomain.Credential, len(ids))
+	for i, id := range ids {
+		out[i] = accountdomain.Credential{
+			ID: id, Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+			Name: fmt.Sprintf("web-%d", id), SourceKey: fmt.Sprintf("web-source-%d", id),
+			EncryptedAccessToken: r.encryptedSSO, Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		}
+	}
+	return out, nil
+}
+
 func (r *conversionBatchRepository) UpsertByIdentity(_ context.Context, value accountdomain.Credential) (accountdomain.Credential, bool, error) {
 	value.ID = 10_000 + r.nextBuildID.Add(1)
 	return value, true, nil

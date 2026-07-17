@@ -87,11 +87,18 @@ type providerWebConfigDTO struct {
 }
 
 type batchConfigDTO struct {
-	ImportConcurrency     int    `json:"importConcurrency"`
-	ConversionConcurrency int    `json:"conversionConcurrency"`
-	SyncConcurrency       int    `json:"syncConcurrency"`
-	RefreshConcurrency    int    `json:"refreshConcurrency"`
-	RandomDelay           string `json:"randomDelay"`
+	ImportConcurrency     int               `json:"importConcurrency"`
+	ConversionConcurrency int               `json:"conversionConcurrency"`
+	SyncConcurrency       int               `json:"syncConcurrency"`
+	RefreshConcurrency    int               `json:"refreshConcurrency"`
+	RandomDelay           string            `json:"randomDelay"`
+	DBBuffer              dbBufferConfigDTO `json:"dbBuffer"`
+}
+
+type dbBufferConfigDTO struct {
+	Enabled bool   `json:"enabled"`
+	Driver  string `json:"driver"`
+	Path    string `json:"path"`
 }
 
 type routingConfigDTO struct {
@@ -244,6 +251,11 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				ImportConcurrency: config.Batch.ImportConcurrency, ConversionConcurrency: config.Batch.ConversionConcurrency,
 				SyncConcurrency: config.Batch.SyncConcurrency, RefreshConcurrency: config.Batch.RefreshConcurrency,
 				RandomDelay: config.Batch.RandomDelay,
+				DBBuffer: dbBufferConfigDTO{
+					Enabled: config.Batch.DBBuffer.Enabled,
+					Driver:  config.Batch.DBBuffer.Driver,
+					Path:    config.Batch.DBBuffer.Path,
+				},
 			},
 			Media: mediaConfigDTO{
 				MaxImageBytes: config.Media.MaxImageBytes, MaxTotalBytes: config.Media.MaxTotalBytes,
