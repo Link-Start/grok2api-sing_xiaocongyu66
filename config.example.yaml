@@ -137,3 +137,8 @@ routing:
     fingerprint: true
     expire: true
     ttl: 24h
+  # 服务端推理回放缓存：客户端不回传 thinking signature 时，由网关代持上一轮
+  # encrypted reasoning items，加速多轮 Grok Build（对齐上游 CLIProxyAPI）。
+  reasoningReplayEnabled: true
+  reasoningReplayTTL: 1h
+  reasoningReplayMaxEntries: 10240

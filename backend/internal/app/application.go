@@ -40,6 +40,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/pkg/promptcache"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 	"github.com/chenyme/grok2api/backend/internal/pkg/toolslimit"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	httpserver "github.com/chenyme/grok2api/backend/internal/transport/http"
@@ -122,6 +123,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	var rateLimiter repository.RateLimiter
 	var concurrency repository.ConcurrencyLimiter
 	var sticky repository.StickySessionRepository
+	var reasoningReplayStore repository.ReasoningReplayRepository
 	var deviceSessions repository.DeviceSessionRepository
 	var refreshLock repository.DistributedLock
 	var settingsBus repository.SettingsChangeBus
@@ -147,6 +149,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		rateLimiter = redisStore
 		concurrency = redisruntime.NewConcurrencyLimiter(redisStore)
 		sticky = redisStore
+		reasoningReplayStore = redisruntime.NewReasoningReplayStore(redisStore)
 		deviceSessions = redisruntime.NewDeviceSessionStore(redisStore)
 		refreshLock = redisruntime.NewLockStore(redisStore)
 		settingsBus = redisStore
@@ -156,6 +159,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		rateLimiter = memory.NewRateLimiter()
 		concurrency = memory.NewConcurrencyLimiter()
 		sticky = memory.NewStickyStore()
+		reasoningReplayStore = memory.NewReasoningReplayStore(cfg.Routing.ReasoningReplayMaxEntries)
 		deviceSessions = memory.NewDeviceSessionStore()
 		refreshLock = memory.NewLockStore()
 		quotaQueue = memory.NewQuotaRecoveryQueue()
@@ -169,6 +173,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager.SetLogger(logger)
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{BaseURL: cfg.Provider.Build.BaseURL, ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier, TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent}, cipher)
 	cliAdapter.SetEgress(egressManager)
+	reasoningReplay := reasoningreplay.New(reasoningReplayStore, reasoningreplay.Config{
+		Enabled: cfg.Routing.ReasoningReplayEnabled,
+		TTL:     cfg.Routing.ReasoningReplayTTL.Value(),
+	}, logger)
+	cliAdapter.SetReasoningReplay(reasoningReplay)
 	webAdapter := webprovider.NewAdapter(webProviderConfig(cfg), egressManager, cipher, responseRepo, mediaService)
 	webAdapter.SetLogger(logger)
 	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)
@@ -347,6 +356,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			accountService.SetDBBufferRedis(redisRuntime.Client(), next.RuntimeStore.Redis.KeyPrefix)
 		}
 		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
+		reasoningReplay.UpdateConfig(reasoningreplay.Config{
+			Enabled: next.Routing.ReasoningReplayEnabled,
+			TTL:     next.Routing.ReasoningReplayTTL.Value(),
+		})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateRetryPolicy(next.Routing.RetryStatusCodes, next.Routing.RetryServerErrors)
 		auditService.UpdateConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value())
