@@ -175,8 +175,9 @@ type batchUpdateRequest struct {
 }
 
 type batchDeleteRequest struct {
-	IDs      []string `json:"ids" binding:"required"`
+	IDs      []string `json:"ids"`
 	Provider string   `json:"provider" binding:"required"`
+	All      bool     `json:"all"`
 }
 
 type deleteFailedRequest struct {
@@ -217,7 +218,6 @@ type accountValidateResponse struct {
 	PoolSize    int      `json:"poolSize,omitempty"`
 	SampledIDs  []string `json:"sampledIds,omitempty"`
 }
-
 
 type buildConversionRequest struct {
 	IDs      []string                           `json:"ids"`
@@ -403,8 +403,8 @@ func (h *Handler) summary(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{
 		"total": value.Total, "available": value.Available, "recovering": value.Recovering, "attention": value.Attention,
 		"providers": gin.H{
-			string(accountdomain.ProviderBuild): gin.H{"total": build.Total, "available": build.Available, "reauthRequired": build.ReauthRequired, "disabled": build.Disabled},
-			string(accountdomain.ProviderWeb): gin.H{"total": web.Total, "available": web.Available, "reauthRequired": web.ReauthRequired, "disabled": web.Disabled},
+			string(accountdomain.ProviderBuild):   gin.H{"total": build.Total, "available": build.Available, "reauthRequired": build.ReauthRequired, "disabled": build.Disabled},
+			string(accountdomain.ProviderWeb):     gin.H{"total": web.Total, "available": web.Available, "reauthRequired": web.ReauthRequired, "disabled": web.Disabled},
 			string(accountdomain.ProviderConsole): gin.H{"total": console.Total, "available": console.Available, "reauthRequired": console.ReauthRequired, "disabled": console.Disabled},
 		},
 		"recovery": gin.H{"cooldown": value.Recovery.Cooldown, "waitingReset": value.Recovery.WaitingReset, "probing": value.Recovery.Probing},
@@ -426,11 +426,13 @@ func (h *Handler) batchUpdate(c *gin.Context) {
 	if !h.validateProviderIDs(c, ids, request.Provider) {
 		return
 	}
+	providerValue := accountdomain.Provider(request.Provider)
 	updated, err := h.service.BatchUpdate(c.Request.Context(), ids, accountapp.UpdateInput{Enabled: request.Enabled, Priority: request.Priority, MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining})
 	if err != nil {
 		h.writeServiceError(c, "accountBatchUpdateFailed", err, http.StatusInternalServerError, "批量更新账号失败")
 		return
 	}
+	h.service.NotifyPoolChanged(providerValue)
 	response.Success(c, http.StatusOK, gin.H{"updated": updated})
 }
 
@@ -440,9 +442,32 @@ func (h *Handler) batchDelete(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
+	providerValue := accountdomain.Provider(request.Provider)
+	if !providerValue.IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	if request.All {
+		if len(request.IDs) > 0 {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "all 与指定 ids 不能同时提供")
+			return
+		}
+		deleted, err := h.service.DeleteAllAccountsForProvider(c.Request.Context(), providerValue)
+		if err != nil {
+			h.writeServiceError(c, "accountBatchDeleteFailed", err, http.StatusInternalServerError, "批量删除账号失败")
+			return
+		}
+		h.service.NotifyPoolChanged(providerValue)
+		response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
+		return
+	}
 	ids, err := parseIDs(request.IDs)
 	if err != nil {
 		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	if len(ids) == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "ids 不能为空")
 		return
 	}
 	if !h.validateProviderIDs(c, ids, request.Provider) {
@@ -453,6 +478,7 @@ func (h *Handler) batchDelete(c *gin.Context) {
 		h.writeServiceError(c, "accountBatchDeleteFailed", err, http.StatusInternalServerError, "批量删除账号失败")
 		return
 	}
+	h.service.NotifyPoolChanged(providerValue)
 	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
 }
 
@@ -956,10 +982,16 @@ func (h *Handler) delete(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// Fetch before delete to know which pool's scheduler cache to invalidate.
+	var providerHint accountdomain.Provider
+	if value, getErr := h.service.Get(c.Request.Context(), id); getErr == nil {
+		providerHint = value.Credential.Provider
+	}
 	if err := h.service.Delete(c.Request.Context(), id); err != nil {
 		h.writeServiceError(c, "accountDeleteFailed", err, http.StatusInternalServerError, "删除账号失败")
 		return
 	}
+	h.service.NotifyPoolChanged(providerHint)
 	response.Success(c, http.StatusOK, gin.H{"deleted": true})
 }
 
@@ -978,7 +1010,7 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error, fall
 		response.Error(c, http.StatusConflict, "accountOperationUnsupported", err.Error())
 	case errors.Is(err, accountapp.ErrConversionBusy):
 		response.Error(c, http.StatusConflict, "accountConversionBusy", err.Error())
-case errors.Is(err, accountapp.ErrUpstreamSyncDisabled):
+	case errors.Is(err, accountapp.ErrUpstreamSyncDisabled):
 		response.Error(c, http.StatusConflict, "upstreamSyncDisabled", "上游余额/额度同步已禁用，可在 provider.proactiveUpstreamSync 中开启")
 	default:
 		response.Error(c, fallbackStatus, code, fallbackMessage)
@@ -1271,6 +1303,10 @@ func (h *Handler) validateProviderIDs(c *gin.Context, ids []uint64, providerValu
 	}
 	for _, id := range ids {
 		value, err := h.service.Get(c.Request.Context(), id)
+		if errors.Is(err, accountapp.ErrNotFound) {
+			// Stale selection or concurrent delete: do not treat as pool mismatch.
+			continue
+		}
 		if err != nil || string(value.Credential.Provider) != providerValue {
 			response.Error(c, http.StatusConflict, "accountPoolMismatch", "批量操作包含不属于当前号池的账号")
 			return false

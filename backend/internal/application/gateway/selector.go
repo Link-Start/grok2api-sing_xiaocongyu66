@@ -25,9 +25,11 @@ type accountLease struct {
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
+
 // candidateCacheTTL trades a little routing freshness for fewer ListRoutingCandidates
 // DB hits under high RPS; sticky/prompt-cache still pin accounts independently.
-const candidateCacheTTL = 2 * time.Second
+// Shorter TTL helps admin bulk deletes / pool changes reflect in scheduling faster.
+const candidateCacheTTL = 1 * time.Second
 
 type candidateSnapshot struct {
 	values    []account.RoutingCandidate
@@ -271,6 +273,25 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			if lease == nil {
 				continue
 			}
+			// Re-validate time-sensitive exclusions from the (possibly slightly stale) snapshot
+			// using the planning time. Prevents handing out a lease for an account that entered
+			// cooldown / probe window / model block during the capacityWait loop.
+			if candidate.ModelQuotaBlock != nil && currentTime.Before(candidate.ModelQuotaBlock.CooldownUntil) {
+				lease.Release()
+				continue
+			}
+			if c := candidate.Credential; c.CooldownUntil != nil && currentTime.Before(*c.CooldownUntil) {
+				lease.Release()
+				continue
+			}
+			if rec := candidate.QuotaRecovery; rec != nil && rec.Status != account.QuotaRecoveryStatusActive {
+				if rec.NextProbeAt != nil && currentTime.Before(*rec.NextProbeAt) {
+					lease.Release()
+					continue
+				}
+			}
+			// Billing and QuotaWindow can legitimately go stale due to concurrent usage by other
+			// instances/requests; the call path and response handling will detect and mark exhausted.
 			if stickyKey != "" {
 				stickyTTL, _, _, _ := s.routingConfig()
 				if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
@@ -547,6 +568,13 @@ func (s *Selector) invalidateCandidates(provider account.Provider) {
 			delete(s.candidates, key)
 		}
 	}
+}
+
+// InvalidateProvider drops the in-memory routing candidate snapshot for the provider.
+// Useful after bulk account operations (delete all, import, priority changes) so the
+// scheduler immediately sees the updated pool instead of waiting out the cache TTL.
+func (s *Selector) InvalidateProvider(provider account.Provider) {
+	s.invalidateCandidates(provider)
 }
 
 func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credential) (*accountLease, error) {

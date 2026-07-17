@@ -323,6 +323,17 @@ func (r *AccountRepository) ListFailedAccountIDs(ctx context.Context, provider a
 	return ids, err
 }
 
+func (r *AccountRepository) ListProviderAccountIDs(ctx context.Context, provider account.Provider, limit int) ([]uint64, error) {
+	if limit < 1 {
+		return []uint64{}, nil
+	}
+	var ids []uint64
+	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select("id").Where("provider = ?", string(provider)).Order("id ASC").Limit(limit).Scan(&ids).Error
+	if ids == nil {
+		ids = []uint64{}
+	}
+	return ids, err
+}
 
 func (r *AccountRepository) FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64) ([]uint64, error) {
 	if len(ids) == 0 {

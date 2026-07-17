@@ -20,17 +20,17 @@ import (
 )
 
 var (
-	ErrDevicePending  = errors.New("Device OAuth 等待用户授权")
-	ErrDeviceSlowDown = errors.New("Device OAuth 轮询过快")
-	ErrDeviceDenied   = errors.New("Device OAuth 已拒绝或过期")
-	ErrInvalidFilter  = errors.New("账号筛选条件无效")
-	ErrInvalidInput   = errors.New("账号参数无效")
-	ErrInvalidImport  = errors.New("账号凭据格式无效")
-	ErrImportLimit    = errors.New("导入账号数量超过限制")
-	ErrExportLimit    = errors.New("导出账号数量超过限制")
-	ErrNotFound       = errors.New("账号不存在")
-	ErrUnsupported    = errors.New("账号来源不支持该操作")
-	ErrConversionBusy = errors.New("账号正在转换为 Grok Build")
+	ErrDevicePending        = errors.New("Device OAuth 等待用户授权")
+	ErrDeviceSlowDown       = errors.New("Device OAuth 轮询过快")
+	ErrDeviceDenied         = errors.New("Device OAuth 已拒绝或过期")
+	ErrInvalidFilter        = errors.New("账号筛选条件无效")
+	ErrInvalidInput         = errors.New("账号参数无效")
+	ErrInvalidImport        = errors.New("账号凭据格式无效")
+	ErrImportLimit          = errors.New("导入账号数量超过限制")
+	ErrExportLimit          = errors.New("导出账号数量超过限制")
+	ErrNotFound             = errors.New("账号不存在")
+	ErrUnsupported          = errors.New("账号来源不支持该操作")
+	ErrConversionBusy       = errors.New("账号正在转换为 Grok Build")
 	ErrUpstreamSyncDisabled = errors.New("上游余额/额度同步已禁用")
 )
 
@@ -69,34 +69,33 @@ func syncSourceFrom(ctx context.Context) string {
 	return value
 }
 
-
 const (
-	estimatedFreeTokenLimit     int64         = 1_000_000
-	freeUsageWindow             time.Duration = 24 * time.Hour
-	forcedRefreshMinInterval    time.Duration = 30 * time.Second
+	estimatedFreeTokenLimit  int64         = 1_000_000
+	freeUsageWindow          time.Duration = 24 * time.Hour
+	forcedRefreshMinInterval time.Duration = 30 * time.Second
 	// refreshStateWriteCooldown skips re-attempting OAuth refresh when the failure
 	// schedule could not be persisted (typically Postgres connection exhaustion).
 	// Without this, due accounts are re-selected every tick and amplify 53300 storms.
-	refreshStateWriteCooldown     time.Duration = 2 * time.Minute
+	refreshStateWriteCooldown   time.Duration = 2 * time.Minute
 	paidProbeRetryInterval      time.Duration = 15 * time.Minute
 	credentialRefreshAdvance    time.Duration = 3 * time.Minute
 	credentialRefreshSafetyPoll time.Duration = time.Minute
 	credentialRefreshTimeout    time.Duration = 30 * time.Second
 	credentialRefreshStateTTL   time.Duration = 5 * time.Second
 	// Smaller batches leave Postgres headroom for the request path under load.
-	credentialRefreshBatchSize                = 50
+	credentialRefreshBatchSize = 50
 	// credentialScheduleReconcileEvery bounds expensive schedule backfill so the
 	// refresh loop is not blocked by scanning all unscheduling rows every tick.
-	credentialScheduleReconcileEvery          = 5 * time.Minute
-	managedTaskWorkerCeiling                  = 50
-	webQuotaRefreshQueueSize                  = 4096
-	webQuotaRefreshTimeout                    = 30 * time.Second
-	maxCredentialExportAccounts               = 10000
-	maxCredentialImportAccounts               = 10000
-	credentialImportChunkSize                 = 100
-	maxBuildConversionAccounts                = 1000
-	maxWebConsoleSyncAccounts                 = 1000
-	accountTaskBatchSize                      = 1000
+	credentialScheduleReconcileEvery = 5 * time.Minute
+	managedTaskWorkerCeiling         = 50
+	webQuotaRefreshQueueSize         = 4096
+	webQuotaRefreshTimeout           = 30 * time.Second
+	maxCredentialExportAccounts      = 10000
+	maxCredentialImportAccounts      = 10000
+	credentialImportChunkSize        = 100
+	maxBuildConversionAccounts       = 1000
+	maxWebConsoleSyncAccounts        = 1000
+	accountTaskBatchSize             = 1000
 )
 
 const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
@@ -274,19 +273,19 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 
 // Service 负责 OAuth 账号接入、刷新、额度和持久化生命周期。
 type Service struct {
-	accounts              repository.AccountRepository
-	audits                repository.AuditRepository
-	deviceSessions        repository.DeviceSessionRepository
-	sticky                repository.StickySessionRepository
-	refreshLock           repository.DistributedLock
-	quotaQueue            repository.QuotaRecoveryQueue
-	providers             *provider.Registry
-	cipher                *security.Cipher
-	refreshes             singleflight.Group
-	billingSyncs          singleflight.Group
-	quotaSyncs            singleflight.Group
-	refreshMu             sync.Mutex
-	lastRefreshAt         map[uint64]time.Time
+	accounts       repository.AccountRepository
+	audits         repository.AuditRepository
+	deviceSessions repository.DeviceSessionRepository
+	sticky         repository.StickySessionRepository
+	refreshLock    repository.DistributedLock
+	quotaQueue     repository.QuotaRecoveryQueue
+	providers      *provider.Registry
+	cipher         *security.Cipher
+	refreshes      singleflight.Group
+	billingSyncs   singleflight.Group
+	quotaSyncs     singleflight.Group
+	refreshMu      sync.Mutex
+	lastRefreshAt  map[uint64]time.Time
 	// refreshSkipUntil holds in-memory cooldowns when RefreshDueAt could not be written.
 	refreshSkipUntil      map[uint64]time.Time
 	quotaRefreshMu        sync.Mutex
@@ -302,10 +301,25 @@ type Service struct {
 	upstreamSync          UpstreamSyncPolicy
 	scheduleReconcileMu   sync.Mutex
 	lastScheduleReconcile time.Time
+	poolNotify            func(accountdomain.Provider)
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
 	s.quotaQueue = queue
+}
+
+// SetPoolNotify registers a callback invoked after account deletions or major pool
+// mutations so that routing schedulers can drop caches immediately.
+func (s *Service) SetPoolNotify(notify func(accountdomain.Provider)) {
+	s.poolNotify = notify
+}
+
+// NotifyPoolChanged lets transport handlers trigger scheduler cache invalidation
+// for a provider after batch mutations (e.g. selected account deletes).
+func (s *Service) NotifyPoolChanged(p accountdomain.Provider) {
+	if s.poolNotify != nil && p.IsValid() {
+		s.poolNotify(p)
+	}
 }
 
 // SetUpstreamSyncPolicy updates proactive billing/quota sync gates (hot-reload safe).
@@ -345,7 +359,6 @@ func (s *Service) quotaSyncAllowed(ctx context.Context) bool {
 	}
 	return policy.WebQuota || policy.AllowManualQuotaRefresh
 }
-
 
 func NewService(accounts repository.AccountRepository, audits repository.AuditRepository, deviceSessions repository.DeviceSessionRepository, sticky repository.StickySessionRepository, providers *provider.Registry, cipher *security.Cipher, refreshLock repository.DistributedLock) *Service {
 	return &Service{
@@ -538,10 +551,67 @@ func (s *Service) DeleteFailedAccounts(ctx context.Context, providerValue accoun
 			if s.logger != nil {
 				s.logger.Info("delete_failed_accounts_done", "deleted", deleted, "rounds", round+1)
 			}
+			if deleted > 0 && s.poolNotify != nil {
+				s.poolNotify(providerValue)
+			}
 			return deleted, nil
 		}
 	}
+	if deleted > 0 && s.poolNotify != nil {
+		s.poolNotify(providerValue)
+	}
 	return deleted, fmt.Errorf("%w: 删除失效账号超过安全轮次上限", ErrInvalidInput)
+}
+
+// DeleteAllAccountsForProvider removes every account (and related state) for a provider.
+// This is a destructive full-pool purge and should only be invoked after explicit confirmation.
+// Deletes are chunked and reuse BatchDelete for sticky/refresh cleanup.
+func (s *Service) DeleteAllAccountsForProvider(ctx context.Context, providerValue accountdomain.Provider) (int64, error) {
+	if !providerValue.IsValid() {
+		return 0, ErrInvalidInput
+	}
+	const chunk = 500
+	const maxRounds = 20000
+	var deleted int64
+	for round := 0; round < maxRounds; round++ {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		ids, err := s.accounts.ListProviderAccountIDs(ctx, providerValue, chunk)
+		if err != nil {
+			return deleted, err
+		}
+		if len(ids) == 0 {
+			if s.logger != nil {
+				s.logger.Info("delete_all_accounts_done", "provider", providerValue, "deleted", deleted, "rounds", round)
+			}
+			return deleted, nil
+		}
+		n, err := s.BatchDelete(ctx, ids)
+		deleted += n
+		if s.logger != nil {
+			s.logger.Info("delete_all_accounts_chunk", "provider", providerValue, "batch", len(ids), "deleted_rows", n, "total_deleted", deleted)
+		}
+		if err != nil {
+			return deleted, err
+		}
+		if n == 0 {
+			return deleted, fmt.Errorf("%w: 匹配到 %d 个账号但无法删除（可能被外键占用）", ErrInvalidInput, len(ids))
+		}
+		if len(ids) < chunk {
+			if s.logger != nil {
+				s.logger.Info("delete_all_accounts_done", "provider", providerValue, "deleted", deleted, "rounds", round+1)
+			}
+			if deleted > 0 && s.poolNotify != nil {
+				s.poolNotify(providerValue)
+			}
+			return deleted, nil
+		}
+	}
+	if deleted > 0 && s.poolNotify != nil {
+		s.poolNotify(providerValue)
+	}
+	return deleted, fmt.Errorf("%w: 删除账号超过安全轮次上限", ErrInvalidInput)
 }
 
 // SSOEmailDedupResult summarizes email-based SSO token deduplication.
@@ -928,8 +998,6 @@ func (s *Service) probeAccountUpstream(ctx context.Context, value accountdomain.
 	}
 	return fmt.Errorf("Provider %s 未注册可用性探测能力", value.Provider)
 }
-
-
 
 func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 	value, err := s.accounts.Get(ctx, id)

@@ -2,10 +2,12 @@ package quotarecovery
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -100,6 +102,14 @@ func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain
 		return
 	}
 	if ctx.Err() != nil {
+		return
+	}
+	// Deleted or permanently gone account: ack to remove the stale recovery task from the scheduler queue.
+	// Prevents the quota recovery scheduler from spinning on non-existent accounts after bulk deletes etc.
+	if errors.Is(probeErr, accountapp.ErrNotFound) {
+		if err := s.queue.AckQuotaRecovery(ctx, value); err != nil {
+			s.logger.Warn("quota_recovery_ack_failed", "account_id", value.AccountID, "mode", value.Mode, "error", err)
+		}
 		return
 	}
 	value.Attempts++

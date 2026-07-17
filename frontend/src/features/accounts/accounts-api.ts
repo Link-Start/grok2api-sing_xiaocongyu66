@@ -444,7 +444,9 @@ export function deleteAccounts(ids: string[], provider: AccountProvider): Promis
   return apiRequest("/api/admin/v1/accounts", { method: "DELETE", body: { ids, provider } }, decodeCountResult<{ deleted: number }>("deleted"));
 }
 
-
+export function deleteAllAccounts(provider: AccountProvider): Promise<{ deleted: number }> {
+  return apiRequest("/api/admin/v1/accounts", { method: "DELETE", body: { all: true, provider } }, decodeCountResult<{ deleted: number }>("deleted"));
+}
 
 export function deleteFailedAccounts(provider: AccountProvider, includeDisabled = true): Promise<{ deleted: number }> {
   // Default includeDisabled=true: matches "attention" issues (reauth + disabled), not quota-recovering accounts.

@@ -37,6 +37,7 @@ import {
   dedupSSOByEmail,
   deleteAccount,
   deleteAccounts,
+  deleteAllAccounts,
   deleteFailedAccounts,
   exportAccounts,
   getAccountSummary,
@@ -102,6 +103,7 @@ export function AccountsPage() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [deleteFailedOpen, setDeleteFailedOpen] = useState(false);
+  const [deleteAllOpen, setDeleteAllOpen] = useState(false);
   const [validateAllOpen, setValidateAllOpen] = useState(false);
   const [validatePreselectOpen, setValidatePreselectOpen] = useState(false);
   const [dedupOpen, setDedupOpen] = useState(false);
@@ -402,6 +404,17 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const deleteAllMutation = useMutation({
+    mutationFn: () => deleteAllAccounts(provider),
+    onSuccess: (result) => {
+      setDeleteAllOpen(false);
+      setSelected(new Set());
+      invalidateAccountData();
+      toast.success(t("accounts.allDeleted", { count: result.deleted }));
+    },
+    onError: showError,
+  });
+
   const dedupMutation = useMutation({
     mutationFn: () => {
       const controller = new AbortController();
@@ -620,7 +633,7 @@ export function AccountsPage() {
     || importMutation.isPending
     || batchUpdateMutation.isPending
     || batchBillingMutation.isPending
-    || batchDeleteMutation.isPending || deleteFailedMutation.isPending || dedupMutation.isPending || validateMutation.isPending;
+    || batchDeleteMutation.isPending || deleteFailedMutation.isPending || deleteAllMutation.isPending || dedupMutation.isPending || validateMutation.isPending;
 
   return (
     <div className="space-y-8">
@@ -726,6 +739,11 @@ export function AccountsPage() {
                 {hasProviderAccounts && providerFailedCount > 0 ? (
                   <Button variant="secondary" size="sm" className="text-destructive" disabled={bulkTaskPending || deleteFailedMutation.isPending} onClick={() => setDeleteFailedOpen(true)}>
                     {deleteFailedMutation.isPending ? <Spinner /> : t("accounts.deleteFailed", { count: providerFailedCount })}
+                  </Button>
+                ) : null}
+                {hasProviderAccounts ? (
+                  <Button variant="secondary" size="sm" className="text-destructive" disabled={bulkTaskPending || deleteAllMutation.isPending} onClick={() => setDeleteAllOpen(true)}>
+                    {deleteAllMutation.isPending ? <Spinner /> : t("accounts.deleteAll")}
                   </Button>
                 ) : null}
                 {hasProviderAccounts && (provider === "grok_web" || provider === "grok_console") ? (
@@ -1034,6 +1052,30 @@ export function AccountsPage() {
               }}
             >
               {deleteFailedMutation.isPending ? <Spinner /> : t("accounts.deleteFailedConfirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={deleteAllOpen} onOpenChange={setDeleteAllOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("accounts.deleteAllTitle", { count: providerAccountTotal })}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("accounts.deleteAllDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteAllMutation.isPending}>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={deleteAllMutation.isPending}
+              onClick={(event) => {
+                event.preventDefault();
+                deleteAllMutation.mutate();
+              }}
+            >
+              {deleteAllMutation.isPending ? <Spinner /> : t("accounts.deleteAllConfirm")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

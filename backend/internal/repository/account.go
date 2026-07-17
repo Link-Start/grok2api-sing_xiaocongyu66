@@ -30,6 +30,8 @@ type AccountRepository interface {
 	ListEnabledAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error)
 	// ListFailedAccountIDs returns IDs of reauthRequired (and optionally disabled) accounts for bulk cleanup.
 	ListFailedAccountIDs(ctx context.Context, provider account.Provider, includeDisabled bool, limit int) ([]uint64, error)
+	// ListProviderAccountIDs returns up to limit IDs for the provider (ID ASC). Used for bulk operations like pool purge.
+	ListProviderAccountIDs(ctx context.Context, provider account.Provider, limit int) ([]uint64, error)
 	// ListSSOAccountsForDedup returns SSO credentials for a provider (enabled or not) with email/token fields for dedup.
 	ListSSOAccountsForDedup(ctx context.Context, provider account.Provider) ([]account.Credential, error)
 	// FilterMissingBuildConversionIDs 从指定账号中排除已经关联 Build 的 Web 账号。
