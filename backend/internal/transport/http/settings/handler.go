@@ -183,6 +183,11 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
 			SyncConcurrency: value.Batch.SyncConcurrency, RefreshConcurrency: value.Batch.RefreshConcurrency,
 			RandomDelay: value.Batch.RandomDelay,
+			DBBuffer: settingsapp.DBBufferConfig{
+				Enabled: value.Batch.DBBuffer.Enabled,
+				Driver:  value.Batch.DBBuffer.Driver,
+				Path:    value.Batch.DBBuffer.Path,
+			},
 		},
 		Media: settingsapp.MediaConfig{
 			MaxImageBytes: value.Media.MaxImageBytes, MaxTotalBytes: value.Media.MaxTotalBytes,

@@ -467,6 +467,10 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
 	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
 	next.Provider.Console.UserAgent = strings.TrimSpace(input.ProviderConsole.UserAgent)
+	randomDelay, err := time.ParseDuration(strings.TrimSpace(input.Batch.RandomDelay))
+	if err != nil {
+		return config.Config{}, fmt.Errorf("batch.randomDelay 必须是有效时长")
+	}
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
 		SyncConcurrency: input.Batch.SyncConcurrency, RefreshConcurrency: input.Batch.RefreshConcurrency,
