@@ -123,6 +123,9 @@ func (r *bulkBufferRepoStub) UpdateCredentialRefreshFailure(context.Context, uin
 func (r *bulkBufferRepoStub) UpdateObservedModel(context.Context, uint64, string, time.Time) error {
 	return nil
 }
+func (r *bulkBufferRepoStub) MarkBuildAPIFallback(context.Context, uint64, bool) error {
+	return nil
+}
 func (r *bulkBufferRepoStub) UpdateHealth(context.Context, uint64, int, *time.Time, string, bool) error {
 	return nil
 }
