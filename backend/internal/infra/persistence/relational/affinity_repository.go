@@ -2,7 +2,10 @@ package relational
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -23,6 +26,11 @@ func NewAffinityStore(db *Database) *AffinityStore {
 // When expire is false, expires_at is stored as NULL (never expire).
 func (s *AffinityStore) GetOrCreate(ctx context.Context, fingerprint, newID string, ttl time.Duration, expire bool) (string, error) {
 	if s == nil || s.db == nil || fingerprint == "" {
+		return newID, nil
+	}
+	// Schema enforces length(fingerprint)=64; never insert longer keys (SQLSTATE 22001).
+	fingerprint = normalizeAffinityFingerprint(fingerprint)
+	if fingerprint == "" {
 		return newID, nil
 	}
 	now := time.Now().UTC()
@@ -96,6 +104,10 @@ func (s *AffinityStore) Lookup(ctx context.Context, fingerprint string, now time
 	if s == nil || s.db == nil || fingerprint == "" {
 		return "", false, nil
 	}
+	fingerprint = normalizeAffinityFingerprint(fingerprint)
+	if fingerprint == "" {
+		return "", false, nil
+	}
 	var row promptCacheAffinityModel
 	err := s.db.db.WithContext(ctx).Where("fingerprint = ?", fingerprint).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -111,4 +123,28 @@ func (s *AffinityStore) Lookup(ctx context.Context, fingerprint string, now time
 		return "", false, nil
 	}
 	return row.AffinityID, true, nil
+}
+
+// normalizeAffinityFingerprint ensures the SQL PK fits length(fingerprint)=64.
+// Prefixed keys (legacy "seed:"/"turn:"/"client:") are re-hashed to 64 hex chars.
+func normalizeAffinityFingerprint(fingerprint string) string {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return ""
+	}
+	if len(fingerprint) == 64 {
+		// Fast path: already a full SHA-256 hex digest.
+		for i := 0; i < 64; i++ {
+			c := fingerprint[i]
+			if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+				continue
+			}
+			// Non-hex: fall through to hash.
+			goto hash
+		}
+		return strings.ToLower(fingerprint)
+	}
+hash:
+	sum := sha256.Sum256([]byte(fingerprint))
+	return hex.EncodeToString(sum[:])
 }

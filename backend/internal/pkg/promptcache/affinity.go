@@ -145,7 +145,8 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (string, error) {
 	if fp == "" {
 		return "", nil
 	}
-	return r.getOrCreate(ctx, "client:"+fp, policy)
+	// Must be exactly 64 hex chars for prompt_cache_affinity.fingerprint PK.
+	return r.getOrCreate(ctx, fp, policy)
 }
 
 // RememberTurn links a completed response id to the affinity key used for that request
@@ -221,18 +222,20 @@ func fingerprint(clientKeyID uint64, clientIP, userAgent string) string {
 	if clientKeyID == 0 && ip == "" && ua == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\n%s\n%s", clientKeyID, ip, ua)))
+	// Domain tag is inside the hash so the stored key stays 64 hex chars
+	// (SQL prompt_cache_affinity.fingerprint requires length = 64).
+	sum := sha256.Sum256([]byte(fmt.Sprintf("client\n%d\n%s\n%s", clientKeyID, ip, ua)))
 	return hex.EncodeToString(sum[:])
 }
 
 func turnFingerprint(clientKeyID uint64, responseID string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("turn\n%d\n%s", clientKeyID, strings.TrimSpace(responseID))))
-	return "turn:" + hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 func seedFingerprint(clientKeyID uint64, seed string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("seed\n%d\n%s", clientKeyID, seed)))
-	return "seed:" + hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:])
 }
 
 // ConversationSeedFromMessages builds a stable seed from system + first user text.
