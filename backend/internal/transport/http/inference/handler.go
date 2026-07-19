@@ -154,13 +154,17 @@ func (h *Handler) listModels(c *gin.Context) {
 		writeOpenAIError(c, http.StatusInternalServerError, "model_list_failed", "读取模型列表失败")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values)})
+	// Compatibility aliases (e.g. grok-4.20-multi-agent-xhigh) are routable but are not
+	// separate rows in model_routes — surface them so clients match jiujiu532/grok2api.
+	aliases := h.models.ListPublicAliases()
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values, aliases)})
 }
 
 // newModelListItems 按下游公开名称去重，隐藏仅用于内部选路的 Provider 前缀。
-func newModelListItems(values []modeldomain.Route) []modelListItem {
-	data := make([]modelListItem, 0, len(values))
-	seen := make(map[string]bool, len(values))
+// aliases are extra client-visible IDs that resolve via ModelAlias (reasoning effort shortcuts).
+func newModelListItems(values []modeldomain.Route, aliases []string) []modelListItem {
+	data := make([]modelListItem, 0, len(values)+len(aliases))
+	seen := make(map[string]bool, len(values)+len(aliases))
 	for _, value := range values {
 		publicID := modeldomain.ExternalPublicID(value.Provider, value.PublicID)
 		if seen[publicID] {
@@ -168,6 +172,19 @@ func newModelListItems(values []modeldomain.Route) []modelListItem {
 		}
 		seen[publicID] = true
 		data = append(data, modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api"})
+	}
+	// Use a stable synthetic created time so aliases sort after real routes when clients sort by created.
+	aliasCreated := time.Now().UTC().Unix()
+	if len(values) > 0 {
+		aliasCreated = values[0].CreatedAt.Unix()
+	}
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" || seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		data = append(data, modelListItem{ID: alias, Object: "model", Created: aliasCreated, OwnedBy: "grok2api"})
 	}
 	return data
 }

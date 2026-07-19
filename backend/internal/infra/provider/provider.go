@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -435,6 +436,26 @@ func (r *Registry) Get(value account.Provider) (Adapter, bool) {
 func (r *Registry) ResolveModelAlias(value string) (ModelAlias, bool) {
 	result, ok := r.aliases[value]
 	return result, ok
+}
+
+// ListModelAliases returns all registered compatibility aliases (e.g. grok-4.20-multi-agent-xhigh).
+// Used by /v1/models so clients can discover names that only exist as routing aliases.
+func (r *Registry) ListModelAliases() []ModelAlias {
+	if r == nil || len(r.aliases) == 0 {
+		return nil
+	}
+	out := make([]ModelAlias, 0, len(r.aliases))
+	for _, value := range r.aliases {
+		out = append(out, value)
+	}
+	// Stable order for OpenAI-style model lists and admin UI.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Alias == out[j].Alias {
+			return out[i].Provider < out[j].Provider
+		}
+		return out[i].Alias < out[j].Alias
+	})
+	return out
 }
 
 // Definition 返回生产 Adapter 声明的稳定能力描述。

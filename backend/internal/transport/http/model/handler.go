@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
@@ -79,7 +80,9 @@ type accountOptionResponse struct {
 
 func (h *Handler) list(c *gin.Context) {
 	page, pageSize := pagination(c)
-	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), modelapp.ListFilter{Provider: c.Query("provider"), Status: c.Query("status"), Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}})
+	search := c.Query("search")
+	filter := modelapp.ListFilter{Provider: c.Query("provider"), Status: c.Query("status"), Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}}
+	values, total, err := h.service.List(c.Request.Context(), page, pageSize, search, filter)
 	if errors.Is(err, modelapp.ErrInvalidFilter) {
 		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
 		return
@@ -91,6 +94,13 @@ func (h *Handler) list(c *gin.Context) {
 	items := make([]modelResponse, 0, len(values))
 	for _, value := range values {
 		items = append(items, newModelResponse(value))
+	}
+	// On first page with no provider filter, append visible Console aliases
+	// (grok-4.20-multi-agent-xhigh etc.) so admin UI matches /v1/models discovery.
+	if page <= 1 && filter.Provider == "" && (filter.Status == "" || filter.Status == "enabled") {
+		for _, alias := range h.service.ListPublicAliasRoutes(search) {
+			items = append(items, newModelResponse(alias))
+		}
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
 }
@@ -244,8 +254,13 @@ func newModelResponse(value modeldomain.Route) modelResponse {
 	for _, id := range value.BoundAccountIDs {
 		accountIDs = append(accountIDs, strconv.FormatUint(id, 10))
 	}
+	// Alias virtual rows use a bare client ID as PublicID (no Console/ prefix).
+	publicID := value.PublicID
+	if strings.Contains(publicID, "/") {
+		publicID = modeldomain.ExternalPublicID(value.Provider, value.PublicID)
+	}
 	return modelResponse{
-		ID: value.ID, PublicID: modeldomain.ExternalPublicID(value.Provider, value.PublicID), Provider: string(value.Provider), UpstreamModel: modeldomain.DisplayUpstreamModel(value.Provider, value.UpstreamModel), Capability: string(value.Capability),
+		ID: value.ID, PublicID: publicID, Provider: string(value.Provider), UpstreamModel: modeldomain.DisplayUpstreamModel(value.Provider, value.UpstreamModel), Capability: string(value.Capability),
 		Enabled: value.Enabled, Origin: string(value.Origin), AccountIDs: accountIDs, BindingMode: manualBinding, SupportedAccounts: value.SupportedAccounts,
 		SyncedAccounts: value.SyncedAccounts, TotalAccounts: value.TotalAccounts, CapabilityKnown: capabilityKnown,
 		Available: available, LastSyncedAt: value.LastSyncedAt,

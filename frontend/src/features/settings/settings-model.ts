@@ -7,12 +7,18 @@ export type DurationValue = { value: number; unit: DurationUnit };
 export type ByteSizeUnit = "MiB" | "GiB";
 export type ByteSizeValue = { value: number; unit: ByteSizeUnit };
 
-// Empty number inputs become NaN via valueAsNumber; reject non-finite so the
-// invalid-submit path can toast instead of looking like a dead save button.
-const numberField = z.number().refine((value) => Number.isFinite(value), { message: "invalid" });
-const durationSchema = z.object({ value: numberField.positive(), unit: z.enum(["s", "m", "h", "d"]) });
-const positiveInteger = numberField.int().positive();
-const byteSizeSchema = z.object({ value: numberField.positive(), unit: z.enum(["MiB", "GiB"]) });
+// Coerce number inputs from HTML/react-hook-form (strings, empty → NaN) so save
+// does not fail silently on fields that look filled in the UI.
+const numberField = z.coerce.number().refine((value) => Number.isFinite(value), { message: "invalid" });
+const durationSchema = z.object({
+  value: numberField.refine((value) => value > 0, { message: "invalid" }),
+  unit: z.enum(["s", "m", "h", "d"]),
+});
+const positiveInteger = numberField.refine((value) => Number.isInteger(value) && value > 0, { message: "invalid" });
+const byteSizeSchema = z.object({
+  value: numberField.refine((value) => value > 0, { message: "invalid" }),
+  unit: z.enum(["MiB", "GiB"]),
+});
 const routingTTLDuration = durationSchema.refine((value) => durationSeconds(value) <= 30 * 86_400);
 const routingCooldownDuration = durationSchema.refine((value) => durationSeconds(value) <= 86_400);
 const routingCapacityWaitDuration = durationSchema.refine((value) => durationSeconds(value) <= 5);
@@ -91,7 +97,7 @@ export const settingsSchema = z.object({
     conversionConcurrency: positiveInteger.max(50),
     syncConcurrency: positiveInteger.max(50),
     refreshConcurrency: positiveInteger.max(50),
-    randomDelay: numberField.int().min(0).max(5_000),
+    randomDelay: numberField.refine((value) => Number.isInteger(value) && value >= 0 && value <= 5_000, { message: "invalid" }),
     dbBuffer: z.object({
       enabled: z.boolean(),
       driver: z.enum(["none", "redis", "sqlite"]),
@@ -101,7 +107,7 @@ export const settingsSchema = z.object({
   media: z.object({
     maxImageSize: byteSizeSchema.refine((value) => byteSizeBytes(value) >= 1 << 20 && byteSizeBytes(value) <= 32 << 20),
     maxTotalSize: byteSizeSchema.refine((value) => byteSizeBytes(value) <= 2 ** 40),
-    cleanupThresholdPercent: z.number().int().min(50).max(95),
+    cleanupThresholdPercent: numberField.refine((value) => Number.isInteger(value) && value >= 50 && value <= 95, { message: "invalid" }),
     cleanupInterval: durationSchema.refine((value) => durationSeconds(value) >= 60 && durationSeconds(value) <= 86_400),
   }).refine((value) => byteSizeBytes(value.maxTotalSize) >= byteSizeBytes(value.maxImageSize), { path: ["maxTotalSize"] }),
   routing: z.object({

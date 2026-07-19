@@ -39,12 +39,17 @@ export function SettingsPage() {
     form.setValue("providerBuild.clientVersion", recommendedBuild.clientVersion, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
     form.setValue("providerBuild.userAgent", recommendedBuild.userAgent, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
   };
-  const canSave = !loading && !updateMutation.isPending && form.formState.isDirty;
+  // Do not gate Save on isDirty: Switch/Controller edits sometimes leave isDirty false
+  // (looks like a dead button). Always allow submit; validation + API still protect.
+  const canSave = !loading && !updateMutation.isPending && Boolean(snapshot);
 
   return (
     <form
       className="w-full space-y-8 [&_input]:border-transparent"
-      onSubmit={form.handleSubmit((values) => updateMutation.mutate(values), onInvalid)}
+      onSubmit={form.handleSubmit(
+        (values) => updateMutation.mutate(values),
+        onInvalid,
+      )}
     >
       <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
@@ -60,7 +65,7 @@ export function SettingsPage() {
             </TooltipTrigger>
             <TooltipContent>{t("common.reset")}</TooltipContent>
           </Tooltip>
-          <Button type="submit" size="sm" disabled={!canSave} title={!form.formState.isDirty && !loading ? t("settings.noChanges", { defaultValue: "没有未保存的更改" }) : undefined}>
+          <Button type="submit" size="sm" disabled={!canSave}>
             {updateMutation.isPending ? <Spinner /> : null}{t("common.save")}
           </Button>
         </div>

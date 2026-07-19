@@ -30,12 +30,19 @@ export function useSettings() {
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
   const form = useForm<SettingsForm>({
     resolver: zodResolver(settingsSchema),
-    // Avoid "click save → nothing" when RHF has not yet re-rendered isValid after edits.
     mode: "onSubmit",
     reValidateMode: "onChange",
+    shouldFocusError: true,
   });
   const updateMutation = useMutation({
-    mutationFn: (config: SettingsForm) => updateSettings(settingsQuery.data?.revision ?? "0", toSettingsDTO(config)),
+    mutationFn: async (config: SettingsForm) => {
+      try {
+        return await updateSettings(settingsQuery.data?.revision ?? "0", toSettingsDTO(config));
+      } catch (error) {
+        // Surface DTO/build errors (e.g. undefined duration) instead of silent failure.
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+    },
     onSuccess: (snapshot) => {
       queryClient.setQueryData(["settings"], snapshot);
       void queryClient.invalidateQueries({ queryKey: ["system-info"] });
@@ -46,25 +53,27 @@ export function useSettings() {
   });
 
   useEffect(() => {
-    if (settingsQuery.data) form.reset(toSettingsForm(settingsQuery.data.config));
+    if (settingsQuery.data) {
+      form.reset(toSettingsForm(settingsQuery.data.config), { keepDefaultValues: false });
+    }
   }, [form, settingsQuery.data]);
 
   const onInvalid = (errors: FieldErrors<SettingsForm>) => {
     const paths = collectErrorPaths(errors);
     const preview = paths.slice(0, 4).join(", ");
     const more = paths.length > 4 ? ` (+${paths.length - 4})` : "";
+    // Always toast — previous bug was validation fail with zero UI feedback.
     toast.error(
       paths.length > 0
         ? t("settings.validationFailed", { fields: `${preview}${more}`, defaultValue: `校验失败：${preview}${more}` })
         : t("settings.validationFailedGeneric", { defaultValue: "表单校验未通过，请检查标红字段" }),
     );
-    // Focus first invalid control so errors on other tabs are less silent.
     const first = paths[0];
     if (first) {
       try {
         form.setFocus(first as never);
       } catch {
-        // ignore focus failures for nested duration objects
+        // nested duration objects may not be focusable
       }
     }
   };
