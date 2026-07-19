@@ -619,6 +619,15 @@ export function AccountsPage() {
   const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
   const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
   const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
+  const webPools = summary?.webPools ?? {
+    basic: { total: 0, available: 0 },
+    super: { total: 0, available: 0 },
+    heavy: { total: 0, available: 0 },
+    auto: { total: 0, available: 0 },
+  };
+  const consoleQuota = summary?.consoleQuota ?? {
+    total: 0, available: 0, healthy: 0, rotating: 0, exhausted: 0, remaining: 0, capacity: 0,
+  };
   const summaryLoading = summaryQuery.isPending;
   const summaryUnavailable = summaryQuery.isError;
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
@@ -655,6 +664,22 @@ export function AccountsPage() {
             <TabsTrigger value="grok_console">Grok Console</TabsTrigger>
           </TabsList>
         </Tabs>
+        {provider === "grok_web" ? (
+          <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolBasic")} total={webPools.basic.total} available={webPools.basic.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolSuper")} total={webPools.super.total} available={webPools.super.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolHeavy")} total={webPools.heavy.total} available={webPools.heavy.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolAuto")} total={webPools.auto.total} available={webPools.auto.available} locale={i18n.language} />
+          </section>
+        ) : null}
+        {provider === "grok_console" ? (
+          <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <AccountMetricPanel icon={<Webhook />} loading={summaryLoading} label={t("accounts.consoleQuotaRemaining")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.remaining, i18n.language, 0)} detail={t("accounts.consoleQuotaCapacity", { capacity: formatNumber(consoleQuota.capacity, i18n.language, 0) })} />
+            <AccountMetricPanel icon={<Compass />} loading={summaryLoading} label={t("accounts.consoleQuotaHealthy")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.healthy, i18n.language, 0)} detail={t("accounts.consoleQuotaHealthyDetail")} />
+            <AccountMetricPanel icon={<RefreshCw />} loading={summaryLoading} label={t("accounts.consoleQuotaRotating")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.rotating, i18n.language, 0)} detail={t("accounts.consoleQuotaRotatingDetail")} />
+            <AccountMetricPanel icon={<TriangleAlert />} loading={summaryLoading} label={t("accounts.consoleQuotaExhausted")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.exhausted, i18n.language, 0)} detail={t("accounts.consoleQuotaExhaustedDetail")} />
+          </section>
+        ) : null}
         <input
           ref={fileInputRef}
           type="file"
@@ -1162,6 +1187,19 @@ function AccountMetricPanel({ icon, label, value, detail, loading }: { icon: Rea
   );
 }
 
+function PoolMetricPanel({ loading, unavailable, label, total, available, locale }: { loading: boolean; unavailable: boolean; label: string; total: number; available: number; locale: string }) {
+  const { t } = useTranslation();
+  return (
+    <AccountMetricPanel
+      icon={<Compass />}
+      loading={loading}
+      label={label}
+      value={unavailable ? "-" : formatNumber(total, locale, 0)}
+      detail={t("accounts.routableAccountCount", { count: formatNumber(available, locale, 0) })}
+    />
+  );
+}
+
 function WebAccountType({ tier }: { tier?: AccountDTO["webTier"] }) {
   const { t } = useTranslation();
   const label = tier === "basic" ? t("accountType.free") : tier === "super" ? t("accountType.super") : tier === "heavy" ? t("accountType.heavy") : t("accountType.auto");
@@ -1194,8 +1232,14 @@ function AccountStatus({ account }: { account: AccountDTO }) {
   if (account.authStatus === "reauthRequired") {
     return <Badge variant="destructive">{t("accounts.statusReauthRequired")}</Badge>;
   }
-  if (account.provider === "grok_console" && account.quotaWindows?.some((window) => window.mode === "console" && window.remaining <= 0)) {
-    return <Badge variant="secondary" className="bg-amber-500/10 text-amber-700 dark:text-amber-300">{t("accounts.waitingReset")}</Badge>;
+  if (account.provider === "grok_console") {
+    const consoleWindow = account.quotaWindows?.find((window) => window.mode === "console");
+    if (consoleWindow && consoleWindow.remaining <= 0) {
+      return <Badge variant="secondary" className="bg-amber-500/10 text-amber-700 dark:text-amber-300">{t("accounts.waitingReset")}</Badge>;
+    }
+    if (consoleWindow && consoleWindow.remaining > 0 && consoleWindow.resetAt) {
+      return <Badge variant="secondary" className="bg-sky-500/10 text-sky-700 dark:text-sky-300">{t("accounts.consoleQuotaRotating")}</Badge>;
+    }
   }
   if (account.quota.status === "waitingReset") {
     return <Badge variant="secondary" className="bg-amber-500/10 text-amber-700 dark:text-amber-300">{t("accounts.waitingReset")}</Badge>;

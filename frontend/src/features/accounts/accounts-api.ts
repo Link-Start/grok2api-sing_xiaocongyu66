@@ -111,6 +111,28 @@ export type AccountProviderSummaryDTO = {
   disabled: number;
 };
 
+export type WebPoolBucketDTO = {
+  total: number;
+  available: number;
+};
+
+export type WebPoolsDTO = {
+  basic: WebPoolBucketDTO;
+  super: WebPoolBucketDTO;
+  heavy: WebPoolBucketDTO;
+  auto: WebPoolBucketDTO;
+};
+
+export type ConsoleQuotaSummaryDTO = {
+  total: number;
+  available: number;
+  healthy: number;
+  rotating: number;
+  exhausted: number;
+  remaining: number;
+  capacity: number;
+};
+
 export type AccountSummaryDTO = {
   total: number;
   available: number;
@@ -119,6 +141,8 @@ export type AccountSummaryDTO = {
   providers: Record<AccountProvider, AccountProviderSummaryDTO>;
   recovery: { cooldown: number; waitingReset: number; probing: number };
   issues: { disabled: number; reauthRequired: number };
+  webPools: WebPoolsDTO;
+  consoleQuota: ConsoleQuotaSummaryDTO;
 };
 
 export type DeviceSessionDTO = {
@@ -174,11 +198,17 @@ const accountValidator = hasShape({
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);
 const decodeAccountPage = createPaginatedDecoder<AccountDTO>(accountValidator);
+const webPoolBucketValidator = hasShape({ total: isNumber, available: isNumber });
 const decodeAccountSummary = createObjectDecoder<AccountSummaryDTO>("account summary", {
   total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber,
   providers: isRecordOf(hasShape({ total: isNumber, available: isNumber, reauthRequired: isNumber, disabled: isNumber })),
   recovery: hasShape({ cooldown: isNumber, waitingReset: isNumber, probing: isNumber }),
   issues: hasShape({ disabled: isNumber, reauthRequired: isNumber }),
+  webPools: hasShape({ basic: webPoolBucketValidator, super: webPoolBucketValidator, heavy: webPoolBucketValidator, auto: webPoolBucketValidator }),
+  consoleQuota: hasShape({
+    total: isNumber, available: isNumber, healthy: isNumber, rotating: isNumber,
+    exhausted: isNumber, remaining: isNumber, capacity: isNumber,
+  }),
 });
 const decodeDeviceSession = createObjectDecoder<DeviceSessionDTO>("device session", {
   sessionId: isString, userCode: isString, verificationUri: isString, verificationUriComplete: isOptional(isString),

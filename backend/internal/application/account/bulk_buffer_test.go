@@ -47,6 +47,12 @@ func (r *bulkBufferRepoStub) ListProviderAccountBatch(context.Context, accountdo
 func (r *bulkBufferRepoStub) Summarize(context.Context, time.Time) ([]repository.AccountSummary, error) {
 	return nil, nil
 }
+func (r *bulkBufferRepoStub) SummarizeWebPools(context.Context, time.Time) (repository.WebPoolSummary, error) {
+	return repository.WebPoolSummary{}, nil
+}
+func (r *bulkBufferRepoStub) SummarizeConsoleQuota(context.Context, time.Time) (repository.ConsoleQuotaSummary, error) {
+	return repository.ConsoleQuotaSummary{}, nil
+}
 func (r *bulkBufferRepoStub) ListEnabled(context.Context, accountdomain.Provider) ([]accountdomain.Credential, error) {
 	return nil, nil
 }

@@ -400,6 +400,9 @@ func (h *Handler) summary(c *gin.Context) {
 	build := value.Providers[string(accountdomain.ProviderBuild)]
 	web := value.Providers[string(accountdomain.ProviderWeb)]
 	console := value.Providers[string(accountdomain.ProviderConsole)]
+	poolBucket := func(bucket repository.WebPoolBucket) gin.H {
+		return gin.H{"total": bucket.Total, "available": bucket.Available}
+	}
 	response.Success(c, http.StatusOK, gin.H{
 		"total": value.Total, "available": value.Available, "recovering": value.Recovering, "attention": value.Attention,
 		"providers": gin.H{
@@ -409,6 +412,18 @@ func (h *Handler) summary(c *gin.Context) {
 		},
 		"recovery": gin.H{"cooldown": value.Recovery.Cooldown, "waitingReset": value.Recovery.WaitingReset, "probing": value.Recovery.Probing},
 		"issues":   gin.H{"disabled": value.Issues.Disabled, "reauthRequired": value.Issues.ReauthRequired},
+		"webPools": gin.H{
+			"basic": poolBucket(value.WebPools.Basic),
+			"super": poolBucket(value.WebPools.Super),
+			"heavy": poolBucket(value.WebPools.Heavy),
+			"auto":  poolBucket(value.WebPools.Auto),
+		},
+		"consoleQuota": gin.H{
+			"total": value.ConsoleQuota.Total, "available": value.ConsoleQuota.Available,
+			"healthy": value.ConsoleQuota.Healthy, "rotating": value.ConsoleQuota.Rotating,
+			"exhausted": value.ConsoleQuota.Exhausted, "remaining": value.ConsoleQuota.Remaining,
+			"capacity": value.ConsoleQuota.Capacity,
+		},
 	})
 }
 

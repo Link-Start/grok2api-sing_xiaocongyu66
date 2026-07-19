@@ -147,6 +147,99 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 	return rows, err
 }
 
+
+func (r *AccountRepository) SummarizeWebPools(ctx context.Context, now time.Time) (repository.WebPoolSummary, error) {
+	type row struct {
+		Tier      string
+		Total     int64
+		Available int64
+	}
+	var rows []row
+	// Coalesce missing profiles to "auto" so unsynced Web accounts still appear in the pool view.
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select(`
+COALESCE(NULLIF(TRIM(profile.tier), ''), 'auto') AS tier,
+COUNT(*) AS total,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? AND NOT ` + accountRecoveryPredicateForAlias("account") + ` AND NOT ` + providerQuotaExhaustedPredicateForAlias("account") + ` AND (account.cooldown_until IS NULL OR account.cooldown_until <= ?) THEN 1 ELSE 0 END) AS available
+`, true, account.AuthStatusActive, now).
+		Joins("LEFT JOIN web_account_profiles AS profile ON profile.account_id = account.id").
+		Where("account.provider = ?", account.ProviderWeb).
+		Group("COALESCE(NULLIF(TRIM(profile.tier), ''), 'auto')").
+		Scan(&rows).Error
+	if err != nil {
+		return repository.WebPoolSummary{}, err
+	}
+	var result repository.WebPoolSummary
+	for _, value := range rows {
+		bucket := repository.WebPoolBucket{Total: value.Total, Available: value.Available}
+		switch account.WebTier(value.Tier) {
+		case account.WebTierBasic:
+			result.Basic = bucket
+		case account.WebTierSuper:
+			result.Super = bucket
+		case account.WebTierHeavy:
+			result.Heavy = bucket
+		default:
+			result.Auto = bucket
+		}
+	}
+	return result, nil
+}
+
+func (r *AccountRepository) SummarizeConsoleQuota(ctx context.Context, now time.Time) (repository.ConsoleQuotaSummary, error) {
+	type row struct {
+		Total     int64
+		Available int64
+		Healthy   int64
+		Rotating  int64
+		Exhausted int64
+		Remaining int64
+		Capacity  int64
+	}
+	var value row
+	// Console free-model rotation: healthy = remaining > threshold without timer;
+	// rotating = timer started while still usable; exhausted = remaining depleted.
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select(`
+COUNT(*) AS total,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? AND NOT ` + accountRecoveryPredicateForAlias("account") + ` AND NOT ` + providerQuotaExhaustedPredicateForAlias("account") + ` AND (account.cooldown_until IS NULL OR account.cooldown_until <= ?) THEN 1 ELSE 0 END) AS available,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? AND COALESCE(quota.remaining, 0) > 0 AND quota.reset_at IS NULL THEN 1 ELSE 0 END) AS healthy,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? AND COALESCE(quota.remaining, 0) > 0 AND quota.reset_at IS NOT NULL AND quota.reset_at > ? THEN 1 ELSE 0 END) AS rotating,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? AND (quota.remaining IS NULL OR quota.remaining <= 0) THEN 1 ELSE 0 END) AS exhausted,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? THEN COALESCE(quota.remaining, 0) ELSE 0 END) AS remaining,
+SUM(CASE WHEN account.enabled = ? AND account.auth_status = ? THEN COALESCE(quota.total, 0) ELSE 0 END) AS capacity
+`,
+			true, account.AuthStatusActive, now,
+			true, account.AuthStatusActive,
+			true, account.AuthStatusActive, now,
+			true, account.AuthStatusActive,
+			true, account.AuthStatusActive,
+			true, account.AuthStatusActive,
+		).
+		Joins("LEFT JOIN account_quota_windows AS quota ON quota.account_id = account.id AND quota.mode = ?", "console").
+		Where("account.provider = ?", account.ProviderConsole).
+		Scan(&value).Error
+	if err != nil {
+		return repository.ConsoleQuotaSummary{}, err
+	}
+	return repository.ConsoleQuotaSummary{
+		Total: value.Total, Available: value.Available, Healthy: value.Healthy,
+		Rotating: value.Rotating, Exhausted: value.Exhausted, Remaining: value.Remaining, Capacity: value.Capacity,
+	}, nil
+}
+
+// accountRecoveryPredicateForAlias rewrites the recovery EXISTS predicate for a table alias.
+func accountRecoveryPredicateForAlias(alias string) string {
+	return `EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = ` + alias + `.id AND recovery.status IN ('exhausted', 'probing'))`
+}
+
+// providerQuotaExhaustedPredicateForAlias rewrites the provider quota gate for a table alias.
+func providerQuotaExhaustedPredicateForAlias(alias string) string {
+	return `((` + alias + `.provider = 'grok_web' AND ((EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id AND quota.mode = 'weekly') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id AND quota.mode = 'weekly' AND quota.remaining > 0)) OR (NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id AND quota.mode = 'weekly') AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id AND quota.remaining > 0)))) OR (` + alias + `.provider = 'grok_console' AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = ` + alias + `.id AND quota.remaining > 0)))`
+}
+
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
 func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
 	values, err := r.ListEnabled(ctx, provider)

@@ -256,6 +256,73 @@ func TestAccountRepositoryDecrementsQuotaByAmountAtomically(t *testing.T) {
 	}
 }
 
+func TestAccountRepositorySummarizesWebPoolsAndConsoleQuota(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	now := time.Now().UTC()
+
+	createWeb := func(name string, tier account.WebTier) account.Credential {
+		value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
+			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.SaveQuotaWindows(ctx, value.ID, tier, now, []account.QuotaWindow{{
+			AccountID: value.ID, Mode: "fast", Remaining: 10, Total: 30, UpdatedAt: now,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	createWeb("web-basic", account.WebTierBasic)
+	createWeb("web-super", account.WebTierSuper)
+	createWeb("web-heavy", account.WebTierHeavy)
+
+	createConsole := func(name string, remaining int, rotating bool) {
+		credential, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
+			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resetAt *time.Time
+		if rotating {
+			until := now.Add(time.Hour)
+			resetAt = &until
+		}
+		if err := repo.SaveQuotaWindows(ctx, credential.ID, "", now, []account.QuotaWindow{{
+			AccountID: credential.ID, Mode: "console", Remaining: remaining, Total: 20, WindowSeconds: 3600,
+			ResetAt: resetAt, Source: account.QuotaSourceDefault, UpdatedAt: now,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createConsole("console-healthy", 18, false)
+	createConsole("console-rotating", 10, true)
+	createConsole("console-exhausted", 0, true)
+
+	pools, err := repo.SummarizeWebPools(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pools.Basic.Total != 1 || pools.Super.Total != 1 || pools.Heavy.Total != 1 {
+		t.Fatalf("web pools = %#v", pools)
+	}
+	consoleQuota, err := repo.SummarizeConsoleQuota(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consoleQuota.Total != 3 || consoleQuota.Healthy != 1 || consoleQuota.Rotating != 1 || consoleQuota.Exhausted != 1 {
+		t.Fatalf("console quota = %#v", consoleQuota)
+	}
+	if consoleQuota.Remaining != 28 || consoleQuota.Capacity != 60 {
+		t.Fatalf("console remaining/capacity = %#v", consoleQuota)
+	}
+}
+
 func TestAccountRepositoryConsoleDelayedQuotaRotation(t *testing.T) {
 	ctx := context.Background()
 	repo := NewAccountRepository(openTestDatabase(t))

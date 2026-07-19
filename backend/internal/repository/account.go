@@ -26,6 +26,10 @@ type AccountRepository interface {
 	// ListProviderAccountBatch 以 ID 游标取一批账号；total 仅在 afterID 为 0 时返回。
 	ListProviderAccountBatch(ctx context.Context, provider account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error)
 	Summarize(ctx context.Context, now time.Time) ([]AccountSummary, error)
+	// SummarizeWebPools returns basic/super/heavy pool counts for Grok Web accounts.
+	SummarizeWebPools(ctx context.Context, now time.Time) (WebPoolSummary, error)
+	// SummarizeConsoleQuota returns console free-model local quota rotation stats.
+	SummarizeConsoleQuota(ctx context.Context, now time.Time) (ConsoleQuotaSummary, error)
 	ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error)
 	ListEnabledAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error)
 	// ListFailedAccountIDs returns IDs of reauthRequired (and optionally disabled) accounts for bulk cleanup.

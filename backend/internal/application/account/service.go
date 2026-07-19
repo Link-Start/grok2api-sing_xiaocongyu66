@@ -219,13 +219,15 @@ type ListFilter struct {
 }
 
 type Summary struct {
-	Total      int64
-	Available  int64
-	Recovering int64
-	Attention  int64
-	Providers  map[string]ProviderSummary
-	Recovery   RecoverySummary
-	Issues     IssueSummary
+	Total         int64
+	Available     int64
+	Recovering    int64
+	Attention     int64
+	Providers     map[string]ProviderSummary
+	Recovery      RecoverySummary
+	Issues        IssueSummary
+	WebPools      repository.WebPoolSummary
+	ConsoleQuota  repository.ConsoleQuotaSummary
 }
 
 type ProviderSummary struct {
@@ -270,6 +272,16 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 	}
 	result.Recovering = result.Recovery.Cooldown + result.Recovery.WaitingReset + result.Recovery.Probing
 	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired
+	if pools, poolErr := s.accounts.SummarizeWebPools(ctx, s.now()); poolErr != nil {
+		return Summary{}, poolErr
+	} else {
+		result.WebPools = pools
+	}
+	if consoleQuota, quotaErr := s.accounts.SummarizeConsoleQuota(ctx, s.now()); quotaErr != nil {
+		return Summary{}, quotaErr
+	} else {
+		result.ConsoleQuota = consoleQuota
+	}
 	return result, nil
 }
 

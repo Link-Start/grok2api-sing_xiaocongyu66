@@ -110,7 +110,40 @@ export function ConsoleQuota({ windows, locale }: { windows: NonNullable<Account
   const { t } = useTranslation();
   const window = windows.find((value) => value.mode === "console") ?? windows[0];
   if (!window) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
-  return <WebQuotaMode mode="Console" window={window} locale={locale} />;
+  const used = Math.max(0, window.total - window.remaining);
+  const percent = window.total > 0 ? Math.max(0, Math.min(100, used / window.total * 100)) : 0;
+  const rotating = window.remaining > 0 && Boolean(window.resetAt);
+  const exhausted = window.remaining <= 0;
+  const rotationLabel = exhausted
+    ? t("accounts.consoleQuotaExhausted")
+    : rotating
+      ? t("accounts.consoleQuotaRotating")
+      : t("accounts.consoleQuotaHealthy");
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="block w-full min-w-0 text-left">
+          <div className="flex items-center justify-between gap-1 text-[11px]">
+            <span className="truncate text-muted-foreground">Console</span>
+            <span className="shrink-0 tabular-nums">{formatNumber(used, locale, 0)}/{formatNumber(window.total, locale, 0)}</span>
+          </div>
+          <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted">
+            <div className={cn("h-full", exhausted ? "bg-amber-500" : rotating ? "bg-sky-500" : "bg-primary")} style={{ width: `${percent}%` }} />
+          </div>
+          <div className="mt-1 text-[11px] text-muted-foreground">{rotationLabel}</div>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div>{t("accounts.webModeQuotaRemaining", { mode: "Console", remaining: formatNumber(window.remaining, locale, 0) })}</div>
+        <div className="text-muted-foreground">
+          {window.resetAt
+            ? t("accounts.quotaResetAt", { time: formatDateTime(window.resetAt, locale) })
+            : t("accounts.consoleQuotaDelayedTimer")}
+        </div>
+        <div className="mt-1 text-muted-foreground">{t("accounts.consoleQuotaPolicy")}</div>
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 export function WebQuota({ windows, locale, tier }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string; tier?: AccountDTO["webTier"] }) {
