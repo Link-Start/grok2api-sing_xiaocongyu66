@@ -47,11 +47,20 @@ func TestGenerateValid(t *testing.T) {
 }
 
 // TestTwoCallsDiffer ensures a random key per call.
+// A single pair can collide (same 1-byte XOR key + same second bucket) with ~1/256
+// odds; sample a few pairs so CI does not flake on that race.
 func TestTwoCallsDiffer(t *testing.T) {
-	a, _ := Generate("/rest/app-chat/conversations/new", "POST", time.Now().Unix())
-	b, _ := Generate("/rest/app-chat/conversations/new", "POST", time.Now().Unix())
-	if a == b {
-		t.Fatal("two calls produced identical statsig (expected random key)")
+	now := time.Now().Unix()
+	seen := make(map[string]struct{}, 8)
+	for i := 0; i < 8; i++ {
+		out, err := Generate("/rest/app-chat/conversations/new", "POST", now)
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		seen[out] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("8 calls produced only %d unique statsig value(s) (expected random key)", len(seen))
 	}
 }
 
