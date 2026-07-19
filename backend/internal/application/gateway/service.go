@@ -422,6 +422,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if operation == "" {
 		operation = audit.OperationResponses
 	}
+	clientModelName := strings.TrimSpace(input.PublicModel)
 	routes, aliasEffort, err := s.resolvePublicModelRoutes(ctx, input.PublicModel)
 	if err != nil {
 		return nil, ErrModelNotFound
@@ -460,6 +461,14 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return nil, err
 		}
 	}
+	reasoningEffort := strings.TrimSpace(aliasEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = extractReasoningEffort(input.Body, operation)
+	}
+	clientModel := ""
+	if clientModelName != "" && !strings.EqualFold(clientModelName, publicModel) {
+		clientModel = clientModelName
+	}
 	if routeErr != nil && !errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
 		return nil, routeErr
 	}
@@ -476,7 +485,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	}
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
-		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+		ModelRouteID: route.ID, ModelPublicID: publicModel, ClientModel: clientModel, ReasoningEffort: reasoningEffort,
+		ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
 		Provider: string(route.Provider), Operation: operation, UsageSource: usageSource, Streaming: input.Streaming,
 		ClientType: input.ClientType, ClientUserAgent: input.ClientUserAgent, ClientIP: input.ClientIP,
 	}
@@ -945,6 +955,57 @@ func (s *Service) queueAccountModelSync(accountID uint64) {
 		}
 		logger.Info("model_etag_refresh_completed", "account_id", accountID, "models", count)
 	}()
+}
+
+// extractReasoningEffort reads thinking strength from the request body when the
+// client used a base model (not an effort alias). Supports Responses, Chat, and Messages.
+func extractReasoningEffort(body []byte, operation audit.Operation) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	normalize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		switch value {
+		case "low", "medium", "high", "xhigh", "minimal", "none":
+			return value
+		case "max":
+			return "xhigh"
+		default:
+			return ""
+		}
+	}
+	switch operation {
+	case audit.OperationChat:
+		if value, ok := payload["reasoning_effort"].(string); ok {
+			return normalize(value)
+		}
+	case audit.OperationMessages:
+		if config, ok := payload["output_config"].(map[string]any); ok {
+			if value, ok := config["effort"].(string); ok {
+				return normalize(value)
+			}
+		}
+		if thinking, ok := payload["thinking"].(map[string]any); ok {
+			if value, ok := thinking["effort"].(string); ok {
+				return normalize(value)
+			}
+		}
+	default:
+		if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+			if value, ok := reasoning["effort"].(string); ok {
+				return normalize(value)
+			}
+		}
+		// Some clients still send Chat-style field on Responses.
+		if value, ok := payload["reasoning_effort"].(string); ok {
+			return normalize(value)
+		}
+	}
+	return ""
 }
 
 // rewriteAliasedModel rewrites a client alias request onto the real public model id

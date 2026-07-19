@@ -153,7 +153,8 @@ func toClientKeyDomain(value clientKeyModel, allowedModels []uint64) clientkey.K
 func toAuditDomain(value requestAuditModel) audit.Record {
 	return audit.Record{
 		ID: value.ID, EventID: value.EventID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
-		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
+		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ClientModel: value.ClientModel, ReasoningEffort: value.ReasoningEffort,
+		ModelUpstreamModel: value.ModelUpstreamModel,
 		Provider: value.Provider, Operation: audit.Operation(value.Operation), UsageSource: audit.UsageSource(value.UsageSource),
 		AccountID: value.AccountID, AccountName: value.AccountName,
 		EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName, EgressScope: value.EgressScope, EgressMode: audit.EgressMode(value.EgressMode),

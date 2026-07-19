@@ -73,6 +73,12 @@ type Record struct {
 	ClientKeyName           string
 	ModelRouteID            uint64
 	ModelPublicID           string
+	// ClientModel is the model id from the client request when it differs from the
+	// resolved route public id (e.g. grok-4.5-high or multi-agent-xhigh aliases).
+	ClientModel             string
+	// ReasoningEffort is the effective thinking strength for this request
+	// (alias-forced or body reasoning.effort / reasoning_effort).
+	ReasoningEffort         string
 	ModelUpstreamModel      string
 	Provider                string
 	Operation               Operation

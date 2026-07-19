@@ -216,6 +216,8 @@ export function RequestAuditsPage() {
                   <TableCell className="py-3">
                     <ModelRouteValue
                       model={audit.modelPublicId || `#${audit.modelRouteId}`}
+                      clientModel={audit.clientModel}
+                      reasoningEffort={audit.reasoningEffort}
                       upstreamModel={audit.modelUpstreamModel || "-"}
                       account={audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-")}
                       clientKey={formatClientKeyLabel(audit.clientKeyName, audit.clientKeyId)}
@@ -374,20 +376,63 @@ function ClientKeyValue({ name, id }: { name?: string; id: string }) {
   );
 }
 
-function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: string; upstreamModel: string; account: string; clientKey: string }) {
+function ModelRouteValue({
+  model,
+  clientModel,
+  reasoningEffort,
+  upstreamModel,
+  account,
+  clientKey,
+}: {
+  model: string;
+  clientModel?: string;
+  reasoningEffort?: string;
+  upstreamModel: string;
+  account: string;
+  clientKey: string;
+}) {
   const { t } = useTranslation();
+  // Prefer client-requested id when it was an effort alias; always surface thinking strength.
+  const displayModel = clientModel && clientModel !== model ? clientModel : model;
+  const effortLabel = reasoningEffort ? reasoningEffort.toUpperCase() : "";
+  const modelTitle = effortLabel
+    ? `${displayModel} · ${t("audits.reasoningEffort", { defaultValue: "思考" })} ${effortLabel}`
+    : displayModel;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button type="button" className="block w-full min-w-0 cursor-help text-left" aria-label={t("audits.routeDetails")}>
-          <span className="block truncate text-xs font-medium" title={model}>{model}</span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="block min-w-0 truncate text-xs font-medium" title={modelTitle}>{displayModel}</span>
+            {effortLabel ? (
+              <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px] font-normal tabular-nums">
+                {effortLabel}
+              </Badge>
+            ) : null}
+          </span>
           <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
             <CornerDownRight className="size-3 shrink-0" />
             <span className="truncate" title={upstreamModel}>{upstreamModel}</span>
           </span>
         </button>
       </TooltipTrigger>
-        <TooltipContent className="w-64 space-y-1.5 py-2" side="top" align="start">
+        <TooltipContent className="w-72 space-y-1.5 py-2" side="top" align="start">
+          {clientModel && clientModel !== model ? (
+            <div className="grid grid-cols-[auto_1fr] gap-x-3">
+              <span className="text-primary-foreground/65">{t("audits.clientModel", { defaultValue: "请求模型" })}</span>
+              <span className="truncate text-right font-mono" title={clientModel}>{clientModel}</span>
+            </div>
+          ) : null}
+          <div className="grid grid-cols-[auto_1fr] gap-x-3">
+            <span className="text-primary-foreground/65">{t("audits.routeModel", { defaultValue: "路由模型" })}</span>
+            <span className="truncate text-right font-mono" title={model}>{model}</span>
+          </div>
+          {effortLabel ? (
+            <div className="grid grid-cols-[auto_1fr] gap-x-3">
+              <span className="text-primary-foreground/65">{t("audits.reasoningEffort", { defaultValue: "思考强度" })}</span>
+              <span className="truncate text-right tabular-nums">{effortLabel}</span>
+            </div>
+          ) : null}
           <div className="grid grid-cols-[auto_1fr] gap-x-3">
             <span className="text-primary-foreground/65">{t("audits.owningAccount")}</span>
             <span className="truncate text-right" title={account}>{account}</span>

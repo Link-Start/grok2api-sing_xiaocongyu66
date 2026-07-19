@@ -259,6 +259,8 @@ type requestAuditModel struct {
 	ClientKeyName           string    `gorm:"size:160;check:chk_request_audits_client_key_name,length(client_key_name) <= 160"`
 	ModelRouteID            uint64    `gorm:"not null;check:chk_request_audits_model_route_id,model_route_id > 0"`
 	ModelPublicID           string    `gorm:"size:255;check:chk_request_audits_model_public_id,length(model_public_id) <= 255"`
+	ClientModel             string    `gorm:"size:255;not null;default:'';check:chk_request_audits_client_model,length(client_model) <= 255"`
+	ReasoningEffort         string    `gorm:"size:32;not null;default:'';check:chk_request_audits_reasoning_effort,length(reasoning_effort) <= 32"`
 	ModelUpstreamModel      string    `gorm:"size:255;check:chk_request_audits_model_upstream_model,length(model_upstream_model) <= 255"`
 	Provider                string    `gorm:"size:32;not null;check:chk_request_audits_provider,provider IN ('grok_build','grok_web','grok_console')"`
 	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','chat','messages','image','image_edit','video')"`
