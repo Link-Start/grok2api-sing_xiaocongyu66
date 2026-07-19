@@ -299,13 +299,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
+                "description": "与管理端「模型列表」一致：返回已启用的 model_routes；对列表中已有上游的兼容别名（如 grok-4.20-multi-agent-xhigh）一并暴露。非固定写死清单。",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Models"
                 ],
-                "summary": "获取可用模型",
+                "summary": "获取模型列表",
                 "responses": {
                     "200": {
                         "description": "OK",
