@@ -257,7 +257,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		}
 	}
 	modelService := modelapp.NewService(modelRepo, accountRepo, accountService, providers)
-	modelService.SetBulkPool(syncPool)
+	// Dedicated pool: do not share Postgres-capped syncPool (quota jobs). Model sync is
+	// mostly static bulk SQL + a few Build HTTP /models calls; sharing pool_limit=6 made
+	// admin "同步模型" take 8+ minutes across ~20k Web accounts before gateway timeout.
 	modelService.SetLogger(logger)
 	if err := modelRepo.ReplaceProviderRoutes(ctx, account.ProviderWeb, webprovider.Routes()); err != nil {
 		if runtimeStore != nil {

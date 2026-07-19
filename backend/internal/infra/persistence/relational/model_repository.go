@@ -213,30 +213,75 @@ func (r *ModelRepository) GetConfiguredByProviderUpstream(ctx context.Context, p
 }
 
 func (r *ModelRepository) ReplaceAccountCapabilities(ctx context.Context, accountID uint64, upstreamModels []string, syncedAt time.Time) error {
-	unique := make(map[string]struct{}, len(upstreamModels))
-	rows := make([]accountModelCapabilityModel, 0, len(upstreamModels))
-	for _, value := range upstreamModels {
-		value = strings.TrimSpace(value)
-		if value == "" {
+	return r.ReplaceAccountCapabilitiesMany(ctx, []repository.AccountCapabilitySync{{
+		AccountID: accountID, UpstreamModels: upstreamModels, SyncedAt: syncedAt,
+	}})
+}
+
+// ReplaceAccountCapabilitiesMany replaces capability rows for many accounts in chunked
+// transactions. Used by static Web/Console catalog sync so tens of thousands of accounts
+// are not written one-by-one under a 6-worker Postgres-capped pool.
+func (r *ModelRepository) ReplaceAccountCapabilitiesMany(ctx context.Context, items []repository.AccountCapabilitySync) error {
+	if len(items) == 0 {
+		return nil
+	}
+	const chunkSize = 500
+	for start := 0; start < len(items); start += chunkSize {
+		end := min(start+chunkSize, len(items))
+		chunk := items[start:end]
+		if err := r.replaceAccountCapabilitiesChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ModelRepository) replaceAccountCapabilitiesChunk(ctx context.Context, items []repository.AccountCapabilitySync) error {
+	accountIDs := make([]uint64, 0, len(items))
+	rows := make([]accountModelCapabilityModel, 0, len(items)*8)
+	states := make([]accountModelSyncStateModel, 0, len(items))
+	for _, item := range items {
+		if item.AccountID == 0 {
 			continue
 		}
-		if _, ok := unique[value]; ok {
-			continue
+		accountIDs = append(accountIDs, item.AccountID)
+		syncedAt := item.SyncedAt
+		if syncedAt.IsZero() {
+			syncedAt = time.Now().UTC()
 		}
-		unique[value] = struct{}{}
-		rows = append(rows, accountModelCapabilityModel{AccountID: accountID, UpstreamModel: value})
+		successAt := syncedAt
+		states = append(states, accountModelSyncStateModel{
+			AccountID: item.AccountID, LastAttemptAt: syncedAt, LastSuccessAt: &successAt, LastError: "",
+		})
+		unique := make(map[string]struct{}, len(item.UpstreamModels))
+		for _, value := range item.UpstreamModels {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, ok := unique[value]; ok {
+				continue
+			}
+			unique[value] = struct{}{}
+			rows = append(rows, accountModelCapabilityModel{AccountID: item.AccountID, UpstreamModel: value})
+		}
+	}
+	if len(accountIDs) == 0 {
+		return nil
 	}
 	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("account_id = ?", accountID).Delete(&accountModelCapabilityModel{}).Error; err != nil {
+		if err := tx.Where("account_id IN ?", accountIDs).Delete(&accountModelCapabilityModel{}).Error; err != nil {
 			return err
 		}
 		if len(rows) > 0 {
-			if err := tx.CreateInBatches(rows, 200).Error; err != nil {
+			if err := tx.CreateInBatches(rows, 500).Error; err != nil {
 				return err
 			}
 		}
-		state := accountModelSyncStateModel{AccountID: accountID, LastAttemptAt: syncedAt, LastSuccessAt: &syncedAt}
-		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: clause.AssignmentColumns([]string{"last_attempt_at", "last_success_at", "last_error"})}).Create(&state).Error
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "account_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"last_attempt_at", "last_success_at", "last_error"}),
+		}).CreateInBatches(states, 500).Error
 	})
 }
 

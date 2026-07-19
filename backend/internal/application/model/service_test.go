@@ -68,9 +68,13 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 		first.ID:  {"grok-basic"},
 		second.ID: {"grok-basic", "grok-premium"},
 	}}
-	webAdapter := &modelCapabilityAdapter{provider: account.ProviderWeb, models: map[uint64][]string{
-		webAccount.ID: {"grok-chat-fast", "grok-chat-auto"},
-	}}
+	webAdapter := &modelCapabilityAdapter{
+		provider: account.ProviderWeb,
+		catalog:  provider.ModelCatalogStatic,
+		models: map[uint64][]string{
+			webAccount.ID: {"grok-chat-fast", "grok-chat-auto"},
+		},
+	}
 	registry := provider.NewRegistry(adapter, webAdapter)
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, cipher, nil)
@@ -106,6 +110,69 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	}
 	if len(webCandidates) != 1 || !webCandidates[0].ModelCapabilityKnown || !webCandidates[0].SupportsModel {
 		t.Fatalf("web candidates = %#v", webCandidates)
+	}
+}
+
+func TestSyncStaticCatalogUsesBulkWrite(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-static-sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("sso-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	const n = 1200
+	modelsByID := make(map[uint64][]string, n)
+	for index := range n {
+		value, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+			Name: fmt.Sprintf("web-%d", index), SourceKey: fmt.Sprintf("web-%d", index),
+			EncryptedAccessToken: encrypted, Enabled: true, AuthStatus: account.AuthStatusActive,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		modelsByID[value.ID] = []string{"grok-chat-fast", "grok-imagine-image"}
+	}
+	webAdapter := &modelCapabilityAdapter{
+		provider: account.ProviderWeb,
+		catalog:  provider.ModelCatalogStatic,
+		models:   modelsByID,
+	}
+	registry := provider.NewRegistry(webAdapter)
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), memory.NewStickyStore(), registry, cipher, nil)
+	service := NewService(modelRepo, accountRepo, accountService, registry)
+	started := time.Now()
+	count, err := service.Sync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count < 2 {
+		t.Fatalf("synced models = %d", count)
+	}
+	// 1200 static accounts must finish well under the old multi-minute path.
+	if elapsed := time.Since(started); elapsed > 15*time.Second {
+		t.Fatalf("static bulk sync too slow: %s", elapsed)
+	}
+	if attempts := webAdapter.attemptCount(); attempts != n {
+		t.Fatalf("list calls = %d want %d", attempts, n)
+	}
+	ok, err := modelRepo.HasSuccessfulAccountSync(ctx, 1)
+	if err != nil || !ok {
+		t.Fatalf("first account sync state ok=%v err=%v", ok, err)
 	}
 }
 
@@ -183,6 +250,7 @@ func TestSyncAccountRunsUpstreamDiscoveryConcurrently(t *testing.T) {
 
 type modelCapabilityAdapter struct {
 	provider account.Provider
+	catalog  provider.ModelCatalogKind
 	mu       sync.Mutex
 	models   map[uint64][]string
 	attempts []uint64
@@ -199,7 +267,11 @@ func (a *modelCapabilityAdapter) Provider() account.Provider {
 	return a.provider
 }
 func (a *modelCapabilityAdapter) Definition() provider.Definition {
-	return provider.Definition{Provider: a.Provider()}
+	catalog := a.catalog
+	if catalog == "" {
+		catalog = provider.ModelCatalogRemote
+	}
+	return provider.Definition{Provider: a.Provider(), ModelCatalog: catalog}
 }
 func (a *modelCapabilityAdapter) ListModels(ctx context.Context, credential account.Credential) ([]string, error) {
 	a.mu.Lock()

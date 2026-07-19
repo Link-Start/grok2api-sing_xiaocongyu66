@@ -17,8 +17,12 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const defaultModelSyncWorkers = 25
+// defaultModelSyncWorkers is the standalone model-sync pool size. Do not share the
+// Postgres-capped "sync" pool used by slow quota jobs — that was clamping admin
+// "同步模型" to ~6 workers across 20k+ Web accounts (HF log: 488s, canceled).
+const defaultModelSyncWorkers = 32
 const syncFailurePersistTimeout = 5 * time.Second
+const staticCapabilityChunk = 500
 
 var (
 	ErrInvalidFilter = errors.New("模型筛选条件无效")
@@ -320,44 +324,82 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 	if len(credentials) == 0 {
 		return 0, fmt.Errorf("没有可用于模型同步的账号")
 	}
-	results, summary, runErr := batch.Map(ctx, credentials, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
-		adapter, ok := s.providers.Models(value.Provider)
-		if !ok {
-			return nil, fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
+
+	// Split static catalogs (Web/Console: in-process model list) from remote
+	// discovery (Build: HTTP /models). Static path is bulk SQL; remote stays pooled.
+	staticCreds := make([]account.Credential, 0, len(credentials))
+	remoteCreds := make([]account.Credential, 0)
+	for _, value := range credentials {
+		if s.staticModelCatalog(value.Provider) {
+			staticCreds = append(staticCreds, value)
+		} else {
+			remoteCreds = append(remoteCreds, value)
 		}
-		return s.syncAccountCapabilities(workCtx, value, adapter)
-	})
-	pool := s.bulkPool.Snapshot()
-	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_queued", pool.Queued, "pool_peak", pool.Peak, "error", runErr)
-	if runErr != nil {
-		return 0, runErr
 	}
 
 	uniqueModels := make(map[account.Provider]map[string]struct{}, len(providerValues))
-	succeeded := 0
-	var lastErr error
-	for index, result := range results {
-		if result.Err != nil {
-			var panicErr *batch.PanicError
-			if errors.As(result.Err, &panicErr) {
-				s.logger.Error("model_sync_panicked", "account_id", credentials[index].ID, "error", panicErr, "stack", string(panicErr.Stack))
-			}
-			lastErr = result.Err
-			continue
-		}
-		succeeded++
-		providerModels := uniqueModels[credentials[index].Provider]
+	addModels := func(providerValue account.Provider, models []string) {
+		providerModels := uniqueModels[providerValue]
 		if providerModels == nil {
 			providerModels = make(map[string]struct{})
-			uniqueModels[credentials[index].Provider] = providerModels
+			uniqueModels[providerValue] = providerModels
 		}
-		for _, value := range result.Value {
+		for _, value := range models {
 			value = strings.TrimSpace(value)
 			if value != "" {
 				providerModels[value] = struct{}{}
 			}
 		}
 	}
+
+	succeeded := 0
+	var lastErr error
+	startedAt := time.Now()
+
+	staticOK, staticErr := s.syncStaticCatalogAccounts(ctx, staticCreds, addModels)
+	succeeded += staticOK
+	if staticErr != nil {
+		lastErr = staticErr
+		s.logger.Warn("model_static_bulk_sync_failed", "accounts", len(staticCreds), "succeeded", staticOK, "error", staticErr)
+	}
+
+	if len(remoteCreds) > 0 {
+		results, summary, runErr := batch.Map(ctx, remoteCreds, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
+			adapter, ok := s.providers.Models(value.Provider)
+			if !ok {
+				return nil, fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
+			}
+			return s.syncAccountCapabilities(workCtx, value, adapter)
+		})
+		pool := s.bulkPool.Snapshot()
+		s.logger.Info("model_remote_bulk_sync_completed",
+			"total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded,
+			"failed", summary.Failed, "panicked", summary.Panicked,
+			"duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled,
+			"pool_limit", pool.Limit, "pool_peak", pool.Peak, "error", runErr,
+		)
+		if runErr != nil && lastErr == nil {
+			lastErr = runErr
+		}
+		for index, result := range results {
+			if result.Err != nil {
+				var panicErr *batch.PanicError
+				if errors.As(result.Err, &panicErr) {
+					s.logger.Error("model_sync_panicked", "account_id", remoteCreds[index].ID, "error", panicErr, "stack", string(panicErr.Stack))
+				}
+				lastErr = result.Err
+				continue
+			}
+			succeeded++
+			addModels(remoteCreds[index].Provider, result.Value)
+		}
+	}
+
+	s.logger.Info("model_bulk_sync_completed",
+		"total", len(credentials), "static", len(staticCreds), "remote", len(remoteCreds),
+		"succeeded", succeeded, "duration_ms", time.Since(startedAt).Milliseconds(),
+		"pool_limit", s.bulkPool.Limit(), "error", lastErr,
+	)
 	if succeeded == 0 {
 		if lastErr != nil {
 			return 0, lastErr
@@ -379,7 +421,74 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 		}
 		syncedModels += len(models)
 	}
+	// Prefer returning discovered model count; partial static/remote errors already logged.
+	if lastErr != nil && syncedModels == 0 {
+		return 0, lastErr
+	}
 	return syncedModels, nil
+}
+
+func (s *Service) staticModelCatalog(providerValue account.Provider) bool {
+	if s.providers == nil {
+		return false
+	}
+	definition, ok := s.providers.Definition(providerValue)
+	return ok && definition.ModelCatalog == provider.ModelCatalogStatic
+}
+
+// syncStaticCatalogAccounts writes Web/Console capability rows in bulk (no upstream HTTP).
+// Models still depend on account fields (e.g. Web tier) so each account is resolved once
+// in-process, then flushed in large SQL chunks.
+func (s *Service) syncStaticCatalogAccounts(ctx context.Context, credentials []account.Credential, addModels func(account.Provider, []string)) (int, error) {
+	if len(credentials) == 0 {
+		return 0, nil
+	}
+	startedAt := time.Now()
+	syncedAt := time.Now().UTC()
+	items := make([]repository.AccountCapabilitySync, 0, len(credentials))
+	var lastErr error
+	for _, value := range credentials {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		adapter, ok := s.providers.Models(value.Provider)
+		if !ok {
+			lastErr = fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
+			continue
+		}
+		// Static ListModels never needs EnsureCredential / token refresh.
+		models, err := adapter.ListModels(ctx, value)
+		if err != nil {
+			s.markCapabilitySyncFailed(value.ID, syncedAt, err)
+			lastErr = err
+			continue
+		}
+		models = normalizeDiscoveredModels(models)
+		items = append(items, repository.AccountCapabilitySync{
+			AccountID: value.ID, UpstreamModels: models, SyncedAt: syncedAt,
+		})
+		addModels(value.Provider, models)
+	}
+	if len(items) == 0 {
+		return 0, lastErr
+	}
+	// Flush in chunks so a canceled request still keeps progress already written.
+	for start := 0; start < len(items); start += staticCapabilityChunk {
+		if err := ctx.Err(); err != nil {
+			s.logger.Info("model_static_bulk_sync_partial",
+				"written", start, "total", len(items), "duration_ms", time.Since(startedAt).Milliseconds(), "error", err,
+			)
+			return start, err
+		}
+		end := min(start+staticCapabilityChunk, len(items))
+		if err := s.models.ReplaceAccountCapabilitiesMany(ctx, items[start:end]); err != nil {
+			return start, err
+		}
+	}
+	s.logger.Info("model_static_bulk_sync_completed",
+		"accounts", len(items), "duration_ms", time.Since(startedAt).Milliseconds(),
+	)
+	return len(items), lastErr
 }
 
 // HasSuccessfulAccountSync 判断账号是否已有成功模型能力快照，不触发上游请求。
