@@ -18,7 +18,7 @@ import { ErrorState } from "@/shared/components/data-state";
 
 export function SettingsPage() {
   const { t } = useTranslation();
-  const { form, settingsQuery, updateMutation, reset } = useSettings();
+  const { form, settingsQuery, updateMutation, onInvalid, reset } = useSettings();
 
   if (settingsQuery.isError) {
     return <ErrorState message={settingsQuery.error.message} onRetry={() => void settingsQuery.refetch()} />;
@@ -39,9 +39,13 @@ export function SettingsPage() {
     form.setValue("providerBuild.clientVersion", recommendedBuild.clientVersion, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
     form.setValue("providerBuild.userAgent", recommendedBuild.userAgent, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
   };
+  const canSave = !loading && !updateMutation.isPending && form.formState.isDirty;
 
   return (
-    <form className="w-full space-y-8 [&_input]:border-transparent" onSubmit={form.handleSubmit((values) => updateMutation.mutate(values))}>
+    <form
+      className="w-full space-y-8 [&_input]:border-transparent"
+      onSubmit={form.handleSubmit((values) => updateMutation.mutate(values), onInvalid)}
+    >
       <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <h1 className="text-xl font-medium">{t("settings.title")}</h1>
@@ -56,7 +60,7 @@ export function SettingsPage() {
             </TooltipTrigger>
             <TooltipContent>{t("common.reset")}</TooltipContent>
           </Tooltip>
-          <Button type="submit" size="sm" disabled={loading || updateMutation.isPending || !form.formState.isDirty}>
+          <Button type="submit" size="sm" disabled={!canSave} title={!form.formState.isDirty && !loading ? t("settings.noChanges", { defaultValue: "没有未保存的更改" }) : undefined}>
             {updateMutation.isPending ? <Spinner /> : null}{t("common.save")}
           </Button>
         </div>

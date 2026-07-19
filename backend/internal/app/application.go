@@ -426,6 +426,11 @@ func warnBatchVsPostgres(logger *slog.Logger, cfg config.Config) {
 // effectiveBatchConfig returns runtime pool sizes. Admin settings stay as stored;
 // only worker pools are capped so bulk refresh cannot consume every Postgres slot
 // (HF log: SQLSTATE 53300 while credential_auto_refresh ran at pool_limit=25).
+//
+// ConversionConcurrency is intentionally not clamped: Web→Build / Web→Console
+// conversion is dominated by upstream HTTP (device flow / SSO), not Postgres
+// row scans. Capping it to maxOpen/3 left large conversion jobs stuck at ~6
+// workers even when the admin set a higher conversion concurrency.
 func effectiveBatchConfig(cfg config.Config) config.BatchConfig {
 	out := cfg.Batch
 	if cfg.Database.Driver != "postgres" {
@@ -448,7 +453,10 @@ func effectiveBatchConfig(cfg config.Config) config.BatchConfig {
 		return v
 	}
 	out.ImportConcurrency = clamp(out.ImportConcurrency)
-	out.ConversionConcurrency = clamp(out.ConversionConcurrency)
+	// Keep conversion at the configured value (still within settings validation 1..50).
+	if out.ConversionConcurrency < 1 {
+		out.ConversionConcurrency = 1
+	}
 	out.SyncConcurrency = clamp(out.SyncConcurrency)
 	out.RefreshConcurrency = clamp(out.RefreshConcurrency)
 	return out

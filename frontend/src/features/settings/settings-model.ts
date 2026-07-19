@@ -7,9 +7,12 @@ export type DurationValue = { value: number; unit: DurationUnit };
 export type ByteSizeUnit = "MiB" | "GiB";
 export type ByteSizeValue = { value: number; unit: ByteSizeUnit };
 
-const durationSchema = z.object({ value: z.number().positive(), unit: z.enum(["s", "m", "h", "d"]) });
-const positiveInteger = z.number().int().positive();
-const byteSizeSchema = z.object({ value: z.number().positive(), unit: z.enum(["MiB", "GiB"]) });
+// Empty number inputs become NaN via valueAsNumber; reject non-finite so the
+// invalid-submit path can toast instead of looking like a dead save button.
+const numberField = z.number().refine((value) => Number.isFinite(value), { message: "invalid" });
+const durationSchema = z.object({ value: numberField.positive(), unit: z.enum(["s", "m", "h", "d"]) });
+const positiveInteger = numberField.int().positive();
+const byteSizeSchema = z.object({ value: numberField.positive(), unit: z.enum(["MiB", "GiB"]) });
 const routingTTLDuration = durationSchema.refine((value) => durationSeconds(value) <= 30 * 86_400);
 const routingCooldownDuration = durationSchema.refine((value) => durationSeconds(value) <= 86_400);
 const routingCapacityWaitDuration = durationSchema.refine((value) => durationSeconds(value) <= 5);
@@ -88,7 +91,7 @@ export const settingsSchema = z.object({
     conversionConcurrency: positiveInteger.max(50),
     syncConcurrency: positiveInteger.max(50),
     refreshConcurrency: positiveInteger.max(50),
-    randomDelay: z.number().int().min(0).max(5_000),
+    randomDelay: numberField.int().min(0).max(5_000),
     dbBuffer: z.object({
       enabled: z.boolean(),
       driver: z.enum(["none", "redis", "sqlite"]),

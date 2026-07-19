@@ -1430,50 +1430,74 @@ func (s *Service) SyncAllWebAccountsToConsoleWithStrategy(ctx context.Context, s
 	}
 	batchSize := accountTaskBatchSize
 	result := ImportResult{AccountIDs: make([]uint64, 0)}
-	var afterID uint64
 	completed := 0
 	total := 0
-	initialized := false
-	for {
-		var (
-			values  []accountdomain.Credential
-			count   int64
-			skipped int64
-			err     error
-		)
+
+	type listedBatch struct {
+		values  []accountdomain.Credential
+		count   int64
+		skipped int64
+		err     error
+	}
+	listBatch := func(afterID uint64) listedBatch {
+		var out listedBatch
 		if strategy == WebConsoleSyncMissing {
-			values, count, skipped, err = s.accounts.ListMissingConsoleSyncBatch(ctx, afterID, batchSize)
+			out.values, out.count, out.skipped, out.err = s.accounts.ListMissingConsoleSyncBatch(ctx, afterID, batchSize)
 		} else {
-			values, count, err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
+			out.values, out.count, out.err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
 		}
-		if err != nil {
+		return out
+	}
+
+	current := listBatch(0)
+	if current.err != nil {
+		return result, current.err
+	}
+	total = int(current.count)
+	result.Skipped = int(current.skipped)
+	if progress != nil {
+		if err := progress(0, total); err != nil {
 			return result, err
 		}
-		if !initialized {
-			total = int(count)
-			result.Skipped = int(skipped)
-			initialized = true
-			if progress != nil {
-				if err := progress(0, total); err != nil {
-					return result, err
-				}
+	}
+	if len(current.values) == 0 {
+		return result, nil
+	}
+
+	// Pipeline: while batch N is converting/syncing, list batch N+1 so the next
+	// round starts without waiting on the repository scan.
+	for {
+		var nextCh chan listedBatch
+		if len(current.values) == batchSize {
+			nextAfter := current.values[len(current.values)-1].ID
+			nextCh = make(chan listedBatch, 1)
+			go func(afterID uint64) {
+				nextCh <- listBatch(afterID)
+			}(nextAfter)
+		}
+
+		batch, err := s.syncWebCredentialsToConsole(ctx, current.values, observer, offsetBatchProgress(progress, completed, total))
+		result.Created += batch.Created
+		result.Updated += batch.Updated
+		result.AccountIDs = append(result.AccountIDs, batch.AccountIDs...)
+		if err != nil {
+			if nextCh != nil {
+				<-nextCh // drain so the list goroutine can exit
 			}
-		}
-		if len(values) == 0 {
-			return result, nil
-		}
-		current, err := s.syncWebCredentialsToConsole(ctx, values, observer, offsetBatchProgress(progress, completed, total))
-		result.Created += current.Created
-		result.Updated += current.Updated
-		result.AccountIDs = append(result.AccountIDs, current.AccountIDs...)
-		if err != nil {
 			return result, err
 		}
-		completed += len(values)
-		afterID = values[len(values)-1].ID
-		if len(values) < batchSize {
+		completed += len(current.values)
+		if nextCh == nil {
 			return result, nil
 		}
+		next := <-nextCh
+		if next.err != nil {
+			return result, next.err
+		}
+		if len(next.values) == 0 {
+			return result, nil
+		}
+		current = next
 	}
 }
 
@@ -1592,47 +1616,88 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 			return observer(accountID)
 		}
 	}
-	var afterID uint64
 	completed := 0
 	total := 0
-	initialized := false
-	for {
-		var (
-			ids   []uint64
-			count int64
-			err   error
-		)
+
+	// preparedBatch holds list + bulk-buffer preload for one conversion chunk.
+	// Preprocessing the next chunk overlaps with conversion of the current one.
+	type preparedBatch struct {
+		ids []uint64
+		ws  *bulkWorkingSet
+		err error
+	}
+	listIDs := func(afterID uint64) ([]uint64, int64, error) {
 		if strategy == BuildConversionMissing {
-			ids, count, err = s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batchSize)
-		} else {
-			var values []accountdomain.Credential
-			values, count, err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
-			ids = make([]uint64, 0, len(values))
-			for _, value := range values {
-				ids = append(ids, value.ID)
-			}
+			return s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batchSize)
 		}
+		values, count, err := s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
 		if err != nil {
-			return result, err
+			return nil, 0, err
 		}
-		if !initialized {
+		ids := make([]uint64, 0, len(values))
+		for _, value := range values {
+			ids = append(ids, value.ID)
+		}
+		return ids, count, nil
+	}
+	prepareBatch := func(afterID uint64) preparedBatch {
+		ids, count, err := listIDs(afterID)
+		if err != nil {
+			return preparedBatch{err: err}
+		}
+		if afterID == 0 {
 			total = int(count)
-			initialized = true
-			if progress != nil {
-				if err := progress(0, total); err != nil {
-					return result, err
-				}
-			}
 		}
 		if len(ids) == 0 {
-			return result, nil
+			return preparedBatch{}
 		}
-		current, err := s.convertWebAccountsToBuild(ctx, ids, strategy, batchObserver, offsetBatchProgress(progress, completed, total))
-		result.Created += current.Created
-		result.Linked += current.Linked
-		result.Skipped += current.Skipped
-		result.Failed += current.Failed
-		for _, buildID := range current.BuildAccountIDs {
+		ws, prepErr := s.openBulkWorkingSet(ctx, ids)
+		if prepErr != nil {
+			return preparedBatch{ids: ids, err: prepErr}
+		}
+		return preparedBatch{ids: ids, ws: ws}
+	}
+	closePrepared := func(batch preparedBatch) {
+		if batch.ws != nil {
+			batch.ws.close(context.WithoutCancel(ctx))
+		}
+	}
+
+	current := prepareBatch(0)
+	if current.err != nil {
+		closePrepared(current)
+		return result, current.err
+	}
+	if progress != nil {
+		if err := progress(0, total); err != nil {
+			closePrepared(current)
+			return result, err
+		}
+	}
+	if len(current.ids) == 0 {
+		return result, nil
+	}
+
+	for {
+		var nextCh chan preparedBatch
+		// Full page ⇒ more accounts may remain; start listing + buffer load for
+		// the next page while workers finish the current conversion wave.
+		if len(current.ids) == batchSize {
+			nextAfter := current.ids[len(current.ids)-1]
+			nextCh = make(chan preparedBatch, 1)
+			go func(afterID uint64) {
+				nextCh <- prepareBatch(afterID)
+			}(nextAfter)
+		}
+
+		batchResult, err := s.convertWebAccountsToBuildPrepared(ctx, current.ids, current.ws, strategy, batchObserver, offsetBatchProgress(progress, completed, total))
+		// convertWebAccountsToBuildPrepared always closes the working set.
+		current.ws = nil
+		result.Created += batchResult.Created
+		result.Linked += batchResult.Linked
+		result.Skipped += batchResult.Skipped
+		result.Failed += batchResult.Failed
+		for _, buildID := range batchResult.BuildAccountIDs {
 			if _, exists := seenBuildIDs[buildID]; exists {
 				continue
 			}
@@ -1640,13 +1705,25 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 			result.BuildAccountIDs = append(result.BuildAccountIDs, buildID)
 		}
 		if err != nil {
+			if nextCh != nil {
+				next := <-nextCh
+				closePrepared(next)
+			}
 			return result, err
 		}
-		completed += len(ids)
-		afterID = ids[len(ids)-1]
-		if len(ids) < batchSize {
+		completed += len(current.ids)
+		if nextCh == nil {
 			return result, nil
 		}
+		next := <-nextCh
+		if next.err != nil {
+			closePrepared(next)
+			return result, next.err
+		}
+		if len(next.ids) == 0 {
+			return result, nil
+		}
+		current = next
 	}
 }
 
@@ -1663,6 +1740,22 @@ func offsetBatchProgress(progress BatchProgressObserver, offset, total int) Batc
 }
 
 func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	// Pull working set from main DB into optional buffer (memory/redis/sqlite),
+	// then convert against the buffer and batch-flush LinkWebToBuild at the end.
+	ws, err := s.openBulkWorkingSet(ctx, ids)
+	if err != nil {
+		return BuildConversionResult{}, err
+	}
+	return s.convertWebAccountsToBuildPrepared(ctx, ids, ws, strategy, observer, progress)
+}
+
+// convertWebAccountsToBuildPrepared runs conversion against an already-preloaded
+// bulk working set (from openBulkWorkingSet). Always closes ws.
+func (s *Service) convertWebAccountsToBuildPrepared(ctx context.Context, ids []uint64, ws *bulkWorkingSet, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	if ws == nil {
+		return s.convertWebAccountsToBuild(ctx, ids, strategy, observer, progress)
+	}
+	defer ws.close(context.WithoutCancel(ctx))
 	if progress != nil {
 		if err := progress(0, len(ids)); err != nil {
 			return BuildConversionResult{}, err
@@ -1682,13 +1775,6 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Pull working set from main DB into optional buffer (memory/redis/sqlite),
-	// then convert against the buffer and batch-flush LinkWebToBuild at the end.
-	ws, err := s.openBulkWorkingSet(ctx, ids)
-	if err != nil {
-		return BuildConversionResult{}, err
-	}
-	defer ws.close(context.WithoutCancel(ctx))
 	preMap := ws.snapshot()
 
 	results, summary, runErr := batch.MapObserved(runCtx, ids, batch.Options{Workers: s.conversionPool.Limit(), Pool: s.conversionPool}, func(workCtx context.Context, id uint64) (outcome, error) {

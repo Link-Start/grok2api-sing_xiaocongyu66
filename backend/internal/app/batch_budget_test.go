@@ -49,11 +49,14 @@ func TestEffectiveBatchConfigCapsAgainstPostgres(t *testing.T) {
 		},
 	}
 	got := effectiveBatchConfig(cfg)
-	// budget = maxOpen/3 = 6
-	if got.ImportConcurrency != 6 || got.RefreshConcurrency != 6 {
-		t.Fatalf("effective = %+v, want import/refresh capped at 6", got)
+	// budget = maxOpen/3 = 6 for DB-heavy pools; conversion stays configured.
+	if got.ImportConcurrency != 6 || got.RefreshConcurrency != 6 || got.SyncConcurrency != 6 {
+		t.Fatalf("effective = %+v, want import/sync/refresh capped at 6", got)
 	}
-	if cfg.Batch.ImportConcurrency != 32 || cfg.Batch.RefreshConcurrency != 25 {
+	if got.ConversionConcurrency != 25 {
+		t.Fatalf("conversion must not be capped by postgres budget, got %d", got.ConversionConcurrency)
+	}
+	if cfg.Batch.ImportConcurrency != 32 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 {
 		t.Fatalf("settings must stay unchanged, got %+v", cfg.Batch)
 	}
 }
