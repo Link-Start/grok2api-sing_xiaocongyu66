@@ -95,10 +95,10 @@ func (h *Handler) list(c *gin.Context) {
 	for _, value := range values {
 		items = append(items, newModelResponse(value))
 	}
-	// On first page with no provider filter, append visible Console aliases
-	// (grok-4.20-multi-agent-xhigh etc.) so admin UI matches /v1/models discovery.
+	// First page: append effort aliases only when their target is already in the model list
+	// (same dynamic source as GET /v1/models — not a fixed catalog dump).
 	if page <= 1 && filter.Provider == "" && (filter.Status == "" || filter.Status == "enabled") {
-		for _, alias := range h.service.ListPublicAliasRoutes(search) {
+		for _, alias := range h.service.ListPublicAliasRoutes(c.Request.Context(), search) {
 			items = append(items, newModelResponse(alias))
 		}
 	}

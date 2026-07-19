@@ -149,14 +149,13 @@ type modelListItem struct {
 }
 
 func (h *Handler) listModels(c *gin.Context) {
-	values, err := h.models.ListEnabled(c.Request.Context())
+	// Follow admin「模型列表」content: enabled model_routes (+ effort aliases of those rows).
+	// Not a hardcoded provider catalog and not gated on per-account capability sync.
+	values, aliases, err := h.models.ListPublicModels(c.Request.Context())
 	if err != nil {
 		writeOpenAIError(c, http.StatusInternalServerError, "model_list_failed", "读取模型列表失败")
 		return
 	}
-	// Compatibility aliases (e.g. grok-4.20-multi-agent-xhigh) are routable but are not
-	// separate rows in model_routes — surface them so clients match jiujiu532/grok2api.
-	aliases := h.models.ListPublicAliases()
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values, aliases)})
 }
 
@@ -166,16 +165,23 @@ func newModelListItems(values []modeldomain.Route, aliases []string) []modelList
 	data := make([]modelListItem, 0, len(values)+len(aliases))
 	seen := make(map[string]bool, len(values)+len(aliases))
 	for _, value := range values {
+		if !value.Enabled {
+			continue
+		}
 		publicID := modeldomain.ExternalPublicID(value.Provider, value.PublicID)
-		if seen[publicID] {
+		if publicID == "" || seen[publicID] {
 			continue
 		}
 		seen[publicID] = true
-		data = append(data, modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api"})
+		created := value.CreatedAt.Unix()
+		if created <= 0 {
+			created = time.Now().UTC().Unix()
+		}
+		data = append(data, modelListItem{ID: publicID, Object: "model", Created: created, OwnedBy: "grok2api"})
 	}
-	// Use a stable synthetic created time so aliases sort after real routes when clients sort by created.
+	// Aliases (e.g. grok-4.20-multi-agent-xhigh) are routable client IDs without their own route rows.
 	aliasCreated := time.Now().UTC().Unix()
-	if len(values) > 0 {
+	if len(values) > 0 && !values[0].CreatedAt.IsZero() {
 		aliasCreated = values[0].CreatedAt.Unix()
 	}
 	for _, alias := range aliases {

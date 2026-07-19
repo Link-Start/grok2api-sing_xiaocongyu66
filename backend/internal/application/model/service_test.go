@@ -15,8 +15,10 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
@@ -110,6 +112,70 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	}
 	if len(webCandidates) != 1 || !webCandidates[0].ModelCapabilityKnown || !webCandidates[0].SupportsModel {
 		t.Fatalf("web candidates = %#v", webCandidates)
+	}
+}
+
+func TestListPublicModelsFollowsConfiguredListAndAliases(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "public-models.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	modelRepo := relational.NewModelRepository(database)
+	// Seed only what admin model list would have — no hardcoded full catalog dump.
+	if err := modelRepo.ReplaceProviderRoutes(ctx, account.ProviderConsole, consoleprovider.Routes()); err != nil {
+		t.Fatal(err)
+	}
+	registry := provider.NewRegistry(consoleprovider.NewAdapter(consoleprovider.Config{}, nil, nil))
+	service := NewService(modelRepo, nil, nil, registry)
+	routes, aliases, err := service.ListPublicModels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) == 0 {
+		t.Fatal("expected configured console routes")
+	}
+	foundXHigh := false
+	for _, name := range aliases {
+		if name == "grok-4.20-multi-agent-xhigh" {
+			foundXHigh = true
+			break
+		}
+	}
+	if !foundXHigh {
+		t.Fatalf("aliases missing multi-agent-xhigh: %#v", aliases)
+	}
+	// Disable multi-agent route → alias must disappear (follows list content).
+	values, _, err := modelRepo.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var multiID uint64
+	for _, value := range values {
+		if value.UpstreamModel == "grok-4.20-multi-agent-0309" {
+			multiID = value.ID
+			break
+		}
+	}
+	if multiID == 0 {
+		t.Fatal("multi-agent route missing from seeded list")
+	}
+	enabled := false
+	if _, err := service.Update(ctx, multiID, UpdateInput{Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	_, aliases, err = service.ListPublicModels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range aliases {
+		if name == "grok-4.20-multi-agent-xhigh" {
+			t.Fatal("alias must not appear when target route is disabled in model list")
+		}
 	}
 }
 

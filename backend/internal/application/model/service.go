@@ -114,9 +114,67 @@ func (s *Service) ListEnabled(ctx context.Context) ([]modeldomain.Route, error) 
 	return s.models.ListEnabled(ctx)
 }
 
-// ListPublicAliases returns client-visible compatibility model IDs that resolve
-// via provider aliases (e.g. grok-4.20-multi-agent-xhigh → Console multi-agent + xhigh effort).
-// These are not separate model_routes rows but must appear in GET /v1/models like jiujiu532/grok2api.
+func (s *Service) ListConfiguredEnabled(ctx context.Context) ([]modeldomain.Route, error) {
+	return s.models.ListConfiguredEnabled(ctx)
+}
+
+// ListPublicModels builds GET /v1/models from the admin model list only:
+// every enabled row in model_routes (catalog / discovered / manual), not a hardcoded catalog.
+// Compatibility aliases (e.g. grok-4.20-multi-agent-xhigh) are included only when their
+// target upstream model is already present in that list.
+func (s *Service) ListPublicModels(ctx context.Context) ([]modeldomain.Route, []string, error) {
+	values, err := s.models.ListConfiguredEnabled(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return values, s.aliasesForRoutes(values), nil
+}
+
+// aliasesForRoutes returns client alias IDs whose target upstream is in the given routes.
+func (s *Service) aliasesForRoutes(routes []modeldomain.Route) []string {
+	if s == nil || s.providers == nil || len(routes) == 0 {
+		return nil
+	}
+	present := make(map[string]struct{}, len(routes)*2)
+	for _, route := range routes {
+		if !route.Enabled {
+			continue
+		}
+		upstream := strings.TrimSpace(route.UpstreamModel)
+		if upstream != "" {
+			key := string(route.Provider) + "\x00" + upstream
+			present[key] = struct{}{}
+		}
+		// Also index bare external public id so aliases can match either form.
+		if ext := modeldomain.ExternalPublicID(route.Provider, route.PublicID); ext != "" {
+			present["ext\x00"+ext] = struct{}{}
+		}
+	}
+	aliases := s.providers.ListModelAliases()
+	if len(aliases) == 0 {
+		return nil
+	}
+	out := make([]string, 0)
+	for _, alias := range aliases {
+		name := strings.TrimSpace(alias.Alias)
+		if name == "" {
+			continue
+		}
+		upstream := strings.TrimSpace(alias.UpstreamModel)
+		key := string(alias.Provider) + "\x00" + upstream
+		if _, ok := present[key]; !ok {
+			// Fallback: PublicModel may be Console/grok-...
+			if _, ok := present["ext\x00"+modeldomain.ExternalPublicID(alias.Provider, alias.PublicModel)]; !ok {
+				continue
+			}
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// ListPublicAliases returns all registered alias names (unfiltered). Prefer aliasesForRoutes
+// for /v1/models so the response tracks the live model list.
 func (s *Service) ListPublicAliases() []string {
 	if s == nil || s.providers == nil {
 		return nil
@@ -136,28 +194,37 @@ func (s *Service) ListPublicAliases() []string {
 	return out
 }
 
-// ListPublicAliasRoutes returns synthetic enabled routes for admin UI listing of aliases.
-// Search is applied case-insensitively against the alias name.
-func (s *Service) ListPublicAliasRoutes(search string) []modeldomain.Route {
-	if s == nil || s.providers == nil {
+// ListPublicAliasRoutes returns synthetic admin rows for aliases whose upstream is in the
+// enabled model list (same source as /v1/models). Search filters the alias name.
+func (s *Service) ListPublicAliasRoutes(ctx context.Context, search string) []modeldomain.Route {
+	if s == nil || s.providers == nil || s.models == nil {
+		return nil
+	}
+	routes, err := s.models.ListConfiguredEnabled(ctx)
+	if err != nil {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(routes))
+	for _, name := range s.aliasesForRoutes(routes) {
+		allowed[name] = struct{}{}
+	}
+	if len(allowed) == 0 {
 		return nil
 	}
 	search = strings.ToLower(strings.TrimSpace(search))
-	aliases := s.providers.ListModelAliases()
-	if len(aliases) == 0 {
-		return nil
-	}
 	now := time.Now().UTC()
-	out := make([]modeldomain.Route, 0, len(aliases))
-	for _, alias := range aliases {
+	out := make([]modeldomain.Route, 0, len(allowed))
+	for _, alias := range s.providers.ListModelAliases() {
 		name := strings.TrimSpace(alias.Alias)
 		if name == "" {
+			continue
+		}
+		if _, ok := allowed[name]; !ok {
 			continue
 		}
 		if search != "" && !strings.Contains(strings.ToLower(name), search) {
 			continue
 		}
-		// Virtual row: PublicID is the bare client ID so admin shows exact request model name.
 		out = append(out, modeldomain.Route{
 			PublicID: name, Provider: alias.Provider, UpstreamModel: alias.UpstreamModel,
 			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog,
