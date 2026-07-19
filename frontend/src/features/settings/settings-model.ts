@@ -44,9 +44,20 @@ export const settingsSchema = z.object({
     quotaTimeout: durationSchema, chatTimeout: durationSchema, imageTimeout: durationSchema, videoTimeout: durationSchema,
     mediaConcurrency: positiveInteger.max(64), allowNSFW: z.boolean(),
     recoveryBackoffBase: durationSchema, recoveryBackoffMax: durationSchema,
+    flareSolverrEnabled: z.boolean(),
+    flareSolverrURL: z.string().trim().max(2048),
+    flareSolverrTargetURL: z.string().trim().max(2048),
+    flareSolverrTimeout: durationSchema,
+    flareSolverrRefreshInterval: durationSchema,
   }).superRefine((value, context) => {
     if (durationSeconds(value.recoveryBackoffMax) < durationSeconds(value.recoveryBackoffBase)) {
       context.addIssue({ code: "custom", path: ["recoveryBackoffMax"], message: "invalid" });
+    }
+    if (value.flareSolverrEnabled) {
+      const url = value.flareSolverrURL.trim();
+      if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        context.addIssue({ code: "custom", path: ["flareSolverrURL"], message: "invalid" });
+      }
     }
     if (value.statsigMode === "manual" && !value.statsigManualConfigured && value.statsigManualValue.length === 0) {
       context.addIssue({ code: "custom", path: ["statsigManualValue"], message: "required" });
