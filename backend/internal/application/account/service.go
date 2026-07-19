@@ -2411,23 +2411,58 @@ func (s *Service) DecrementQuota(ctx context.Context, id uint64, mode string, am
 	if amount <= 0 {
 		amount = 1
 	}
+	now := s.now()
+	var updated bool
+	var err error
 	if repository, ok := s.accounts.(interface {
 		DecrementQuotaWindowBy(context.Context, uint64, string, int, time.Time) (bool, error)
 	}); ok {
-		return repository.DecrementQuotaWindowBy(ctx, id, mode, amount, s.now())
+		updated, err = repository.DecrementQuotaWindowBy(ctx, id, mode, amount, now)
+	} else {
+		for range amount {
+			decremented, decErr := s.accounts.DecrementQuotaWindow(ctx, id, mode, now)
+			if decErr != nil {
+				return updated, decErr
+			}
+			if !decremented {
+				break
+			}
+			updated = true
+		}
 	}
-	updated := false
-	for range amount {
-		decremented, err := s.accounts.DecrementQuotaWindow(ctx, id, mode, s.now())
-		if err != nil {
-			return updated, err
+	if err != nil || !updated {
+		return updated, err
+	}
+	// When a local window is fully exhausted and already carries a reset timer,
+	// ensure the recovery queue will re-check it at DueAt.
+	if s.quotaQueue != nil {
+		windows, getErr := s.accounts.GetQuotaWindows(ctx, []uint64{id})
+		if getErr == nil {
+			for _, window := range windows[id] {
+				if window.Mode != mode || window.Remaining > 0 || window.ResetAt == nil {
+					continue
+				}
+				if scheduleErr := s.quotaQueue.ScheduleQuotaRecovery(ctx, accountdomain.QuotaRecoveryEvent{
+					AccountID: id, Mode: mode, DueAt: *window.ResetAt,
+				}); scheduleErr != nil {
+					s.logger.Warn("quota_recovery_schedule_failed", "account_id", id, "mode", mode, "error", scheduleErr)
+				}
+			}
 		}
-		if !decremented {
-			break
-		}
-		updated = true
 	}
 	return updated, nil
+}
+
+// ResetExpiredLocalQuotaWindows restores console delayed-rotation windows whose
+// recovery timer has elapsed without calling the upstream provider.
+func (s *Service) ResetExpiredLocalQuotaWindows(ctx context.Context, now time.Time) (int, error) {
+	resetter, ok := s.accounts.(interface {
+		ResetExpiredLocalQuotaWindows(context.Context, time.Time) (int, error)
+	})
+	if !ok {
+		return 0, nil
+	}
+	return resetter.ResetExpiredLocalQuotaWindows(ctx, now)
 }
 
 func (s *Service) DecrementWebQuota(ctx context.Context, id uint64, mode string, amount int) (bool, error) {
@@ -2530,12 +2565,21 @@ func preserveActiveQuotaWindows(existing, incoming []accountdomain.QuotaWindow, 
 		byMode[window.Mode] = window
 	}
 	result := append([]accountdomain.QuotaWindow(nil), incoming...)
-	for index, window := range result {
-		current, ok := byMode[window.Mode]
-		if !ok || current.ResetAt == nil || !current.ResetAt.After(now) {
+	for index := range result {
+		current, ok := byMode[result[index].Mode]
+		if !ok {
 			continue
 		}
-		result[index] = current
+		// Keep partially consumed local windows even when the delayed-rotation timer
+		// has not started yet (ResetAt == nil). Only replace windows that are fully
+		// exhausted and not waiting on a future reset.
+		if current.Remaining > 0 && (current.ResetAt == nil || current.ResetAt.After(now)) {
+			result[index] = current
+			continue
+		}
+		if current.Remaining <= 0 && current.ResetAt != nil && current.ResetAt.After(now) {
+			result[index] = current
+		}
 	}
 	return result
 }

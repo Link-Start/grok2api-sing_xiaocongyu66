@@ -7,9 +7,15 @@ import (
 )
 
 const (
-	QuotaMode          = "console"
-	DefaultQuotaLimit  = 20
+	QuotaMode = "console"
+	// DefaultQuotaLimit is the per-window request budget for console.x.ai.
+	DefaultQuotaLimit = 20
+	// DefaultQuotaWindow is the recovery window in seconds once the rotate timer starts.
 	DefaultQuotaWindow = 3600
+	// RotateThreshold starts the recovery timer only after remaining drops to this
+	// value (inclusive). Mirrors jiujiu532/grok2api delayed rotation so high-balance
+	// accounts stay preferred and timers are not started on first use.
+	RotateThreshold = 12
 )
 
 type ModelSpec struct {

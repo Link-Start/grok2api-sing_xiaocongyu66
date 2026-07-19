@@ -82,10 +82,11 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 
 func (a *Adapter) SyncQuota(_ context.Context, credential account.Credential) (provider.QuotaSnapshot, error) {
 	now := time.Now().UTC()
-	resetAt := now.Add(DefaultQuotaWindow * time.Second)
+	// Local console quota uses delayed rotation: ResetAt stays nil until remaining
+	// falls to RotateThreshold so the pool can keep selecting high-balance accounts.
 	return provider.QuotaSnapshot{SyncedAt: now, Windows: []account.QuotaWindow{{
 		AccountID: credential.ID, Mode: QuotaMode, Remaining: DefaultQuotaLimit, Total: DefaultQuotaLimit,
-		WindowSeconds: DefaultQuotaWindow, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceDefault, UpdatedAt: now,
+		WindowSeconds: DefaultQuotaWindow, ResetAt: nil, SyncedAt: &now, Source: account.QuotaSourceDefault, UpdatedAt: now,
 	}}}, nil
 }
 

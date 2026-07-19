@@ -622,10 +622,12 @@ func (s *Selector) MarkPaidQuotaExhausted(ctx context.Context, credential accoun
 func (s *Selector) MarkQuotaStateChanged(provider account.Provider) { s.invalidateCandidates(provider) }
 
 // ConsumeQuota 将成功请求的本地额度变化应用到候选快照，避免为单账号变化清空整个 Provider 缓存。
+// Console 模式还会在 remaining 落到轮换阈值时启动恢复计时器，与持久化层延迟轮换策略一致。
 func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mode string, amount int) {
 	if accountID == 0 || mode == "" || mode == "weekly" || amount <= 0 {
 		return
 	}
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, snapshot := range s.candidates {
@@ -639,7 +641,13 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 			}
 			window := *candidate.QuotaWindow
 			window.Remaining = max(0, window.Remaining-amount)
-			window.UpdatedAt = time.Now().UTC()
+			window.UpdatedAt = now
+			// Mirror console delayed rotation in the hot-path cache (threshold=12).
+			const consoleRotateThreshold = 12
+			if mode == "console" && window.ResetAt == nil && window.WindowSeconds > 0 && window.Remaining <= consoleRotateThreshold {
+				resetAt := now.Add(time.Duration(window.WindowSeconds) * time.Second)
+				window.ResetAt = &resetAt
+			}
 			candidate.QuotaWindow = &window
 		}
 		s.candidates[key] = snapshot

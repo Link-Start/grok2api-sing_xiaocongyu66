@@ -120,7 +120,16 @@ func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingC
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
 			inFlight: inFlight[index], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
-		if candidate.Billing != nil {
+		// Prefer accounts with more local window quota (Web mode / Console). Billing
+		// remaining is only meaningful for Build paid accounts and is used as fallback.
+		if candidate.QuotaWindow != nil {
+			score.remaining = float64(candidate.QuotaWindow.Remaining)
+			if candidate.QuotaWindow.SyncedAt != nil {
+				score.billingFresh = now.Sub(*candidate.QuotaWindow.SyncedAt) <= 30*time.Minute
+			} else {
+				score.billingFresh = now.Sub(candidate.QuotaWindow.UpdatedAt) <= 30*time.Minute
+			}
+		} else if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
 		}

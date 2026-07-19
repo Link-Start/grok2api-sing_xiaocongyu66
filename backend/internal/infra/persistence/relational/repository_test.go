@@ -256,6 +256,69 @@ func TestAccountRepositoryDecrementsQuotaByAmountAtomically(t *testing.T) {
 	}
 }
 
+func TestAccountRepositoryConsoleDelayedQuotaRotation(t *testing.T) {
+	ctx := context.Background()
+	repo := NewAccountRepository(openTestDatabase(t))
+	value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "console-quota", SourceKey: "console-quota",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.SaveQuotaWindows(ctx, value.ID, "", now, []account.QuotaWindow{{
+		AccountID: value.ID, Mode: "console", Remaining: 20, Total: 20, WindowSeconds: 3600, Source: account.QuotaSourceDefault, UpdatedAt: now,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Above the rotate threshold: remaining decreases, timer stays unset.
+	if updated, err := repo.DecrementQuotaWindowBy(ctx, value.ID, "console", 7, now); err != nil || !updated {
+		t.Fatalf("pre-threshold decrement updated=%v err=%v", updated, err)
+	}
+	windows, err := repo.GetQuotaWindows(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows[value.ID]) != 1 || windows[value.ID][0].Remaining != 13 || windows[value.ID][0].ResetAt != nil {
+		t.Fatalf("pre-threshold window = %#v", windows[value.ID])
+	}
+
+	// Crossing the threshold starts the delayed recovery timer.
+	if updated, err := repo.DecrementQuotaWindowBy(ctx, value.ID, "console", 1, now); err != nil || !updated {
+		t.Fatalf("threshold decrement updated=%v err=%v", updated, err)
+	}
+	windows, err = repo.GetQuotaWindows(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := windows[value.ID][0]
+	if window.Remaining != 12 || window.ResetAt == nil {
+		t.Fatalf("threshold window = %#v", window)
+	}
+	if delta := window.ResetAt.Sub(now); delta < 3599*time.Second || delta > 3601*time.Second {
+		t.Fatalf("reset_at delta = %s, want ~3600s", delta)
+	}
+
+	// After the timer elapses, the next decrement restores then consumes one unit.
+	expiredAt := window.ResetAt.Add(time.Second)
+	if err := repo.ExhaustQuotaWindow(ctx, value.ID, "console", window.ResetAt, now); err != nil {
+		t.Fatal(err)
+	}
+	// Force remaining=0 with past reset for the local-reset path via ResetExpiredLocalQuotaWindows.
+	if count, err := repo.ResetExpiredLocalQuotaWindows(ctx, expiredAt); err != nil || count != 1 {
+		t.Fatalf("local reset count=%d err=%v", count, err)
+	}
+	windows, err = repo.GetQuotaWindows(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windows[value.ID][0].Remaining != 20 || windows[value.ID][0].ResetAt != nil {
+		t.Fatalf("restored window = %#v", windows[value.ID][0])
+	}
+}
+
 func TestAccountRepositorySummarizesOperationalStates(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()

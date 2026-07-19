@@ -124,6 +124,17 @@ func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain
 }
 
 func (s *Service) reconcileDue(ctx context.Context, now time.Time) {
+	// Prefer local console window restore (no upstream call) when the delayed
+	// rotation timer has elapsed. Falls back to RefreshQuotaMode for remote modes.
+	if resetter, ok := s.syncer.(interface {
+		ResetExpiredLocalQuotaWindows(context.Context, time.Time) (int, error)
+	}); ok {
+		if count, err := resetter.ResetExpiredLocalQuotaWindows(ctx, now); err != nil {
+			s.logger.Warn("console_quota_local_reset_failed", "error", err)
+		} else if count > 0 {
+			s.logger.Info("console_quota_local_reset", "count", count)
+		}
+	}
 	windows, err := s.syncer.ListDueQuotaWindows(ctx, now, recoveryReconcileLimit)
 	if err != nil {
 		s.logger.Warn("quota_recovery_reconcile_failed", "error", err)

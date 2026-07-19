@@ -443,6 +443,42 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 	}
 }
 
+func TestSelectorPrefersHigherQuotaWindowRemaining(t *testing.T) {
+	now := time.Now().UTC()
+	selector := &Selector{concurrency: &batchConcurrencyLimiter{values: map[string]int{}}, lastSelectedAt: map[uint64]time.Time{}}
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, Priority: 10}, QuotaWindow: &account.QuotaWindow{Mode: "console", Remaining: 5, SyncedAt: &now}},
+		{Credential: account.Credential{ID: 2, Priority: 10}, QuotaWindow: &account.QuotaWindow{Mode: "console", Remaining: 18, SyncedAt: &now}},
+		{Credential: account.Credential{ID: 3, Priority: 10}, QuotaWindow: &account.QuotaWindow{Mode: "console", Remaining: 12, SyncedAt: &now}},
+	}
+	plan, err := selector.planCandidates(context.Background(), values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := make([]uint64, 0, len(values))
+	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
+		ordered = append(ordered, candidate.Credential.ID)
+	}
+	if expected := []uint64{2, 3, 1}; !slices.Equal(ordered, expected) {
+		t.Fatalf("候选顺序 = %v, want %v", ordered, expected)
+	}
+}
+
+func TestSelectorConsumeQuotaStartsConsoleRotateTimer(t *testing.T) {
+	key := candidateCacheKey{provider: account.ProviderConsole, upstreamModel: "grok-4.3", quotaMode: "console"}
+	selector := &Selector{candidates: map[candidateCacheKey]candidateSnapshot{
+		key: {values: []account.RoutingCandidate{{
+			Credential: account.Credential{ID: 9},
+			QuotaWindow: &account.QuotaWindow{AccountID: 9, Mode: "console", Remaining: 13, Total: 20, WindowSeconds: 3600},
+		}}},
+	}}
+	selector.ConsumeQuota(account.ProviderConsole, 9, "console", 1)
+	window := selector.candidates[key].values[0].QuotaWindow
+	if window == nil || window.Remaining != 12 || window.ResetAt == nil {
+		t.Fatalf("console rotate window = %#v", window)
+	}
+}
+
 func TestSelectorWaitsBrieflyForAccountCapacity(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "capacity-wait.db"))

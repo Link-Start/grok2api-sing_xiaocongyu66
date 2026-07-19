@@ -68,6 +68,27 @@ func TestCatalogContainsAllConsoleModelsAndAliases(t *testing.T) {
 	}
 }
 
+func TestSyncQuotaUsesDelayedRotationWithoutImmediateReset(t *testing.T) {
+	adapter := NewAdapter(Config{}, nil, nil)
+	snapshot, err := adapter.SyncQuota(context.Background(), account.Credential{ID: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Windows) != 1 {
+		t.Fatalf("windows = %#v", snapshot.Windows)
+	}
+	window := snapshot.Windows[0]
+	if window.Mode != QuotaMode || window.Remaining != DefaultQuotaLimit || window.Total != DefaultQuotaLimit {
+		t.Fatalf("window = %#v", window)
+	}
+	if window.WindowSeconds != DefaultQuotaWindow || window.ResetAt != nil {
+		t.Fatalf("delayed rotation expects nil ResetAt, got %#v", window)
+	}
+	if window.AccountID != 42 || window.Source != account.QuotaSourceDefault {
+		t.Fatalf("window metadata = %#v", window)
+	}
+}
+
 func TestNormalizeRequestAppliesConsoleContract(t *testing.T) {
 	spec, ok := Resolve("grok-4.3")
 	if !ok {

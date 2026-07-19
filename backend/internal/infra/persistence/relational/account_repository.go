@@ -1086,23 +1086,99 @@ func (r *AccountRepository) saveQuotaWindows(ctx context.Context, accountID uint
 }
 
 func (r *AccountRepository) DecrementQuotaWindow(ctx context.Context, accountID uint64, mode string, now time.Time) (bool, error) {
-	result := r.db.db.WithContext(ctx).Model(&quotaWindowModel{}).
-		Where("account_id = ? AND mode = ? AND remaining > 0", accountID, mode).
-		Updates(map[string]any{"remaining": gorm.Expr("remaining - 1"), "updated_at": now})
-	return result.RowsAffected == 1, result.Error
+	return r.DecrementQuotaWindowBy(ctx, accountID, mode, 1, now)
 }
 
+// DecrementQuotaWindowBy atomically reduces remaining quota. For console mode it
+// also starts the delayed recovery timer once remaining falls to the rotate
+// threshold, matching the multi-account pool rotation policy used by grok2api.
 func (r *AccountRepository) DecrementQuotaWindowBy(ctx context.Context, accountID uint64, mode string, amount int, now time.Time) (bool, error) {
 	if amount <= 0 {
 		amount = 1
 	}
+	now = now.UTC()
+	var updated bool
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row quotaWindowModel
+		query := tx.Where("account_id = ? AND mode = ?", accountID, mode)
+		if r.db.dialect == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		// Local console windows whose recovery timer already elapsed are refreshed
+		// inline so a single request both restores and consumes one unit.
+		if shouldResetExpiredLocalWindow(row, now) {
+			row.Remaining = max(row.Total, 0)
+			row.ResetAt = nil
+			row.Source = string(account.QuotaSourceDefault)
+		}
+		if row.Remaining <= 0 {
+			return nil
+		}
+		row.Remaining = max(0, row.Remaining-amount)
+		row.UpdatedAt = now
+		if shouldStartConsoleRotateTimer(row) {
+			resetAt := now.Add(time.Duration(max(row.WindowSeconds, 0)) * time.Second)
+			row.ResetAt = &resetAt
+		}
+		// Use Expr("NULL") so GORM actually clears reset_at; a bare nil is skipped.
+		var resetAtValue any
+		if row.ResetAt == nil {
+			resetAtValue = gorm.Expr("NULL")
+		} else {
+			resetAtValue = *row.ResetAt
+		}
+		if err := tx.Model(&quotaWindowModel{}).
+			Where("account_id = ? AND mode = ?", accountID, mode).
+			Updates(map[string]any{
+				"remaining":  row.Remaining,
+				"reset_at":   resetAtValue,
+				"source":     row.Source,
+				"updated_at": row.UpdatedAt,
+			}).Error; err != nil {
+			return err
+		}
+		updated = true
+		return nil
+	})
+	return updated, err
+}
+
+// ResetExpiredLocalQuotaWindows restores console windows whose delayed recovery
+// timer has elapsed. Returns the number of restored rows.
+func (r *AccountRepository) ResetExpiredLocalQuotaWindows(ctx context.Context, now time.Time) (int, error) {
+	now = now.UTC()
 	result := r.db.db.WithContext(ctx).Model(&quotaWindowModel{}).
-		Where("account_id = ? AND mode = ? AND remaining > 0", accountID, mode).
+		Where("mode = ? AND total > 0 AND reset_at IS NOT NULL AND reset_at <= ?", "console", now).
 		Updates(map[string]any{
-			"remaining":  gorm.Expr("CASE WHEN remaining <= ? THEN 0 ELSE remaining - ? END", amount, amount),
+			"remaining":  gorm.Expr("total"),
+			"reset_at":   gorm.Expr("NULL"),
+			"source":     string(account.QuotaSourceDefault),
 			"updated_at": now,
 		})
-	return result.RowsAffected == 1, result.Error
+	return int(result.RowsAffected), result.Error
+}
+
+// shouldStartConsoleRotateTimer implements delayed console quota rotation:
+// start the recovery window only after remaining drops to the threshold.
+func shouldStartConsoleRotateTimer(row quotaWindowModel) bool {
+	if row.Mode != "console" || row.ResetAt != nil || row.WindowSeconds <= 0 {
+		return false
+	}
+	const consoleRotateThreshold = 12
+	return row.Remaining <= consoleRotateThreshold
+}
+
+func shouldResetExpiredLocalWindow(row quotaWindowModel, now time.Time) bool {
+	if row.Mode != "console" || row.Total <= 0 || row.ResetAt == nil {
+		return false
+	}
+	return !row.ResetAt.After(now)
 }
 
 func (r *AccountRepository) ExhaustQuotaWindow(ctx context.Context, accountID uint64, mode string, resetAt *time.Time, now time.Time) error {
