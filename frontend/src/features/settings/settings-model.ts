@@ -181,7 +181,17 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
     },
     providerConsole: { ...config.providerConsole, chatTimeout: formatDuration(config.providerConsole.chatTimeout) },
     proactiveUpstreamSync: config.proactiveUpstreamSync,
-    batch: { ...config.batch, randomDelay: `${config.batch.randomDelay}ms`, dbBuffer: config.batch.dbBuffer },
+    batch: (() => {
+      const dbBuffer = { ...config.batch.dbBuffer };
+      if (dbBuffer.enabled && (dbBuffer.driver === "none" || !dbBuffer.driver)) {
+        dbBuffer.enabled = false;
+        dbBuffer.driver = "none";
+      }
+      if (dbBuffer.enabled && dbBuffer.driver === "sqlite" && !(dbBuffer.path ?? "").trim()) {
+        dbBuffer.enabled = false;
+      }
+      return { ...config.batch, randomDelay: `${config.batch.randomDelay}ms`, dbBuffer };
+    })(),
     media: {
       maxImageBytes: byteSizeBytes(config.media.maxImageSize), maxTotalBytes: byteSizeBytes(config.media.maxTotalSize),
       cleanupThresholdPercent: config.media.cleanupThresholdPercent,

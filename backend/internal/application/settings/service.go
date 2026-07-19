@@ -224,6 +224,11 @@ func (s *Service) Update(ctx context.Context, expectedRevision uint64, input Edi
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
+	// Validate before persist so misconfigured fields return a clear 400 message
+	// (e.g. batch.dbBuffer) instead of a generic "保存运行设置失败".
+	if err := next.Validate(); err != nil {
+		return Snapshot{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
 	updatedAt, revision, err := s.repository.Save(ctx, toDomainConfig(next), currentRevision)
 	if err != nil {
 		if errors.Is(err, repository.ErrConflict) {
@@ -338,7 +343,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
 		RetryStatusCodes: append([]int(nil), value.Routing.RetryStatusCodes...), RetryServerErrors: value.Routing.RetryServerErrors,
 		DeprioritizeFailedAccounts: value.Routing.DeprioritizeFailedAccounts,
-		ReasoningReplayEnabled: replayEnabled, ReasoningReplayTTL: replayTTL, ReasoningReplayMaxEntries: replayMax,
+		ReasoningReplayEnabled:     replayEnabled, ReasoningReplayTTL: replayTTL, ReasoningReplayMaxEntries: replayMax,
 	}
 	if base.Routing.ReasoningReplayTTL.Value() <= 0 {
 		base.Routing.ReasoningReplayTTL = config.Duration(time.Hour)
@@ -383,7 +388,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 func toDomainConfig(value config.Config) settingsdomain.Config {
 	randomDelay := value.Batch.RandomDelay.Value()
 	return settingsdomain.Config{
-		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
+		Server:   settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		Frontend: settingsdomain.FrontendConfig{PublicAPIBaseURL: value.Frontend.PublicAPIBaseURLOverride},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
 			BaseURL: value.Provider.Build.BaseURL, ClientVersion: value.Provider.Build.ClientVersion,
@@ -562,7 +567,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 
 func toEditable(cfg config.Config) EditableConfig {
 	return EditableConfig{
-		Server: ServerConfig{MaxConcurrentRequests: cfg.Server.MaxConcurrentRequests},
+		Server:   ServerConfig{MaxConcurrentRequests: cfg.Server.MaxConcurrentRequests},
 		Frontend: FrontendConfig{PublicAPIBaseURL: cfg.Frontend.PublicAPIBaseURLOverride},
 		ProviderBuild: ProviderBuildConfig{
 			BaseURL: cfg.Provider.Build.BaseURL, ClientVersion: cfg.Provider.Build.ClientVersion,
@@ -621,6 +626,8 @@ func toEditable(cfg config.Config) EditableConfig {
 
 // normalizeDBBuffer fills defaults so admin JSON never returns an empty driver
 // (frontend decoder requires none|redis|sqlite; legacy rows omit dbBuffer entirely).
+// When enabled with driver "none" (or empty), force disabled so Validate does not
+// reject a common admin UI default and surface as "保存运行设置失败".
 func normalizeDBBuffer(value config.DBBufferConfig) config.DBBufferConfig {
 	driver := strings.ToLower(strings.TrimSpace(value.Driver))
 	switch driver {
@@ -631,12 +638,22 @@ func normalizeDBBuffer(value config.DBBufferConfig) config.DBBufferConfig {
 	default:
 		driver = "none"
 	}
-	if !value.Enabled {
-		// Keep path for UX when re-enabling sqlite later, but force a valid driver label.
+	enabled := value.Enabled
+	path := strings.TrimSpace(value.Path)
+	if enabled && (driver == "none" || driver == "") {
+		enabled = false
+		driver = "none"
+	}
+	if enabled && driver == "sqlite" && path == "" {
+		// Keep enabled=false rather than hard-failing the whole settings save.
+		enabled = false
+	}
+	if !enabled && driver != "redis" && driver != "sqlite" {
+		driver = "none"
 	}
 	return config.DBBufferConfig{
-		Enabled: value.Enabled,
+		Enabled: enabled,
 		Driver:  driver,
-		Path:    strings.TrimSpace(value.Path),
+		Path:    path,
 	}
 }
