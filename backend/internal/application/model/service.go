@@ -130,43 +130,65 @@ func (s *Service) ListConfiguredEnabled(ctx context.Context) ([]modeldomain.Rout
 	return s.models.ListConfiguredEnabled(ctx)
 }
 
-// ListPublicModels builds GET /v1/models from the admin model list only:
-// every enabled row in model_routes (catalog / discovered / manual), not a hardcoded catalog.
-// Compatibility aliases (e.g. grok-4.20-multi-agent-xhigh) are included only when their
-// target upstream model is already present in that list.
+// ListPublicModels builds GET /v1/models like jiujiu532: pre-registered client IDs.
+// - enabled model_routes (Build discovered + Web/Console built-in catalog rows)
+// - all registered aliases whose target upstream is in the built-in static catalog
+//   and/or currently configured (e.g. grok-4.20-multi-agent-xhigh)
+// Account availability is checked at request time, not at list time.
 func (s *Service) ListPublicModels(ctx context.Context) ([]modeldomain.Route, []string, error) {
 	values, err := s.models.ListConfiguredEnabled(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	return values, s.aliasesForRoutes(values), nil
+	return values, s.aliasesForRoutes(ctx, values), nil
 }
 
-// aliasesForRoutes returns client alias IDs whose target upstream is in the given routes.
-func (s *Service) aliasesForRoutes(routes []modeldomain.Route) []string {
-	if s == nil || s.providers == nil || len(routes) == 0 {
+// aliasesForRoutes returns client alias IDs (jiujiu-style public names) for targets
+// that exist either in configured routes or in the static provider catalog in code.
+func (s *Service) aliasesForRoutes(ctx context.Context, routes []modeldomain.Route) []string {
+	if s == nil || s.providers == nil {
 		return nil
 	}
-	present := make(map[string]struct{}, len(routes)*2)
+	present := make(map[string]struct{}, len(routes)*2+16)
 	for _, route := range routes {
 		if !route.Enabled {
 			continue
 		}
 		upstream := strings.TrimSpace(route.UpstreamModel)
 		if upstream != "" {
-			key := string(route.Provider) + "\x00" + upstream
-			present[key] = struct{}{}
+			present[string(route.Provider)+"\x00"+upstream] = struct{}{}
 		}
-		// Also index bare external public id so aliases can match either form.
 		if ext := modeldomain.ExternalPublicID(route.Provider, route.PublicID); ext != "" {
 			present["ext\x00"+ext] = struct{}{}
+		}
+	}
+	// Pre-register static catalog upstreams from code (Console/Web), so aliases such as
+	// multi-agent-xhigh appear even if DB reseed is mid-flight — same idea as jiujiu MODELS.
+	for _, providerValue := range s.providers.Providers() {
+		if !s.staticModelCatalog(providerValue) {
+			continue
+		}
+		adapter, ok := s.providers.Models(providerValue)
+		if !ok {
+			continue
+		}
+		models, listErr := adapter.ListModels(ctx, account.Credential{})
+		if listErr != nil {
+			continue
+		}
+		for _, modelName := range models {
+			modelName = strings.TrimSpace(modelName)
+			if modelName == "" {
+				continue
+			}
+			present[string(providerValue)+"\x00"+modelName] = struct{}{}
 		}
 	}
 	aliases := s.providers.ListModelAliases()
 	if len(aliases) == 0 {
 		return nil
 	}
-	out := make([]string, 0)
+	out := make([]string, 0, len(aliases))
 	for _, alias := range aliases {
 		name := strings.TrimSpace(alias.Alias)
 		if name == "" {
@@ -175,7 +197,6 @@ func (s *Service) aliasesForRoutes(routes []modeldomain.Route) []string {
 		upstream := strings.TrimSpace(alias.UpstreamModel)
 		key := string(alias.Provider) + "\x00" + upstream
 		if _, ok := present[key]; !ok {
-			// Fallback: PublicModel may be Console/grok-...
 			if _, ok := present["ext\x00"+modeldomain.ExternalPublicID(alias.Provider, alias.PublicModel)]; !ok {
 				continue
 			}
@@ -217,7 +238,7 @@ func (s *Service) ListPublicAliasRoutes(ctx context.Context, search string) []mo
 		return nil
 	}
 	allowed := make(map[string]struct{}, len(routes))
-	for _, name := range s.aliasesForRoutes(routes) {
+	for _, name := range s.aliasesForRoutes(ctx, routes) {
 		allowed[name] = struct{}{}
 	}
 	if len(allowed) == 0 {

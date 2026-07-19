@@ -66,6 +66,20 @@ func TestCatalogContainsAllConsoleModelsAndAliases(t *testing.T) {
 			t.Fatalf("alias %q targets non-canonical model %q", name, alias.PublicModel)
 		}
 	}
+	// jiujiu-style: every client-facing ID is pre-registered (catalog + aliases).
+	clientIDs := ClientFacingIDs()
+	if len(clientIDs) != len(catalog)+len(aliases) {
+		t.Fatalf("ClientFacingIDs = %d, want %d", len(clientIDs), len(catalog)+len(aliases))
+	}
+	wantClient := map[string]bool{}
+	for _, id := range clientIDs {
+		wantClient[id] = true
+	}
+	for _, name := range []string{"grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-xhigh", "grok-4.3-console"} {
+		if !wantClient[name] {
+			t.Fatalf("missing pre-registered client id %q", name)
+		}
+	}
 }
 
 func TestSyncQuotaUsesDelayedRotationWithoutImmediateReset(t *testing.T) {

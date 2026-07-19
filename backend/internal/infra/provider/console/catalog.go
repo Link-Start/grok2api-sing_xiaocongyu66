@@ -27,6 +27,10 @@ type ModelSpec struct {
 	SearchTools            bool
 }
 
+// catalog is the built-in console.x.ai model directory (aligned with
+// jiujiu532/grok2api app/control/model/registry.py Console Chat section).
+// These are seeded into model_routes at startup and on admin「同步模型」;
+// they are NOT discovered from a remote /models API.
 var catalog = []ModelSpec{
 	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309", UpstreamModel: "grok-4.20-0309", MaxOutputTokens: 1_000_000, SearchTools: true},
@@ -36,13 +40,17 @@ var catalog = []ModelSpec{
 	{PublicID: "grok-build-0.1", UpstreamModel: "grok-build-0.1", MaxOutputTokens: 256_000, SearchTools: true},
 }
 
+// aliases are client-facing IDs (same names as jiujiu MODELS console entries).
+// They resolve to a catalog upstream + optional fixed reasoning effort — no separate DB row.
 var aliases = []provider.ModelAlias{
+	// *-console names (jiujiu public names for the same upstream models)
 	consoleAlias("grok-4.3-console", "grok-4.3", "grok-4.3", ""),
 	consoleAlias("grok-4.20-0309-console", "grok-4.20-0309", "grok-4.20-0309", ""),
 	consoleAlias("grok-4.20-0309-reasoning-console", "grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning", ""),
 	consoleAlias("grok-4.20-0309-non-reasoning-console", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning", ""),
 	consoleAlias("grok-4.20-multi-agent-console", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", ""),
 	consoleAlias("grok-build-console", "grok-build-0.1", "grok-build-0.1", ""),
+	// fixed reasoning effort shortcuts
 	consoleAlias("grok-4.3-low", "grok-4.3", "grok-4.3", "low"),
 	consoleAlias("grok-4.3-medium", "grok-4.3", "grok-4.3", "medium"),
 	consoleAlias("grok-4.3-high", "grok-4.3", "grok-4.3", "high"),
@@ -50,6 +58,19 @@ var aliases = []provider.ModelAlias{
 	consoleAlias("grok-4.20-multi-agent-medium", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "medium"),
 	consoleAlias("grok-4.20-multi-agent-high", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "high"),
 	consoleAlias("grok-4.20-multi-agent-xhigh", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "xhigh"),
+}
+
+// ClientFacingIDs returns every name clients may put in request.model / GET /v1/models
+// for Console: catalog public IDs + aliases (jiujiu-style pre-registered list).
+func ClientFacingIDs() []string {
+	out := make([]string, 0, len(catalog)+len(aliases))
+	for _, spec := range catalog {
+		out = append(out, spec.PublicID)
+	}
+	for _, alias := range aliases {
+		out = append(out, alias.Alias)
+	}
+	return out
 }
 
 func consoleAlias(alias, publicModel, upstreamModel, effort string) provider.ModelAlias {

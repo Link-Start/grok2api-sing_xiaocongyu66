@@ -203,7 +203,7 @@ Grok Console 内置模型（`console.x.ai` SSO，不消耗 grok.com 付费额度
 
 `grok-4.5` 不由 Grok Console Provider 注册；即使由 Web SSO 同步创建 Console 账号，该模型在 Console 中仍不可用。
 
-Console 上游路由始终使用 `Console/` 内部前缀，不再根据启动顺序生成 `-console` 冲突后缀。升级产生的兼容别名不会出现在 `GET /v1/models`，但请求体可直接使用 `*-console` 别名。
+Console / Web 模型采用与 jiujiu532/grok2api 相同的**代码内固定注册表**（启动与「同步模型」时写入 `model_routes`），不是从上游 `/models` 拉取。`GET /v1/models` 会暴露目录公开名与兼容别名（如 `grok-4.20-multi-agent-xhigh`）；密钥权限请绑定真实路由（如 `grok-4.20-multi-agent-0309`），请求里仍可用别名。
 
 同名模型会在当前可用来源中自动选路；来源选定后，账号故障切换只发生在该 Provider 的账号池内。Web 侧 basic / super / heavy 按模型最低等级过滤，并在同等级池内按优先级、并发、剩余额度与最近选用时间做负载均衡。
 
