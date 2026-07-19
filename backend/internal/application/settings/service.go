@@ -34,19 +34,24 @@ type ProviderBuildRecommendation struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL                 string
-	StatsigMode             string
-	StatsigManualValue      string
-	StatsigManualConfigured bool
-	StatsigSignerURL        string
-	QuotaTimeout            string
-	ChatTimeout             string
-	ImageTimeout            string
-	VideoTimeout            string
-	MediaConcurrency        int
-	AllowNSFW               bool
-	RecoveryBackoffBase     string
-	RecoveryBackoffMax      string
+	BaseURL                     string
+	StatsigMode                 string
+	StatsigManualValue          string
+	StatsigManualConfigured     bool
+	StatsigSignerURL            string
+	QuotaTimeout                string
+	ChatTimeout                 string
+	ImageTimeout                string
+	VideoTimeout                string
+	MediaConcurrency            int
+	AllowNSFW                   bool
+	RecoveryBackoffBase         string
+	RecoveryBackoffMax          string
+	FlareSolverrEnabled         bool
+	FlareSolverrURL             string
+	FlareSolverrTargetURL       string
+	FlareSolverrTimeout         string
+	FlareSolverrRefreshInterval string
 }
 
 type ProviderConsoleConfig struct {
@@ -307,6 +312,9 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		VideoTimeout:     config.Duration(value.ProviderWeb.VideoTimeout),
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
+		FlareSolverrEnabled: value.ProviderWeb.FlareSolverrEnabled, FlareSolverrURL: value.ProviderWeb.FlareSolverrURL,
+		FlareSolverrTargetURL: value.ProviderWeb.FlareSolverrTargetURL,
+		FlareSolverrTimeout:   config.Duration(value.ProviderWeb.FlareSolverrTimeout), FlareSolverrRefreshInterval: config.Duration(value.ProviderWeb.FlareSolverrRefreshInterval),
 	}
 	// Console 是后续版本新增的完整配置段；旧 JSON 整段缺失时沿用代码默认值。
 	if value.ProviderConsole != (settingsdomain.ProviderConsoleConfig{}) {
@@ -403,6 +411,9 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			VideoTimeout:     value.Provider.Web.VideoTimeout.Value(),
 			MediaConcurrency: value.Provider.Web.MediaConcurrency, AllowNSFW: value.Provider.Web.AllowNSFW,
 			RecoveryBackoffBase: value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
+			FlareSolverrEnabled: value.Provider.Web.FlareSolverrEnabled, FlareSolverrURL: value.Provider.Web.FlareSolverrURL,
+			FlareSolverrTargetURL: value.Provider.Web.FlareSolverrTargetURL,
+			FlareSolverrTimeout:   value.Provider.Web.FlareSolverrTimeout.Value(), FlareSolverrRefreshInterval: value.Provider.Web.FlareSolverrRefreshInterval.Value(),
 		},
 		ProviderConsole: settingsdomain.ProviderConsoleConfig{
 			BaseURL: value.Provider.Console.BaseURL, UserAgent: value.Provider.Console.UserAgent,
@@ -493,6 +504,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	}
 	next.Provider.Web.MediaConcurrency = input.ProviderWeb.MediaConcurrency
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
+	next.Provider.Web.FlareSolverrEnabled = input.ProviderWeb.FlareSolverrEnabled
+	next.Provider.Web.FlareSolverrURL = strings.TrimSpace(input.ProviderWeb.FlareSolverrURL)
+	next.Provider.Web.FlareSolverrTargetURL = strings.TrimSpace(input.ProviderWeb.FlareSolverrTargetURL)
 	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
 	next.Provider.Console.UserAgent = strings.TrimSpace(input.ProviderConsole.UserAgent)
 	randomDelay, err := time.ParseDuration(strings.TrimSpace(input.Batch.RandomDelay))
@@ -544,6 +558,8 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		{"providerWeb.videoTimeout", input.ProviderWeb.VideoTimeout, func(value config.Duration) { next.Provider.Web.VideoTimeout = value }},
 		{"providerWeb.recoveryBackoffBase", input.ProviderWeb.RecoveryBackoffBase, func(value config.Duration) { next.Provider.Web.RecoveryBackoffBase = value }},
 		{"providerWeb.recoveryBackoffMax", input.ProviderWeb.RecoveryBackoffMax, func(value config.Duration) { next.Provider.Web.RecoveryBackoffMax = value }},
+		{"providerWeb.flareSolverrTimeout", input.ProviderWeb.FlareSolverrTimeout, func(value config.Duration) { next.Provider.Web.FlareSolverrTimeout = value }},
+		{"providerWeb.flareSolverrRefreshInterval", input.ProviderWeb.FlareSolverrRefreshInterval, func(value config.Duration) { next.Provider.Web.FlareSolverrRefreshInterval = value }},
 		{"providerConsole.chatTimeout", input.ProviderConsole.ChatTimeout, func(value config.Duration) { next.Provider.Console.ChatTimeout = value }},
 		{"media.cleanupInterval", input.Media.CleanupInterval, func(value config.Duration) { next.Media.CleanupInterval = value }},
 		{"batch.randomDelay", input.Batch.RandomDelay, func(value config.Duration) { next.Batch.RandomDelay = value }},
@@ -597,6 +613,9 @@ func toEditable(cfg config.Config) EditableConfig {
 			VideoTimeout:     cfg.Provider.Web.VideoTimeout.String(),
 			MediaConcurrency: cfg.Provider.Web.MediaConcurrency, AllowNSFW: cfg.Provider.Web.AllowNSFW,
 			RecoveryBackoffBase: cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
+			FlareSolverrEnabled: cfg.Provider.Web.FlareSolverrEnabled, FlareSolverrURL: cfg.Provider.Web.FlareSolverrURL,
+			FlareSolverrTargetURL: cfg.Provider.Web.FlareSolverrTargetURL,
+			FlareSolverrTimeout:   cfg.Provider.Web.FlareSolverrTimeout.String(), FlareSolverrRefreshInterval: cfg.Provider.Web.FlareSolverrRefreshInterval.String(),
 		},
 		ProviderConsole: ProviderConsoleConfig{
 			BaseURL: cfg.Provider.Console.BaseURL, UserAgent: cfg.Provider.Console.UserAgent,

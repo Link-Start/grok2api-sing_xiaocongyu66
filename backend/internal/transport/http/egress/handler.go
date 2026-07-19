@@ -26,6 +26,8 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/egress-nodes/batch-enabled", h.batchEnabled)
 	router.POST("/egress-nodes/batch-clear-errors", h.batchClearErrors)
 	router.POST("/egress-nodes/:id/test", h.testOne)
+	router.POST("/egress-nodes/:id/refresh-clearance", h.refreshClearance)
+	router.POST("/egress-nodes/refresh-clearance", h.refreshClearanceAll)
 	router.POST("/egress-nodes", h.create)
 	router.PUT("/egress-nodes/:id", h.update)
 	router.DELETE("/egress-nodes/:id", h.delete)
@@ -411,4 +413,35 @@ func pathID(c *gin.Context) (uint64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+func (h *Handler) refreshClearance(c *gin.Context) {
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	value, err := h.service.RefreshClearanceNode(c.Request.Context(), id)
+	if errors.Is(err, egressapp.ErrNotFound) {
+		response.Error(c, http.StatusNotFound, "egressNotFound", "代理节点不存在")
+		return
+	}
+	if errors.Is(err, egressapp.ErrInvalidInput) {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusBadGateway, "flareSolverrFailed", err.Error())
+		return
+	}
+	response.Success(c, http.StatusOK, newNodeResponse(value))
+}
+
+func (h *Handler) refreshClearanceAll(c *gin.Context) {
+	err := h.service.RefreshClearanceAll(c.Request.Context())
+	if err != nil {
+		response.Error(c, http.StatusBadGateway, "flareSolverrFailed", err.Error())
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"refreshed": true})
 }

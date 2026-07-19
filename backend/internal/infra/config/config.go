@@ -165,6 +165,12 @@ type WebProviderConfig struct {
 	AllowNSFW           bool     `yaml:"allowNSFW"`
 	RecoveryBackoffBase Duration `yaml:"recoveryBackoffBase"`
 	RecoveryBackoffMax  Duration `yaml:"recoveryBackoffMax"`
+	// FlareSolverr (optional): auto-solve Cloudflare challenges for Web/Console egress nodes.
+	FlareSolverrEnabled         bool     `yaml:"flareSolverrEnabled"`
+	FlareSolverrURL             string   `yaml:"flareSolverrURL"`
+	FlareSolverrTargetURL       string   `yaml:"flareSolverrTargetURL"`
+	FlareSolverrTimeout         Duration `yaml:"flareSolverrTimeout"`
+	FlareSolverrRefreshInterval Duration `yaml:"flareSolverrRefreshInterval"`
 }
 
 type ConsoleProviderConfig struct {
@@ -638,6 +644,20 @@ func (c Config) Validate() error {
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
+	if c.Provider.Web.FlareSolverrEnabled {
+		if strings.TrimSpace(c.Provider.Web.FlareSolverrURL) == "" {
+			return errors.New("provider.web.flareSolverrURL 启用 FlareSolverr 时不能为空")
+		}
+		if u, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.FlareSolverrURL)); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("provider.web.flareSolverrURL 必须是有效的 HTTP(S) URL")
+		}
+	}
+	if c.Provider.Web.FlareSolverrTimeout.Value() < 0 || c.Provider.Web.FlareSolverrTimeout.Value() > 5*time.Minute {
+		return errors.New("provider.web.flareSolverrTimeout 必须在 0 到 5 分钟之间")
+	}
+	if c.Provider.Web.FlareSolverrRefreshInterval.Value() < 0 || c.Provider.Web.FlareSolverrRefreshInterval.Value() > 24*time.Hour {
+		return errors.New("provider.web.flareSolverrRefreshInterval 必须在 0 到 24 小时之间")
+	}
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
 		return fmt.Errorf("routing 参数无效")
 	}
@@ -741,7 +761,7 @@ func defaultConfig() Config {
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
-				ClientVersion: RecommendedBuildClientVersion,
+				ClientVersion:    RecommendedBuildClientVersion,
 				ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
 				UserAgent: RecommendedBuildUserAgent,
 			},
@@ -752,7 +772,9 @@ func defaultConfig() Config {
 				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
-				RecoveryBackoffMax: Duration(30 * time.Minute),
+				RecoveryBackoffMax:  Duration(30 * time.Minute),
+				FlareSolverrEnabled: false, FlareSolverrURL: "", FlareSolverrTargetURL: "https://grok.com/",
+				FlareSolverrTimeout: Duration(60 * time.Second), FlareSolverrRefreshInterval: Duration(time.Hour),
 			},
 			Console: ConsoleProviderConfig{
 				BaseURL: "https://console.x.ai", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",

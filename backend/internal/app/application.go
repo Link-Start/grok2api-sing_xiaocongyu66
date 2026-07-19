@@ -61,6 +61,7 @@ type Application struct {
 	media         *mediaapp.Service
 	quotaRecovery *quotarecoveryapp.Service
 	accounts      *accountapp.Service
+	egressService *egressapp.Service
 	models        *modelapp.Service
 	clientKeys    *clientkeyapp.Service
 	updates       *updatecheckapp.Service
@@ -278,6 +279,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountSyncService.UpdateConcurrency(batchPools.ImportConcurrency)
 	egressService := egressapp.NewService(egressRepo, cipher, infraegress.DefaultUserAgent, cfg.Provider.Console.UserAgent)
 	egressService.SetRuntime(egressManager)
+	egressService.SetLogger(logger)
+	egressService.UpdateFlareSolverr(flareSolverrConfig(cfg))
 	clientKeyService := clientkeyapp.NewService(clientKeyRepo, rateLimiter, concurrency, cfg.ClientKeyDefaults.RPMLimit, cfg.ClientKeyDefaults.MaxConcurrent, cipher)
 	// Affinity: SQL is durable source of truth; Redis/memory is a hot cache layer.
 	sqlAffinity := relational.NewAffinityStore(database)
@@ -353,6 +356,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		webAdapter.UpdateConfig(webProviderConfig(next))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
 		egressService.UpdateDefaults(infraegress.DefaultUserAgent, next.Provider.Console.UserAgent)
+		egressService.UpdateFlareSolverr(flareSolverrConfig(next))
 		mediaService.UpdateConfig(mediaConfig(next))
 		quotaRecoveryService.UpdateConfig(next.Provider.Web.RecoveryBackoffBase.Value(), next.Provider.Web.RecoveryBackoffMax.Value())
 		accountService.SetUpstreamSyncPolicy(upstreamSyncPolicy(next))
@@ -363,7 +367,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			accountService.SetDBBufferRedis(redisRuntime.Client(), next.RuntimeStore.Redis.KeyPrefix)
 		}
 		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
-	selector.SetDeprioritizeFailedAccounts(next.Routing.DeprioritizeFailedAccounts)
+		selector.SetDeprioritizeFailedAccounts(next.Routing.DeprioritizeFailedAccounts)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{
 			Enabled: next.Routing.ReasoningReplayEnabled,
 			TTL:     next.Routing.ReasoningReplayTTL.Value(),
@@ -384,7 +388,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	return &Application{
 		logger: logger, database: database, server: server,
 		audits: auditService, responses: responseRepo, runtime: runtimeStore,
-		settingsBus: settingsBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService, models: modelService, clientKeys: clientKeyService, updates: updateService,
+		settingsBus: settingsBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService,
+		egressService: egressService, models: modelService, clientKeys: clientKeyService, updates: updateService,
 		accountRepo: accountRepo, modelRepo: modelRepo, providers: providers, web: webAdapter, startup: startup, affinitySQL: sqlAffinity,
 	}, nil
 }
@@ -447,6 +452,16 @@ func effectiveBatchConfig(cfg config.Config) config.BatchConfig {
 	out.SyncConcurrency = clamp(out.SyncConcurrency)
 	out.RefreshConcurrency = clamp(out.RefreshConcurrency)
 	return out
+}
+
+func flareSolverrConfig(cfg config.Config) egressapp.FlareSolverrConfig {
+	return egressapp.FlareSolverrConfig{
+		Enabled:         cfg.Provider.Web.FlareSolverrEnabled,
+		URL:             cfg.Provider.Web.FlareSolverrURL,
+		TargetURL:       cfg.Provider.Web.FlareSolverrTargetURL,
+		Timeout:         cfg.Provider.Web.FlareSolverrTimeout.Value(),
+		RefreshInterval: cfg.Provider.Web.FlareSolverrRefreshInterval.Value(),
+	}
 }
 
 func webProviderConfig(cfg config.Config) webprovider.Config {
@@ -580,6 +595,10 @@ func (a *Application) Run(ctx context.Context) error {
 	} else {
 		a.logger.Info("proactive_web_quota_sync_disabled", "reason", "provider.proactiveUpstreamSync.webQuota=false")
 	}
+	startBackground("flaresolverr_clearance", func(taskCtx context.Context) error {
+		a.egressService.RunFlareSolverrRefresh(taskCtx)
+		return nil
+	})
 	startBackground("credential_refresh", func(taskCtx context.Context) error {
 		a.accounts.RunCredentialRefresh(taskCtx)
 		return nil

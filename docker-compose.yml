@@ -17,8 +17,12 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # 如果出口 IP 不干净，可取消以下注释使用 WARP 作为落地代理。
-  # 启用后，在管理端“设置 -> 出口代理”中新增 socks5://warp:1080。
+  # 防封叠加（WARP + Privoxy + FlareSolverr，对齐 jiujiu532/grok2api）：
+  #   docker compose -f docker-compose.yml -f docker-compose.anti-bot.yml up -d
+  # 然后：
+  #   1) 管理端「设置 → Grok Web」启用 FlareSolverr，地址 http://flaresolverr:8191
+  #   2) 「出口代理」新增 socks5://warp:1080 或 http://privoxy:8118（Web/Console 作用域）
+  # 如果只想用 WARP，可取消以下注释：
   # warp:
   #   container_name: warp
   #   image: caomingjun/warp:latest

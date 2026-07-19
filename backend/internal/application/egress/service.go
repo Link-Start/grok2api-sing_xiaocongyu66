@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	flaresolverr "github.com/chenyme/grok2api/backend/internal/pkg/flaresolverr"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -51,17 +53,44 @@ type Input struct {
 	ClearCookies      bool
 }
 
+// FlareSolverrConfig controls automatic Cloudflare clearance refresh via FlareSolverr.
+type FlareSolverrConfig struct {
+	Enabled         bool
+	URL             string
+	TargetURL       string
+	Timeout         time.Duration
+	RefreshInterval time.Duration
+}
+
 type Service struct {
 	repository repository.EgressRepository
 	cipher     *security.Cipher
 	runtime    RuntimeSource
+	logger     *slog.Logger
 	mu         sync.RWMutex
 	webUA      string
 	consoleUA  string
+	flare      FlareSolverrConfig
 }
 
 func NewService(repository repository.EgressRepository, cipher *security.Cipher, webUA, consoleUA string) *Service {
-	return &Service{repository: repository, cipher: cipher, webUA: strings.TrimSpace(webUA), consoleUA: strings.TrimSpace(consoleUA)}
+	return &Service{
+		repository: repository, cipher: cipher,
+		webUA: strings.TrimSpace(webUA), consoleUA: strings.TrimSpace(consoleUA),
+		logger: slog.Default(),
+		flare: FlareSolverrConfig{
+			TargetURL: "https://grok.com/", Timeout: 60 * time.Second, RefreshInterval: time.Hour,
+		},
+	}
+}
+
+func (s *Service) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	s.mu.Lock()
+	s.logger = logger
+	s.mu.Unlock()
 }
 
 func (s *Service) SetRuntime(runtime RuntimeSource) {
@@ -75,6 +104,28 @@ func (s *Service) UpdateDefaults(webUA, consoleUA string) {
 	defer s.mu.Unlock()
 	s.webUA = strings.TrimSpace(webUA)
 	s.consoleUA = strings.TrimSpace(consoleUA)
+}
+
+// UpdateFlareSolverr hot-reloads FlareSolverr clearance settings.
+func (s *Service) UpdateFlareSolverr(cfg FlareSolverrConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(cfg.TargetURL) == "" {
+		cfg.TargetURL = "https://grok.com/"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 60 * time.Second
+	}
+	if cfg.RefreshInterval <= 0 {
+		cfg.RefreshInterval = time.Hour
+	}
+	s.flare = cfg
+}
+
+func (s *Service) flareConfig() FlareSolverrConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.flare
 }
 
 func (s *Service) DefaultUserAgents() map[string]string {
@@ -709,4 +760,145 @@ func SanitizeCloudflareCookies(value string) string {
 		allowed = append(allowed, lower+"="+cookieValue)
 	}
 	return strings.Join(allowed, "; ")
+}
+
+// RunFlareSolverrRefresh periodically refreshes Cloudflare clearance cookies for
+// enabled browser-scoped egress nodes via FlareSolverr (jiujiu532/grok2api style).
+func (s *Service) RunFlareSolverrRefresh(ctx context.Context) {
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		cfg := s.flareConfig()
+		interval := cfg.RefreshInterval
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		if cfg.Enabled && strings.TrimSpace(cfg.URL) != "" {
+			runCtx, cancel := context.WithTimeout(ctx, maxDuration(cfg.Timeout+30*time.Second, 2*time.Minute))
+			if err := s.RefreshClearanceAll(runCtx); err != nil && ctx.Err() == nil {
+				s.logger.Warn("flaresolverr_refresh_cycle_failed", "error", err)
+			}
+			cancel()
+		}
+		resetTimer(timer, interval)
+	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
+}
+
+// RefreshClearanceAll refreshes CF cookies for every enabled web/console egress node.
+func (s *Service) RefreshClearanceAll(ctx context.Context) error {
+	cfg := s.flareConfig()
+	if !cfg.Enabled || strings.TrimSpace(cfg.URL) == "" {
+		return nil
+	}
+	nodes, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	refreshed := 0
+	for _, node := range nodes {
+		if !node.Enabled || !scopesNeedBrowserIdentity(node.EffectiveScopes()) {
+			continue
+		}
+		if err := s.refreshNodeClearance(ctx, node, cfg); err != nil {
+			s.logger.Warn("flaresolverr_node_refresh_failed", "node_id", node.ID, "name", node.Name, "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		refreshed++
+	}
+	if refreshed > 0 {
+		s.logger.Info("flaresolverr_refresh_completed", "refreshed", refreshed)
+	}
+	return firstErr
+}
+
+// RefreshClearanceNode refreshes one egress node via FlareSolverr and returns the public view.
+func (s *Service) RefreshClearanceNode(ctx context.Context, id uint64) (domain.PublicNode, error) {
+	cfg := s.flareConfig()
+	if !cfg.Enabled || strings.TrimSpace(cfg.URL) == "" {
+		return domain.PublicNode{}, fmt.Errorf("%w: 未启用 FlareSolverr 或未配置 URL", ErrInvalidInput)
+	}
+	node, err := s.repository.GetEgressNode(ctx, id)
+	if errors.Is(err, repository.ErrNotFound) {
+		return domain.PublicNode{}, ErrNotFound
+	}
+	if err != nil {
+		return domain.PublicNode{}, err
+	}
+	if !scopesNeedBrowserIdentity(node.EffectiveScopes()) {
+		return domain.PublicNode{}, fmt.Errorf("%w: 仅 Grok Web / Console 节点支持 Clearance 刷新", ErrInvalidInput)
+	}
+	if err := s.refreshNodeClearance(ctx, node, cfg); err != nil {
+		return domain.PublicNode{}, err
+	}
+	updated, err := s.repository.GetEgressNode(ctx, id)
+	if err != nil {
+		return domain.PublicNode{}, err
+	}
+	return s.publicNode(updated), nil
+}
+
+func (s *Service) refreshNodeClearance(ctx context.Context, node domain.Node, cfg FlareSolverrConfig) error {
+	proxyURL := ""
+	if node.EncryptedProxyURL != "" {
+		plain, err := s.cipher.Decrypt(node.EncryptedProxyURL)
+		if err != nil {
+			return fmt.Errorf("解密代理地址: %w", err)
+		}
+		// Placeholder accounts cannot be rendered without a credential; skip proxy for FS solve.
+		if !strings.Contains(plain, ProxyAccountPlaceholder) {
+			proxyURL = plain
+		}
+	}
+	result, err := flaresolverr.SolveClearance(ctx, cfg.URL, cfg.TargetURL, proxyURL, cfg.Timeout)
+	if err != nil {
+		return err
+	}
+	encrypted, err := s.cipher.Encrypt(result.Cookies)
+	if err != nil {
+		return err
+	}
+	node.EncryptedCloudflareCookie = encrypted
+	if ua := strings.TrimSpace(result.UserAgent); ua != "" && !isRandomUserAgent(node.UserAgent) {
+		// Keep admin "random" mode; otherwise adopt the UA FlareSolverr used for the challenge.
+		if strings.TrimSpace(node.UserAgent) == "" || node.UserAgent == s.defaultUserAgent(node.Scope) {
+			node.UserAgent = ua
+		}
+	}
+	// Clear prior CF-related failure state after a successful solve.
+	node.LastError = ""
+	node.FailureCount = 0
+	node.CooldownUntil = nil
+	if node.Health < 1 {
+		node.Health = 1
+	}
+	if _, err := s.repository.UpdateEgressNode(ctx, node); err != nil {
+		return err
+	}
+	return nil
 }

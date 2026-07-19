@@ -21,6 +21,7 @@ export type SettingsConfigDTO = {
     statsigMode: "local" | "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
     mediaConcurrency: number; allowNSFW: boolean;
     recoveryBackoffBase: string; recoveryBackoffMax: string;
+    flareSolverrEnabled?: boolean; flareSolverrURL?: string; flareSolverrTargetURL?: string; flareSolverrTimeout?: string; flareSolverrRefreshInterval?: string;
   };
   providerConsole: { baseURL: string; userAgent: string; chatTimeout: string };
   proactiveUpstreamSync: {
@@ -297,6 +298,8 @@ const settingsConfigValidator = hasShape({
     baseURL: isString, quotaTimeout: isString, chatTimeout: isString, imageTimeout: isString, videoTimeout: isString,
     statsigMode: isOneOf("local", "manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
     statsigSignerURL: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, recoveryBackoffBase: isString, recoveryBackoffMax: isString,
+    flareSolverrEnabled: isOptional(isBoolean), flareSolverrURL: isOptional(isString), flareSolverrTargetURL: isOptional(isString),
+    flareSolverrTimeout: isOptional(isString), flareSolverrRefreshInterval: isOptional(isString),
   }),
   providerConsole: hasShape({ baseURL: isString, userAgent: isString, chatTimeout: isString }),
   proactiveUpstreamSync: hasShape({

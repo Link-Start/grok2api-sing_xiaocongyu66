@@ -72,6 +72,12 @@ type ProviderWebConfig struct {
 	AllowNSFW           bool
 	RecoveryBackoffBase time.Duration
 	RecoveryBackoffMax  time.Duration
+	// FlareSolverr auto-obtains cf_clearance for Web/Console egress nodes.
+	FlareSolverrEnabled         bool
+	FlareSolverrURL             string
+	FlareSolverrTargetURL       string
+	FlareSolverrTimeout         time.Duration
+	FlareSolverrRefreshInterval time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。

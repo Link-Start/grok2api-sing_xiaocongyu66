@@ -71,19 +71,24 @@ type providerBuildConfigDTO struct {
 }
 
 type providerWebConfigDTO struct {
-	BaseURL                 string `json:"baseURL"`
-	StatsigMode             string `json:"statsigMode"`
-	StatsigManualValue      string `json:"statsigManualValue,omitempty"`
-	StatsigManualConfigured bool   `json:"statsigManualConfigured"`
-	StatsigSignerURL        string `json:"statsigSignerURL"`
-	QuotaTimeout            string `json:"quotaTimeout"`
-	ChatTimeout             string `json:"chatTimeout"`
-	ImageTimeout            string `json:"imageTimeout"`
-	VideoTimeout            string `json:"videoTimeout"`
-	MediaConcurrency        int    `json:"mediaConcurrency"`
-	AllowNSFW               bool   `json:"allowNSFW"`
-	RecoveryBackoffBase     string `json:"recoveryBackoffBase"`
-	RecoveryBackoffMax      string `json:"recoveryBackoffMax"`
+	BaseURL                     string `json:"baseURL"`
+	StatsigMode                 string `json:"statsigMode"`
+	StatsigManualValue          string `json:"statsigManualValue,omitempty"`
+	StatsigManualConfigured     bool   `json:"statsigManualConfigured"`
+	StatsigSignerURL            string `json:"statsigSignerURL"`
+	QuotaTimeout                string `json:"quotaTimeout"`
+	ChatTimeout                 string `json:"chatTimeout"`
+	ImageTimeout                string `json:"imageTimeout"`
+	VideoTimeout                string `json:"videoTimeout"`
+	MediaConcurrency            int    `json:"mediaConcurrency"`
+	AllowNSFW                   bool   `json:"allowNSFW"`
+	RecoveryBackoffBase         string `json:"recoveryBackoffBase"`
+	RecoveryBackoffMax          string `json:"recoveryBackoffMax"`
+	FlareSolverrEnabled         bool   `json:"flareSolverrEnabled"`
+	FlareSolverrURL             string `json:"flareSolverrURL"`
+	FlareSolverrTargetURL       string `json:"flareSolverrTargetURL"`
+	FlareSolverrTimeout         string `json:"flareSolverrTimeout"`
+	FlareSolverrRefreshInterval string `json:"flareSolverrRefreshInterval"`
 }
 
 type batchConfigDTO struct {
@@ -182,6 +187,9 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			VideoTimeout:     value.ProviderWeb.VideoTimeout,
 			MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 			RecoveryBackoffBase: value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
+			FlareSolverrEnabled: value.ProviderWeb.FlareSolverrEnabled, FlareSolverrURL: value.ProviderWeb.FlareSolverrURL,
+			FlareSolverrTargetURL: value.ProviderWeb.FlareSolverrTargetURL,
+			FlareSolverrTimeout:   value.ProviderWeb.FlareSolverrTimeout, FlareSolverrRefreshInterval: value.ProviderWeb.FlareSolverrRefreshInterval,
 		},
 		ProviderConsole: settingsapp.ProviderConsoleConfig{
 			BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
@@ -258,6 +266,9 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				VideoTimeout:     config.ProviderWeb.VideoTimeout,
 				MediaConcurrency: config.ProviderWeb.MediaConcurrency, AllowNSFW: config.ProviderWeb.AllowNSFW,
 				RecoveryBackoffBase: config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
+				FlareSolverrEnabled: config.ProviderWeb.FlareSolverrEnabled, FlareSolverrURL: config.ProviderWeb.FlareSolverrURL,
+				FlareSolverrTargetURL: config.ProviderWeb.FlareSolverrTargetURL,
+				FlareSolverrTimeout:   config.ProviderWeb.FlareSolverrTimeout, FlareSolverrRefreshInterval: config.ProviderWeb.FlareSolverrRefreshInterval,
 			},
 			ProviderConsole: providerConsoleConfigDTO{
 				BaseURL: config.ProviderConsole.BaseURL, UserAgent: config.ProviderConsole.UserAgent,
@@ -267,7 +278,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				ImportConcurrency: config.Batch.ImportConcurrency, ConversionConcurrency: config.Batch.ConversionConcurrency,
 				SyncConcurrency: config.Batch.SyncConcurrency, RefreshConcurrency: config.Batch.RefreshConcurrency,
 				RandomDelay: config.Batch.RandomDelay,
-				DBBuffer: normalizeDBBufferDTO(config.Batch.DBBuffer),
+				DBBuffer:    normalizeDBBufferDTO(config.Batch.DBBuffer),
 			},
 			Media: mediaConfigDTO{
 				MaxImageBytes: config.Media.MaxImageBytes, MaxTotalBytes: config.Media.MaxTotalBytes,

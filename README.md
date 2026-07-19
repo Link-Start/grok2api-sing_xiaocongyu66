@@ -59,6 +59,21 @@ flowchart LR
     Gateway --> Media["Media Storage"]
 ```
 
+## 防封部署（WARP + FlareSolverr）
+
+参考 [jiujiu532/grok2api](https://github.com/jiujiu532/grok2api) 的防封栈，本仓库提供叠加 compose：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.anti-bot.yml up -d
+```
+
+1. 管理端 **设置 → Grok Web**：启用 **FlareSolverr**，地址填 `http://flaresolverr:8191`
+2. **出口代理**：为 Grok Web / Console 添加 `socks5://warp:1080` 或 `http://privoxy:8118`
+3. 保存后，服务会按刷新间隔自动用 FlareSolverr 获取/更新节点 `cf_clearance`
+4. 也可对单个出口节点调用 `POST /api/admin/v1/egress-nodes/{id}/refresh-clearance`
+
+> 标准版在 IP 干净时可不用防封栈；遇 403 / Cloudflare 拦截时再启用。
+
 ## 快速部署
 
 ### Docker Compose
