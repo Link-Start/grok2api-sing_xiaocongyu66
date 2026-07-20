@@ -151,6 +151,133 @@ func stripPreviousResponseID(body []byte) ([]byte, bool) {
 	return encoded, true
 }
 
+// sanitizeBodyAfterCompactionDecodeError is the aggressive recovery path when
+// Grok returns "Could not decode the compaction blob". Mild scrub often no-ops
+// (CLI already sent non-type=compaction shapes, or only previous_response_id).
+// This rewrites the outbound body so a second attempt can continue the chat
+// from portable text history instead of account-scoped compact state.
+func sanitizeBodyAfterCompactionDecodeError(body []byte, recall *gatewayCompactRecall) ([]byte, map[string]any) {
+	stats := map[string]any{"changed": false}
+	if len(body) == 0 {
+		return body, stats
+	}
+	out := body
+	if rewritten, ok := resolveGatewayPreviousResponse(out, recall); ok {
+		out = rewritten
+		stats["previous_response_expanded"] = true
+		stats["changed"] = true
+	}
+	if stripped, ok := stripPreviousResponseID(out); ok {
+		out = stripped
+		stats["previous_response_stripped"] = true
+		stats["changed"] = true
+	}
+	if scrubbed, n := scrubUpstreamCompactionBlobs(out); n > 0 {
+		out = scrubbed
+		stats["compaction_objects_removed"] = n
+		stats["changed"] = true
+	}
+	// Nuclear pass: drop any remaining compact-like payloads Grok would try to
+	// decode (opaque encrypted_content on non-reasoning items, nested parts).
+	if cleaned, n := stripOpaqueCompactPayloads(out); n > 0 {
+		out = cleaned
+		stats["opaque_payloads_removed"] = n
+		stats["changed"] = true
+	}
+	return out, stats
+}
+
+// stripOpaqueCompactPayloads removes compact-like encrypted blobs that are not
+// ordinary reasoning replay items. Reasoning.encrypted_content is kept (Build
+// multi-turn needs it); type=compaction and bare opaque blobs are replaced.
+func stripOpaqueCompactPayloads(body []byte) ([]byte, int) {
+	if len(body) == 0 {
+		return body, 0
+	}
+	var payload any
+	if json.Unmarshal(body, &payload) != nil {
+		return body, 0
+	}
+	cleaned, removed := stripOpaqueCompactValue(payload)
+	if removed == 0 {
+		return body, 0
+	}
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return body, 0
+	}
+	return encoded, removed
+}
+
+func stripOpaqueCompactValue(value any) (any, int) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), 1
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringField(typed, "type")))
+		// Keep reasoning encrypted_content (not a compaction blob).
+		if typ == "reasoning" {
+			removed := 0
+			for key, nested := range typed {
+				if key == "encrypted_content" || key == "encryptedContent" {
+					continue
+				}
+				next, n := stripOpaqueCompactValue(nested)
+				if n > 0 {
+					typed[key] = next
+					removed += n
+				}
+			}
+			return typed, removed
+		}
+		removed := 0
+		// Non-reasoning objects: drop long opaque encrypted_content fields that
+		// Grok may treat as compact state even without type=compaction.
+		for _, key := range []string{"encrypted_content", "encryptedContent"} {
+			if blob, ok := typed[key].(string); ok && looksLikeOpaqueCompactBlob(blob) {
+				delete(typed, key)
+				removed++
+			}
+		}
+		for key, nested := range typed {
+			next, n := stripOpaqueCompactValue(nested)
+			if n > 0 {
+				typed[key] = next
+				removed += n
+			}
+		}
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), removed + 1
+		}
+		return typed, removed
+	case []any:
+		removed := 0
+		for index, nested := range typed {
+			next, n := stripOpaqueCompactValue(nested)
+			if n > 0 {
+				typed[index] = next
+				removed += n
+			}
+		}
+		return typed, removed
+	default:
+		return value, 0
+	}
+}
+
+func looksLikeOpaqueCompactBlob(blob string) bool {
+	blob = strings.TrimSpace(blob)
+	if blob == "" {
+		return false
+	}
+	if strings.HasPrefix(blob, gatewayCompactionPrefix) {
+		return true
+	}
+	// Native Grok / foreign compact payloads are long opaque tokens.
+	return len(blob) >= 64
+}
+
 func isCompactionBlobDecodeError(body []byte) bool {
 	if len(body) == 0 {
 		return false

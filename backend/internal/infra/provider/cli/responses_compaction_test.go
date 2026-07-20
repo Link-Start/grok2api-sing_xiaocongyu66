@@ -113,6 +113,33 @@ func TestIsCompactionBlobDecodeError(t *testing.T) {
 	}
 }
 
+func TestSanitizeBodyAfterCompactionDecodeErrorStripsOpaqueAndPrevious(t *testing.T) {
+	blob := "native-grok-compact-blob-" + strings.Repeat("x", 80)
+	body := []byte(`{
+		"model":"grok-4.5",
+		"previous_response_id":"resp_gateway_compact",
+		"input":[
+			{"type":"compaction","encrypted_content":"` + blob + `"},
+			{"type":"message","role":"user","content":"continue please"},
+			{"type":"reasoning","encrypted_content":"sig-keep-this-reasoning-cipher-abcdefghijklmnop"}
+		]
+	}`)
+	out, stats := sanitizeBodyAfterCompactionDecodeError(body, nil)
+	if stats["changed"] != true {
+		t.Fatalf("expected body change, stats=%#v", stats)
+	}
+	if strings.Contains(string(out), "previous_response_id") || strings.Contains(string(out), `"type":"compaction"`) || strings.Contains(string(out), blob) {
+		t.Fatalf("compact state leaked: %s", out)
+	}
+	if !strings.Contains(string(out), "continue please") {
+		t.Fatalf("user message dropped: %s", out)
+	}
+	// Reasoning cipher must survive (multi-turn); only compact-like payloads are stripped.
+	if !strings.Contains(string(out), "sig-keep-this-reasoning-cipher") {
+		t.Fatalf("reasoning encrypted_content should be kept: %s", out)
+	}
+}
+
 func TestCleanGatewayCompactionSummaryMatchesGrokBuildScratchpadRules(t *testing.T) {
 	raw := "<summary>**Analysis**\nprivate draft\n</analysis>\n<summary>1. Primary Request: keep this. " + strings.Repeat("x", 520) + "</summary></summary>"
 	cleaned := cleanGatewayCompactionSummary(raw)

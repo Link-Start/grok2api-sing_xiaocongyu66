@@ -222,31 +222,37 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if err != nil {
 		return nil, err
 	}
-	// If Grok rejects compact state, strip previous_response_id + scrub and retry once.
-	// Common when CLI continues a gateway-emulated compact via previous_response_id.
+	// If Grok rejects compact state, aggressively sanitize and retry once.
+	// Mild scrub alone often no-ops (CLI shapes that are not type=compaction, or
+	// previous_response_id pointing at a gateway-emulated compact Grok never stored).
 	if resp.StatusCode == http.StatusBadRequest && request.Method == http.MethodPost && !isCompactPath(request.Path) {
 		errBody, truncated, readErr := provider.ReadDiagnosticBody(resp.Body)
 		_ = resp.Body.Close()
 		if readErr == nil && isCompactionBlobDecodeError(errBody) {
-			retryBody := body
-			if rewritten, ok := resolveGatewayPreviousResponse(retryBody, a.compactRecall); ok {
-				retryBody = rewritten
-			}
-			if stripped, ok := stripPreviousResponseID(retryBody); ok {
-				retryBody = stripped
-			}
+			retryBody, stats := sanitizeBodyAfterCompactionDecodeError(body, a.compactRecall)
+			// Always re-scrub after nuclear strip (nested leftovers).
 			if scrubbed, n := scrubUpstreamCompactionBlobs(retryBody); n > 0 {
 				retryBody = scrubbed
+				stats["post_scrub"] = n
+				stats["changed"] = true
 			}
 			slog.Warn("compaction_blob_decode_retry",
 				"path", request.Path,
 				"prompt_cache_key_set", strings.TrimSpace(request.PromptCacheKey) != "",
 				"body_truncated", truncated,
+				"body_changed", stats["changed"] == true,
+				"stats", stats,
 			)
-			if retryResp, retryURL, retryErr := a.doResponseRequest(ctx, request, accessToken, retryBody, base); retryErr == nil {
-				resp, reqURL, body = retryResp, retryURL, retryBody
+			// Only retry when we actually rewrote the body; otherwise we would
+			// burn another identical upstream call and still 400.
+			if stats["changed"] == true {
+				if retryResp, retryURL, retryErr := a.doResponseRequest(ctx, request, accessToken, retryBody, base); retryErr == nil {
+					resp, reqURL, body = retryResp, retryURL, retryBody
+				} else {
+					resp = cloneBufferedResponse(resp, errBody, truncated)
+				}
 			} else {
-				// Restore original 400 body for the client.
+				// Nothing to strip: surface original 400 (client must start a new turn).
 				resp = cloneBufferedResponse(resp, errBody, truncated)
 			}
 		} else if readErr == nil {
