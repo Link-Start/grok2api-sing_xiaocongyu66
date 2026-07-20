@@ -132,8 +132,8 @@ func (s *Service) ListConfiguredEnabled(ctx context.Context) ([]modeldomain.Rout
 
 // ListPublicModels builds GET /v1/models like jiujiu532: pre-registered client IDs.
 // - enabled model_routes (Build discovered + Web/Console built-in catalog rows)
-// - all registered aliases whose target upstream is in the built-in static catalog
-//   and/or currently configured (e.g. grok-4.20-multi-agent-xhigh)
+// - effort aliases whose target upstream is currently enabled in model_routes
+//   (e.g. multi-agent-xhigh only while multi-agent-0309 stays enabled)
 // Account availability is checked at request time, not at list time.
 func (s *Service) ListPublicModels(ctx context.Context) ([]modeldomain.Route, []string, error) {
 	values, err := s.models.ListConfiguredEnabled(ctx)
@@ -143,13 +143,14 @@ func (s *Service) ListPublicModels(ctx context.Context) ([]modeldomain.Route, []
 	return values, s.aliasesForRoutes(ctx, values), nil
 }
 
-// aliasesForRoutes returns client alias IDs (jiujiu-style public names) for targets
-// that exist either in configured routes or in the static provider catalog in code.
-func (s *Service) aliasesForRoutes(ctx context.Context, routes []modeldomain.Route) []string {
+// aliasesForRoutes returns client alias IDs for targets that are currently enabled
+// in model_routes (after startup/sync catalog reseed). Admin-disabled routes hide
+// their effort aliases (e.g. disabling multi-agent-0309 hides multi-agent-xhigh).
+func (s *Service) aliasesForRoutes(_ context.Context, routes []modeldomain.Route) []string {
 	if s == nil || s.providers == nil {
 		return nil
 	}
-	present := make(map[string]struct{}, len(routes)*2+16)
+	present := make(map[string]struct{}, len(routes)*2)
 	for _, route := range routes {
 		if !route.Enabled {
 			continue
@@ -160,28 +161,6 @@ func (s *Service) aliasesForRoutes(ctx context.Context, routes []modeldomain.Rou
 		}
 		if ext := modeldomain.ExternalPublicID(route.Provider, route.PublicID); ext != "" {
 			present["ext\x00"+ext] = struct{}{}
-		}
-	}
-	// Pre-register static catalog upstreams from code (Console/Web), so aliases such as
-	// multi-agent-xhigh appear even if DB reseed is mid-flight — same idea as jiujiu MODELS.
-	for _, providerValue := range s.providers.Providers() {
-		if !s.staticModelCatalog(providerValue) {
-			continue
-		}
-		adapter, ok := s.providers.Models(providerValue)
-		if !ok {
-			continue
-		}
-		models, listErr := adapter.ListModels(ctx, account.Credential{})
-		if listErr != nil {
-			continue
-		}
-		for _, modelName := range models {
-			modelName = strings.TrimSpace(modelName)
-			if modelName == "" {
-				continue
-			}
-			present[string(providerValue)+"\x00"+modelName] = struct{}{}
 		}
 	}
 	aliases := s.providers.ListModelAliases()
@@ -516,11 +495,9 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 
 	uniqueModels := make(map[account.Provider]map[string]struct{}, len(providerValues))
 	addModels := func(providerValue account.Provider, models []string) {
-		// Static providers already reseeded full catalog routes above; do not also
-		// UpsertDiscovered them as "discovered" rows (would duplicate public IDs).
-		if s.staticModelCatalog(providerValue) {
-			return
-		}
+		// Always collect models for UpsertDiscovered. When the static seeder already
+		// wrote catalog routes, UpsertDiscovered is a no-op for those upstream IDs.
+		// When seeder is unset (tests) or only partial, this still creates routes.
 		providerModels := uniqueModels[providerValue]
 		if providerModels == nil {
 			providerModels = make(map[string]struct{})
