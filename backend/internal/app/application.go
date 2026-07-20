@@ -261,7 +261,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	// mostly static bulk SQL + a few Build HTTP /models calls; sharing pool_limit=6 made
 	// admin "同步模型" take 8+ minutes across ~20k Web accounts before gateway timeout.
 	modelService.SetLogger(logger)
-	// Startup + admin「同步模型」both reseed Web/Console built-in routes (not Build).
+	// Startup + admin「同步模型」reseed Web/Console catalogs and Build effort-alias routes.
+	// Build discovered models still come from account sync; aliases get real DB ids for keys.
 	seedStaticCatalogs := func(seedCtx context.Context) (int, error) {
 		webRoutes := webprovider.Routes()
 		if err := modelRepo.ReplaceProviderRoutes(seedCtx, account.ProviderWeb, webRoutes); err != nil {
@@ -271,7 +272,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		if err := modelRepo.ReplaceProviderRoutes(seedCtx, account.ProviderConsole, consoleRoutes); err != nil {
 			return 0, fmt.Errorf("Grok Console 模型目录: %w", err)
 		}
-		return len(webRoutes) + len(consoleRoutes), nil
+		// Upsert (do not replace) so Build discovered routes stay intact.
+		buildAliasRoutes := cliprovider.AliasRoutes()
+		if err := modelRepo.UpsertRoutes(seedCtx, buildAliasRoutes); err != nil {
+			return 0, fmt.Errorf("Grok Build 思考别名路由: %w", err)
+		}
+		return len(webRoutes) + len(consoleRoutes) + len(buildAliasRoutes), nil
 	}
 	modelService.SetStaticCatalogSeeder(seedStaticCatalogs)
 	if _, err := seedStaticCatalogs(ctx); err != nil {

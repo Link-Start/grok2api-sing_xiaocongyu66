@@ -84,12 +84,34 @@ func consoleAlias(alias, publicModel, upstreamModel, effort string) provider.Mod
 func Catalog() []ModelSpec { return append([]ModelSpec(nil), catalog...) }
 
 func Routes() []modeldomain.Route {
-	values := make([]modeldomain.Route, 0, len(catalog))
+	// Catalog rows + fixed client aliases (each gets its own model_routes id for key ACL).
+	values := make([]modeldomain.Route, 0, len(catalog)+len(aliases))
+	seenPublic := make(map[string]struct{}, len(catalog)+len(aliases))
 	for _, spec := range catalog {
 		publicID, _ := modeldomain.NormalizePublicID(account.ProviderConsole, spec.PublicID)
+		if publicID == "" {
+			continue
+		}
+		seenPublic[publicID] = struct{}{}
 		values = append(values, modeldomain.Route{
 			PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: spec.UpstreamModel,
-			Capability: modeldomain.CapabilityResponses, Enabled: true,
+			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog, Enabled: true,
+		})
+	}
+	for _, alias := range aliases {
+		// Persist alias as its own public ID row (same upstream as target).
+		// Client keys bind to this row's id so effort shortcuts can be allowed independently.
+		publicID, ok := modeldomain.NormalizePublicID(account.ProviderConsole, alias.Alias)
+		if !ok || publicID == "" {
+			continue
+		}
+		if _, exists := seenPublic[publicID]; exists {
+			continue
+		}
+		seenPublic[publicID] = struct{}{}
+		values = append(values, modeldomain.Route{
+			PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: alias.UpstreamModel,
+			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog, Enabled: true,
 		})
 	}
 	return values

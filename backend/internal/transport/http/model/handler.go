@@ -93,9 +93,7 @@ func (h *Handler) list(c *gin.Context) {
 	}
 	items := make([]modelResponse, 0, len(values))
 	for _, value := range values {
-		// Only real model_routes rows (non-zero id). Virtual alias rows must not appear
-		// in the admin/key picker: they shared id=0 so one checkbox toggled many labels,
-		// and PATCH client-keys rejected "0" as 无效模型 ID.
+		// Real model_routes only (effort aliases are seeded as real rows with their own ids).
 		if value.ID == 0 {
 			continue
 		}

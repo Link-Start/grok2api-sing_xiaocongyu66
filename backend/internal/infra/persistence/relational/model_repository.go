@@ -196,7 +196,9 @@ func findModelRoutesByPublicID(db *gorm.DB, publicID string) ([]modelRouteModel,
 
 func (r *ModelRepository) GetByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
 	var row modelRouteModel
-	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
+	// Prefer the lowest-id row (base catalog/discovered) when multiple public IDs share upstream.
+	if err := r.availableRoutes(r.db.db.WithContext(ctx)).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).
+		Order("model_routes.id ASC").First(&row).Error; err != nil {
 		return model.Route{}, mapError(err)
 	}
 	return toModelDomain(row), nil
@@ -206,7 +208,8 @@ func (r *ModelRepository) GetByProviderUpstream(ctx context.Context, provider ac
 // currently has the capability bound (see GetConfiguredPublicIDCandidates).
 func (r *ModelRepository) GetConfiguredByProviderUpstream(ctx context.Context, provider account.Provider, upstreamModel string) (model.Route, error) {
 	var row modelRouteModel
-	if err := r.db.db.WithContext(ctx).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).First(&row).Error; err != nil {
+	if err := r.db.db.WithContext(ctx).Where("provider = ? AND upstream_model = ? AND enabled = ?", provider, upstreamModel, true).
+		Order("id ASC").First(&row).Error; err != nil {
 		return model.Route{}, mapError(err)
 	}
 	return toModelDomain(row), nil
@@ -329,11 +332,18 @@ func (r *ModelRepository) UpsertDiscovered(ctx context.Context, provider account
 		if err := tx.Where("provider = ?", provider).Find(&existing).Error; err != nil {
 			return err
 		}
+		// Track existing public_ids. Multiple rows may share an upstream (effort aliases);
+		// discovery only skips when a base public id for that upstream already exists.
 		existingUpstream := make(map[string]bool, len(existing))
 		publicIDs := make(map[string]bool, len(existing))
 		for _, row := range existing {
 			if row.Provider == string(provider) {
-				existingUpstream[row.UpstreamModel] = true
+				// Consider upstream covered if any row has the canonical public id for it
+				// (ExternalPublicID matches upstream for normal discovered models).
+				local := model.ExternalPublicID(account.Provider(row.Provider), row.PublicID)
+				if local == row.UpstreamModel {
+					existingUpstream[row.UpstreamModel] = true
+				}
 			}
 			publicIDs[row.PublicID] = true
 		}
@@ -392,9 +402,19 @@ func (r *ModelRepository) UpsertRoutes(ctx context.Context, values []model.Route
 			if strings.TrimSpace(value.PublicID) == "" || strings.TrimSpace(value.UpstreamModel) == "" || value.Provider == "" || value.Capability == "" {
 				return fmt.Errorf("模型路由目录包含无效条目")
 			}
+			// Match by public_id only. Effort aliases share upstream with the base model
+			// and must still create a separate row with its own id for client-key ACL.
 			var existing modelRouteModel
-			err := tx.Where("provider = ? AND upstream_model = ?", value.Provider, value.UpstreamModel).First(&existing).Error
+			err := tx.Where("public_id = ?", value.PublicID).First(&existing).Error
 			if err == nil {
+				// Keep upstream/capability in sync when the catalog updates.
+				updates := map[string]any{
+					"upstream_model": value.UpstreamModel,
+					"capability":     value.Capability,
+				}
+				if err := tx.Model(&modelRouteModel{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+					return mapError(err)
+				}
 				continue
 			}
 			if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -436,22 +456,30 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 			return err
 		}
 
-		byUpstream := make(map[string]modelRouteModel, len(existing))
+		// Match primarily by public_id so effort aliases (shared upstream) keep
+		// distinct route IDs and client-key bindings.
 		byPublicID := make(map[string]modelRouteModel, len(existing))
+		byUpstreamUnused := make(map[string][]modelRouteModel, len(existing))
 		for _, row := range existing {
-			byUpstream[row.UpstreamModel] = row
 			byPublicID[row.PublicID] = row
+			byUpstreamUnused[row.UpstreamModel] = append(byUpstreamUnused[row.UpstreamModel], row)
 		}
 		matched := make(map[int]modelRouteModel, len(values))
 		usedIDs := make(map[uint64]bool, len(values))
 		for index, value := range values {
-			row, ok := byUpstream[value.UpstreamModel]
-			if !ok || usedIDs[row.ID] {
-				row, ok = byPublicID[value.PublicID]
-			}
-			if ok && !usedIDs[row.ID] {
+			if row, ok := byPublicID[value.PublicID]; ok && !usedIDs[row.ID] {
 				matched[index] = row
 				usedIDs[row.ID] = true
+				continue
+			}
+			// Fallback for renamed public IDs: first unused row with same upstream.
+			for _, row := range byUpstreamUnused[value.UpstreamModel] {
+				if usedIDs[row.ID] {
+					continue
+				}
+				matched[index] = row
+				usedIDs[row.ID] = true
+				break
 			}
 		}
 		for _, row := range existing {

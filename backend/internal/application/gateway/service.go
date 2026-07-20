@@ -274,12 +274,20 @@ func (s *Service) CompactResponse(ctx context.Context, input Input) (*Result, er
 // configured (enabled) without a ready account, still return those routes so
 // callers get 503 "no available account" instead of a misleading 404.
 func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel string) ([]modeldomain.Route, string, error) {
+	// Effort for fixed thinking shortcuts (e.g. grok-4.5-high) even when the name is a real model_routes row.
+	effort := s.reasoningEffortForModelName(publicModel)
 	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
 	if err == nil {
-		return routes, "", nil
+		if effort == "" {
+			effort = s.reasoningEffortForRoutes(routes)
+		}
+		return routes, effort, nil
 	}
 	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, publicModel); confErr == nil && len(configured) > 0 {
-		return configured, "", nil
+		if effort == "" {
+			effort = s.reasoningEffortForRoutes(configured)
+		}
+		return configured, effort, nil
 	}
 	if s.providers == nil {
 		s.logModelResolveMiss(publicModel, "no_providers")
@@ -290,27 +298,58 @@ func (s *Service) resolvePublicModelRoutes(ctx context.Context, publicModel stri
 		s.logModelResolveMiss(publicModel, "no_alias")
 		return nil, "", err
 	}
+	if alias.ReasoningEffort != "" {
+		effort = alias.ReasoningEffort
+	}
+	// Prefer a route whose public id is the alias itself (has its own key ACL id).
+	if aliasRoutes, aliasErr := s.models.GetByPublicIDCandidates(ctx, alias.Alias); aliasErr == nil && len(aliasRoutes) > 0 {
+		return aliasRoutes, effort, nil
+	}
+	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, alias.Alias); confErr == nil && len(configured) > 0 {
+		return configured, effort, nil
+	}
 	if alias.Provider != "" && alias.UpstreamModel != "" {
 		route, routeErr := s.models.GetByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel)
 		if routeErr != nil {
 			if configured, confErr := s.models.GetConfiguredByProviderUpstream(ctx, alias.Provider, alias.UpstreamModel); confErr == nil {
-				return []modeldomain.Route{configured}, alias.ReasoningEffort, nil
+				return []modeldomain.Route{configured}, effort, nil
 			}
 			// Log only fixed enum labels for provider; never raw alias strings (CodeQL log-injection).
 			s.logModelResolveMiss(publicModel, "alias_upstream_miss")
 			return nil, "", routeErr
 		}
-		return []modeldomain.Route{route}, alias.ReasoningEffort, nil
+		return []modeldomain.Route{route}, effort, nil
 	}
 	routes, err = s.models.GetByPublicIDCandidates(ctx, alias.PublicModel)
 	if err == nil {
-		return routes, alias.ReasoningEffort, nil
+		return routes, effort, nil
 	}
 	if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, alias.PublicModel); confErr == nil && len(configured) > 0 {
-		return configured, alias.ReasoningEffort, nil
+		return configured, effort, nil
 	}
 	s.logModelResolveMiss(publicModel, "alias_public_miss")
-	return routes, alias.ReasoningEffort, err
+	return routes, effort, err
+}
+
+// reasoningEffortForModelName returns fixed effort when the client model name is a registered shortcut.
+func (s *Service) reasoningEffortForModelName(name string) string {
+	if s == nil || s.providers == nil {
+		return ""
+	}
+	alias, ok := s.providers.ResolveModelAlias(strings.TrimSpace(name))
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(alias.ReasoningEffort)
+}
+
+func (s *Service) reasoningEffortForRoutes(routes []modeldomain.Route) string {
+	for _, route := range routes {
+		if effort := s.reasoningEffortForModelName(modeldomain.ExternalPublicID(route.Provider, route.PublicID)); effort != "" {
+			return effort
+		}
+	}
+	return ""
 }
 
 // logModelResolveMiss records a miss without logging raw client model strings
@@ -450,13 +489,20 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 	}
 	publicModel := modeldomain.ExternalPublicID(route.Provider, route.PublicID)
+	// Upstream-facing base name for body rewrite (alias rows keep effort public id for ACL/audit).
+	upstreamPublicModel := publicModel
+	if aliasEffort != "" {
+		if base := strings.TrimSpace(route.UpstreamModel); base != "" {
+			upstreamPublicModel = base
+		}
+	}
 	input.PublicModel = publicModel
 	// Dual thinking control (same idea as jiujiu multi-agent-* aliases):
 	//  1) Model alias: client sends model=grok-4.5-high → force effort=high
 	//  2) Base model + body: client sends model=grok-4.5 and reasoning.effort / reasoning_effort
 	//     → leave body as-is (no rewrite). Alias effort always wins when present.
 	if aliasEffort != "" {
-		input.Body, err = rewriteAliasedModel(input.Body, publicModel, aliasEffort, operation)
+		input.Body, err = rewriteAliasedModel(input.Body, upstreamPublicModel, aliasEffort, operation)
 		if err != nil {
 			return nil, err
 		}

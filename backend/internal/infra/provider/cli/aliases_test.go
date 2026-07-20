@@ -22,4 +22,16 @@ func TestBuildReasoningEffortAliasesRegistered(t *testing.T) {
 			t.Fatalf("alias %q effort %q mismatch", name, alias.ReasoningEffort)
 		}
 	}
+	routes := AliasRoutes()
+	if len(routes) != 4 {
+		t.Fatalf("AliasRoutes = %d, want 4", len(routes))
+	}
+	for _, route := range routes {
+		if route.Provider != account.ProviderBuild || route.UpstreamModel != "grok-4.5" || route.ID != 0 {
+			t.Fatalf("alias route = %#v", route)
+		}
+		if !strings.HasPrefix(route.PublicID, "Build/") {
+			t.Fatalf("public id = %q", route.PublicID)
+		}
+	}
 }

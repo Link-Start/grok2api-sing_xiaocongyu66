@@ -32,5 +32,23 @@ func Aliases() []provider.ModelAlias {
 	return append([]provider.ModelAlias(nil), buildAliases...)
 }
 
+// AliasRoutes returns model_routes rows for Build effort shortcuts so each
+// client-facing name has a stable DB id for client-key ACL (not id=0 virtual rows).
+// Upstream stays the real model (e.g. grok-4.5); gateway injects effort on rewrite.
+func AliasRoutes() []modeldomain.Route {
+	values := make([]modeldomain.Route, 0, len(buildAliases))
+	for _, alias := range buildAliases {
+		publicID, ok := modeldomain.NormalizePublicID(account.ProviderBuild, alias.Alias)
+		if !ok || publicID == "" {
+			continue
+		}
+		values = append(values, modeldomain.Route{
+			PublicID: publicID, Provider: account.ProviderBuild, UpstreamModel: alias.UpstreamModel,
+			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog, Enabled: true,
+		})
+	}
+	return values
+}
+
 // ModelAliases implements provider.ModelAliasAdapter.
 func (a *Adapter) ModelAliases() []provider.ModelAlias { return Aliases() }
