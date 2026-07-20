@@ -186,17 +186,30 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		if a.replay != nil && request.PromptCacheKey != "" && !isCompactPath(request.Path) && !compactionRequested {
 			body = a.replay.Apply(ctx, request.Model, request.PromptCacheKey, body)
 		}
-		// Last-mile: deep-scrub every compaction object so Grok never sees
-		// foreign/account-scoped compact state (nested content included).
+		// Last-mile: deep-scrub compact state before the first upstream call.
+		// Also strip opaque compact-like payloads and previous_response_id when
+		// any compact residue was found — multi-account pools cannot decode
+		// account-scoped compact blobs, so fail-open to portable text history.
 		if !compactionRequested {
 			var scrubbed int
 			body, scrubbed = scrubUpstreamCompactionBlobs(body)
 			if scrubbed > 0 {
 				foreignCompactions += scrubbed
+			}
+			if cleaned, n := stripOpaqueCompactPayloads(body); n > 0 {
+				body = cleaned
+				foreignCompactions += n
+				scrubbed += n
+			}
+			if scrubbed > 0 {
+				if stripped, ok := stripPreviousResponseID(body); ok {
+					body = stripped
+				}
 				slog.Warn("compaction_blob_scrubbed",
 					"removed", scrubbed,
 					"path", request.Path,
 					"prompt_cache_key_set", strings.TrimSpace(request.PromptCacheKey) != "",
+					"stage", "pre_request",
 				)
 			}
 		}
@@ -214,9 +227,20 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	base := a.apiBaseForOperation(ctx, request.Credential, request.Method, request.Path)
 	// Absolute last defense inside the HTTP sender as well.
 	if scrubbedBody, n := scrubUpstreamCompactionBlobs(body); n > 0 {
-		slog.Warn("compaction_blob_scrubbed", "removed", n, "path", request.Path, "stage", "do_request")
 		body = scrubbedBody
 		foreignCompactions += n
+		if stripped, ok := stripPreviousResponseID(body); ok {
+			body = stripped
+		}
+		slog.Warn("compaction_blob_scrubbed", "removed", n, "path", request.Path, "stage", "do_request")
+	}
+	if cleaned, n := stripOpaqueCompactPayloads(body); n > 0 {
+		body = cleaned
+		foreignCompactions += n
+		if stripped, ok := stripPreviousResponseID(body); ok {
+			body = stripped
+		}
+		slog.Warn("compaction_blob_scrubbed", "removed", n, "path", request.Path, "stage", "do_request_opaque")
 	}
 	resp, reqURL, err := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if err != nil {
@@ -243,16 +267,17 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				"body_changed", stats["changed"] == true,
 				"stats", stats,
 			)
-			// Only retry when we actually rewrote the body; otherwise we would
-			// burn another identical upstream call and still 400.
-			if stats["changed"] == true {
-				if retryResp, retryURL, retryErr := a.doResponseRequest(ctx, request, accessToken, retryBody, base); retryErr == nil {
-					resp, reqURL, body = retryResp, retryURL, retryBody
-				} else {
-					resp = cloneBufferedResponse(resp, errBody, truncated)
-				}
+			// Always retry once after sanitize. Even when stats look unchanged,
+			// re-marshal + drop previous_response_id can still clear sticky state
+			// that Grok ties to compact sessions. Log upstream error length for ops.
+			slog.Warn("compaction_blob_upstream_error",
+				"path", request.Path,
+				"error_len", len(errBody),
+				"error_prefix", truncateForLog(string(errBody), 180),
+			)
+			if retryResp, retryURL, retryErr := a.doResponseRequest(ctx, request, accessToken, retryBody, base); retryErr == nil {
+				resp, reqURL, body = retryResp, retryURL, retryBody
 			} else {
-				// Nothing to strip: surface original 400 (client must start a new turn).
 				resp = cloneBufferedResponse(resp, errBody, truncated)
 			}
 		} else if readErr == nil {
@@ -693,4 +718,12 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 		return account.Billing{}, fmt.Errorf("上游 Billing 接口返回 %d", resp.StatusCode)
 	}
 	return parseBilling(body)
+}
+
+func truncateForLog(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:max] + "…"
 }

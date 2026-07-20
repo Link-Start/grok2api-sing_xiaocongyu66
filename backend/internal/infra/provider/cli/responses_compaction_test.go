@@ -31,11 +31,8 @@ func TestGatewayCompactionLifecycle(t *testing.T) {
 	if !strings.HasPrefix(continuation, "This session is being continued") || strings.Contains(continuation, "<summary>") || !strings.Contains(continuation, "Summary:\n1. Primary") {
 		t.Fatalf("continuation = %q", continuation)
 	}
-	blob, err := codec.encode("session-1", continuation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stream, contentType, err := buildGatewayCompactionResponse(sample.response, blob, "grok-4.5", true)
+	// Compact responses are portable assistant text only (no type=compaction blobs).
+	stream, contentType, err := buildGatewayCompactionResponse(sample.response, continuation, "grok-4.5", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,16 +44,25 @@ func TestGatewayCompactionLifecycle(t *testing.T) {
 	if contentType != "text/event-stream" {
 		t.Fatalf("content type = %q", contentType)
 	}
-	blob = compactionBlobFromSSE(t, stream)
-	expanded, foreign, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(blob)+`}]} `), codec, "session-1")
+	if strings.Contains(string(stream), `"type":"compaction"`) || strings.Contains(string(stream), "encrypted_content") {
+		t.Fatalf("must not emit compact blobs to clients: %s", stream)
+	}
+	if !strings.Contains(string(stream), `"type":"message"`) || !strings.Contains(string(stream), "This session is being continued") {
+		t.Fatalf("expected portable summary message: %s", stream)
+	}
+	// Legacy inbound compact blobs (from older gateway or native Grok) still scrub cleanly.
+	legacyBlob, err := codec.encode("session-1", continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expanded, foreign, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(legacyBlob)+`}]} `), codec, "session-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if foreign != 0 || !strings.Contains(string(expanded), "This session is being continued") || strings.Contains(string(expanded), `"type":"compaction"`) || !strings.Contains(string(expanded), `"role":"user"`) {
 		t.Fatalf("expanded = %s, foreign = %d", expanded, foreign)
 	}
-	// Session mismatch: degrade to boundary (do not hard-fail; multi-account pools rotate keys).
-	mismatched, foreignMiss, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(blob)+`}]}`), codec, "other-session")
+	mismatched, foreignMiss, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(legacyBlob)+`}]}`), codec, "other-session")
 	if err != nil || foreignMiss != 1 || strings.Contains(string(mismatched), `"type":"compaction"`) || !strings.Contains(string(mismatched), "cannot be decoded") {
 		t.Fatalf("session mismatch expand = %s foreign=%d err=%v", mismatched, foreignMiss, err)
 	}
@@ -257,11 +263,12 @@ func TestForwardResponseEmulatesRemoteCompactionV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Header.Get("Content-Type") != "text/event-stream" || !strings.Contains(string(data), `"type":"compaction"`) || !strings.Contains(string(data), "response.completed") {
+	if response.Header.Get("Content-Type") != "text/event-stream" || strings.Contains(string(data), `"type":"compaction"`) || !strings.Contains(string(data), `"type":"message"`) || !strings.Contains(string(data), "response.completed") {
 		t.Fatalf("response = %s, headers = %#v", data, response.Header)
 	}
-	if !strings.Contains(response.Header.Get("X-Grok2API-Compatibility-Warnings"), "remote_compaction_v2_emulated") {
-		t.Fatalf("warnings = %q", response.Header.Get("X-Grok2API-Compatibility-Warnings"))
+	warnings := response.Header.Get("X-Grok2API-Compatibility-Warnings")
+	if !strings.Contains(warnings, "remote_compaction_v2_emulated") || !strings.Contains(warnings, "remote_compaction_v2_text_only") {
+		t.Fatalf("warnings = %q", warnings)
 	}
 }
 

@@ -150,20 +150,23 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 		}
 
 		continuation := gatewayCompactionContinuation(sample.summary)
-		blob, encodeErr := a.compaction.encode(request.PromptCacheKey, continuation)
-		if encodeErr != nil {
-			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 编码失败"), nil
-		}
-		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, blob, request.Model, request.Streaming)
+		// Do NOT return type=compaction + encrypted_content blobs.
+		// Multi-account pools and gateway-emulated g2a_compact_v1 blobs cause Grok
+		// "Could not decode the compaction blob" when the CLI replays them later.
+		// Return a portable assistant message with the summary text only.
+		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, continuation, request.Model, request.Streaming)
 		if convertErr != nil {
 			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 响应编码失败"), nil
 		}
-		// Remember synthetic response id → summary so previous_response_id continuations
-		// do not hit Grok with a compact state it never stored.
 		if a.compactRecall != nil {
 			if responseID := gatewayCompactResponseID(sample.response, converted); responseID != "" {
 				a.compactRecall.remember(responseID, request.PromptCacheKey, continuation)
 			}
+		}
+		if warnings == "" {
+			warnings = "remote_compaction_v2_text_only"
+		} else if !strings.Contains(warnings, "remote_compaction_v2_text_only") {
+			warnings = warnings + ",remote_compaction_v2_text_only"
 		}
 		headers := resp.Header.Clone()
 		headers.Del("Content-Encoding")
@@ -391,22 +394,34 @@ func extractCompactionSummary(response map[string]any) string {
 	return strings.Join(parts, "\n")
 }
 
-func buildGatewayCompactionResponse(response map[string]any, blob, model string, streaming bool) ([]byte, string, error) {
+// buildGatewayCompactionResponse returns a completed Responses payload whose
+// output is a plain assistant message (summary text), never type=compaction.
+// summaryText is the portable continuation the client should keep in history.
+func buildGatewayCompactionResponse(response map[string]any, summaryText, model string, streaming bool) ([]byte, string, error) {
 	response = cloneJSONObject(response)
 	responseID := strings.TrimSpace(stringField(response, "id"))
 	if responseID == "" {
 		responseID = "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
+	summaryText = strings.TrimSpace(summaryText)
+	if summaryText == "" {
+		summaryText = "Conversation context was compacted. Continue from the retained messages."
+	}
 	item := map[string]any{
-		"id": "cmp_" + strings.TrimPrefix(responseID, "resp_"),
-		"type": "compaction", "encrypted_content": blob,
+		"id":   "msg_" + strings.TrimPrefix(responseID, "resp_"),
+		"type": "message",
+		"role": "assistant",
+		"status": "completed",
+		"content": []any{
+			map[string]any{"type": "output_text", "text": summaryText},
+		},
 	}
 	response["id"] = responseID
 	response["object"] = "response"
 	response["status"] = "completed"
 	response["model"] = model
 	response["output"] = []any{item}
-	delete(response, "output_text")
+	response["output_text"] = summaryText
 	if !streaming {
 		encoded, err := json.Marshal(response)
 		return encoded, "application/json", err
@@ -414,6 +429,7 @@ func buildGatewayCompactionResponse(response map[string]any, blob, model string,
 	createdResponse := cloneJSONObject(response)
 	createdResponse["status"] = "in_progress"
 	createdResponse["output"] = []any{}
+	delete(createdResponse, "output_text")
 	inProgressResponse := cloneJSONObject(createdResponse)
 	events := []struct {
 		name string
@@ -422,9 +438,10 @@ func buildGatewayCompactionResponse(response map[string]any, blob, model string,
 		{"response.created", map[string]any{"type": "response.created", "sequence_number": 0, "response": createdResponse}},
 		{"response.in_progress", map[string]any{"type": "response.in_progress", "sequence_number": 1, "response": inProgressResponse}},
 		{"response.output_item.added", map[string]any{"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": item}},
-		{"keepalive", map[string]any{"type": "keepalive", "sequence_number": 3}},
-		{"response.output_item.done", map[string]any{"type": "response.output_item.done", "sequence_number": 4, "output_index": 0, "item": item}},
-		{"response.completed", map[string]any{"type": "response.completed", "sequence_number": 5, "response": response}},
+		{"response.output_text.delta", map[string]any{"type": "response.output_text.delta", "sequence_number": 3, "output_index": 0, "content_index": 0, "delta": summaryText}},
+		{"response.output_text.done", map[string]any{"type": "response.output_text.done", "sequence_number": 4, "output_index": 0, "content_index": 0, "text": summaryText}},
+		{"response.output_item.done", map[string]any{"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": item}},
+		{"response.completed", map[string]any{"type": "response.completed", "sequence_number": 6, "response": response}},
 	}
 	var output bytes.Buffer
 	for _, event := range events {
