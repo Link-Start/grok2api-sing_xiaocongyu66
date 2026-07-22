@@ -28,6 +28,7 @@ Thumbs.db
 # Go
 /.gocache/
 /.gocache-*/
+/.gotmp/
 /backend/grok2api
 /backend/coverage.out
 *.coverprofile

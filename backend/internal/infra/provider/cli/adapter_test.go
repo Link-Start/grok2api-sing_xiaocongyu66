@@ -223,13 +223,14 @@ func TestGrokSessionIDFollowsConversationIdentity(t *testing.T) {
 	if err != nil || parsed.Version() != uuid.Version(8) || first != second {
 		t.Fatalf("derived sessions = %q %q, %v", first, second, err)
 	}
+	// Stateless requests must not mint a random session id; a fresh UUID per
+	// call breaks prompt-cache affinity and keeps cached_tokens at zero.
 	generated, err := grokSessionID("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err = uuid.Parse(generated)
-	if err != nil || parsed.Version() != uuid.Version(7) {
-		t.Fatalf("generated session = %q, %v", generated, err)
+	if generated != "" {
+		t.Fatalf("empty key should yield empty session, got %q", generated)
 	}
 }
 

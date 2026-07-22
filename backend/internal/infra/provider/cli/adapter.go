@@ -246,46 +246,16 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if err != nil {
 		return nil, err
 	}
-	// If Grok rejects compact state, aggressively sanitize and retry once.
-	// Mild scrub alone often no-ops (CLI shapes that are not type=compaction, or
-	// previous_response_id pointing at a gateway-emulated compact Grok never stored).
-	if resp.StatusCode == http.StatusBadRequest && request.Method == http.MethodPost && !isCompactPath(request.Path) {
-		errBody, truncated, readErr := provider.ReadDiagnosticBody(resp.Body)
-		_ = resp.Body.Close()
-		if readErr == nil && isCompactionBlobDecodeError(errBody) {
-			retryBody, stats := sanitizeBodyAfterCompactionDecodeError(body, a.compactRecall)
-			// Always re-scrub after nuclear strip (nested leftovers).
-			if scrubbed, n := scrubUpstreamCompactionBlobs(retryBody); n > 0 {
-				retryBody = scrubbed
-				stats["post_scrub"] = n
-				stats["changed"] = true
-			}
-			slog.Warn("compaction_blob_decode_retry",
-				"path", request.Path,
-				"prompt_cache_key_set", strings.TrimSpace(request.PromptCacheKey) != "",
-				"body_truncated", truncated,
-				"body_changed", stats["changed"] == true,
-				"stats", stats,
-			)
-			// Always retry once after sanitize. Even when stats look unchanged,
-			// re-marshal + drop previous_response_id can still clear sticky state
-			// that Grok ties to compact sessions. Log upstream error length for ops.
-			slog.Warn("compaction_blob_upstream_error",
-				"path", request.Path,
-				"error_len", len(errBody),
-				"error_prefix", truncateForLog(string(errBody), 180),
-			)
-			if retryResp, retryURL, retryErr := a.doResponseRequest(ctx, request, accessToken, retryBody, base); retryErr == nil {
-				resp, reqURL, body = retryResp, retryURL, retryBody
-			} else {
-				resp = cloneBufferedResponse(resp, errBody, truncated)
-			}
-		} else if readErr == nil {
-			resp = cloneBufferedResponse(resp, errBody, truncated)
-		} else {
-			return nil, readErr
-		}
+	// Shared recovery for compaction-blob / encrypted_content decode 400s
+	// (upstream v3.0.5+ reasoning recovery). Pre-request scrub remains above;
+	// post-response recovery owns retries so session-reset is not short-circuited
+	// by a second same-session POST that still carries opaque state.
+	if err := normalizeGzipResponse(resp); err != nil {
+		return nil, err
 	}
+	replayKey := strings.TrimSpace(request.PromptCacheKey)
+	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
+
 	// 未标记账号：仅可回退操作在主地址明确 403 时用等价请求探测 XAI。
 	if a.shouldProbeXAIInferenceFallback(ctx, request.Credential, request.Method, request.Path, resp.StatusCode) {
 		primaryBody, primaryTruncated, readErr := provider.ReadDiagnosticBody(resp.Body)
@@ -297,16 +267,25 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		fallbackBase := a.fallbackBaseURL()
 		if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
 			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, body, fallbackBase)
+			fallbackRecovery := reasoningRecoveryOutcome{}
 			if fallbackErr == nil {
-				if isHTTPSuccess(fallbackResp.StatusCode) {
-					cred := request.Credential
-					a.activateBuildAPIFallback(ctx, &cred)
-					resp, reqURL = fallbackResp, fallbackURL
-				} else {
+				if err := normalizeGzipResponse(fallbackResp); err != nil {
 					_ = fallbackResp.Body.Close()
-					resp = primaryResp
+					fallbackErr = err
 				}
+			}
+			if fallbackErr == nil {
+				fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, fallbackBase, replayKey, fallbackResp, fallbackURL)
+			}
+			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
+				cred := request.Credential
+				a.activateBuildAPIFallback(ctx, &cred)
+				resp, reqURL = fallbackResp, fallbackURL
+				reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
 			} else {
+				if fallbackErr == nil {
+					_ = fallbackResp.Body.Close()
+				}
 				resp = primaryResp
 			}
 		} else {
@@ -327,6 +306,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
+	reasoningRecovery.appendWarnings(resp.Header)
 	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
@@ -576,14 +556,19 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 
 	if trace {
 		requestID := uuid.NewString()
+		// Only set x-grok-conv-id / session-id when a stable session exists.
+		// Never mint a random UUID per request: it breaks xAI session affinity
+		// and keeps cached_tokens at zero across multi-turn sticky sessions.
 		sessionID, err := grokSessionID(promptCacheKey)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
 		req.Header.Set("x-grok-agent-id", a.agentID)
-		req.Header.Set("x-grok-session-id", sessionID)
-		req.Header.Set("x-grok-conv-id", sessionID)
+		if sessionID != "" {
+			req.Header.Set("x-grok-session-id", sessionID)
+			req.Header.Set("x-grok-conv-id", sessionID)
+		}
 		req.Header.Set("x-grok-req-id", requestID)
 		// 网关无法从无状态 API 请求可靠恢复 CLI prompt index；该字段在
 		// 官方协议中可选，因此不伪造 x-grok-turn-idx。
@@ -616,19 +601,17 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 	return nil
 }
 
+// grokSessionID converts a stable session key to the upstream x-grok-conv-id.
+// An empty key returns an empty string; stateless requests never receive a random ID.
 func grokSessionID(promptCacheKey string) (string, error) {
 	key := strings.TrimSpace(promptCacheKey)
-	if key != "" {
-		if parsed, err := uuid.Parse(key); err == nil {
-			return parsed.String(), nil
-		}
-		return uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("grok2api:session:"+key), 8).String(), nil
+	if key == "" {
+		return "", nil
 	}
-	value, err := uuid.NewV7()
-	if err != nil {
-		return "", err
+	if parsed, err := uuid.Parse(key); err == nil {
+		return parsed.String(), nil
 	}
-	return value.String(), nil
+	return uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("grok2api:session:"+key), 8).String(), nil
 }
 
 func injectPromptCacheKey(body []byte, clientKey string) ([]byte, error) {

@@ -850,6 +850,25 @@ attemptLoop:
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+		} else if response.StatusCode >= 400 {
+			// Non-retryable upstream errors (especially 400) previously returned
+			// without a diagnostic line, which made production 400 spikes opaque.
+			// Prefer Diagnostic body when present so we never consume the client stream.
+			upstreamCode := ""
+			if response.Diagnostic != nil {
+				upstreamCode, _, _ = extractUpstreamErrorMetadata(response.Diagnostic.Body)
+			}
+			if warning := strings.TrimSpace(response.Header.Get("X-Grok2API-Compatibility-Warnings")); warning != "" && upstreamCode == "" {
+				upstreamCode = warning
+			}
+			s.logger.Warn("upstream_request_failed",
+				"request_id", input.RequestID,
+				"account_id", credential.ID,
+				"provider", credential.Provider,
+				"status", response.StatusCode,
+				"upstream_code", upstreamCode,
+				"account_scoped", false,
+			)
 		}
 		accountID := credential.ID
 		var once sync.Once
