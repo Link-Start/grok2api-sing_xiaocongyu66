@@ -15,8 +15,15 @@ server:
   # [按需修改] 仅在本地或受信任环境开启，生产环境保持 false。
   swaggerEnabled: false
   # [按需修改] 反代 CIDR/IP；留空则不信任客户端伪造的 X-Forwarded-For。
-  # 例如在 nginx 后面：trustedProxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  # 看到大量 10.x/172.16.x/192.168.x 时，通常是反代/LB 的内网地址，不是用户伪造。
+  # 把「直连本服务的那一跳」CIDR 写进来后，审计/日志会从 X-Forwarded-For / X-Real-IP 取真实客户端 IP。
+  # 示例（Docker/K8s/云内网反代）：
+  # trustedProxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+  # 更稳妥：只写你的反代精确 IP，例如 ["10.16.18.225/32"]
   trustedProxies: []
+  # [按需修改] CDN/边缘真实 IP 头。空=用 X-Forwarded-For / X-Real-IP。
+  # cloudflare → CF-Connecting-IP；flyio → Fly-Client-IP；也可写自定义头名如 True-Client-IP
+  trustedPlatform: ""
 
 auth:
   # [通常不要修改] 管理端访问与刷新令牌有效期。

@@ -232,13 +232,17 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 		if !validRequestID(reqID) {
 			reqID = "-"
 		}
+		clientIP := safeClientIP(c.ClientIP())
+		remoteIP := safeClientIP(c.RemoteIP())
 		attrs := []any{
 			"request_id", reqID,
 			"method", logMethod,
 			"route", classifiedRoute(c),
 			"status", c.Writer.Status(),
 			"duration_ms", time.Since(startedAt).Milliseconds(),
-			"client_ip", safeClientIP(c.ClientIP()),
+			"client_ip", clientIP,
+			// TCP peer (proxy/LB). Differs from client_ip when trustedProxies unwrap XFF.
+			"remote_addr", remoteIP,
 			"client_type", clientType,
 			"user_agent_len", len(userAgent),
 			"bytes_out", c.Writer.Size(),

@@ -64,7 +64,13 @@ type ServerConfig struct {
 	SwaggerEnabled        bool     `yaml:"swaggerEnabled"`
 	// TrustedProxies lists reverse-proxy CIDRs/IPs trusted for X-Forwarded-For / X-Real-IP.
 	// Empty means ClientIP uses the direct remote address only (no client-supplied spoofing).
+	// When the app sits behind nginx/caddy/LB on a private network, set those hop CIDRs
+	// (e.g. 10.0.0.0/8) so audit logs show the real client IP instead of the proxy's 10.x address.
 	TrustedProxies []string `yaml:"trustedProxies"`
+	// TrustedPlatform selects a CDN/edge client-IP header when present (takes priority over XFF).
+	// Values: "" (default), "cloudflare" (CF-Connecting-IP), "flyio" (Fly-Client-IP),
+	// or any custom header name such as "True-Client-IP" / "X-Client-IP".
+	TrustedPlatform string `yaml:"trustedPlatform"`
 }
 
 type FrontendConfig struct {

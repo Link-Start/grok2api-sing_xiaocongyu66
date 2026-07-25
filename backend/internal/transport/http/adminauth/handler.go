@@ -3,7 +3,6 @@ package adminauth
 import (
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -68,7 +67,8 @@ func (h *Handler) login(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, remoteAddress(c.Request))
+	// Use Gin ClientIP so login rate limits honor trustedProxies / CDN headers.
+	adminValue, tokens, err := h.service.Login(c.Request.Context(), request.Username, request.Password, strings.TrimSpace(c.ClientIP()))
 	if err != nil {
 		if errors.Is(err, adminapp.ErrLoginRateLimited) {
 			response.Error(c, http.StatusTooManyRequests, "loginRateLimited", "登录尝试过于频繁，请稍后重试")
@@ -83,15 +83,6 @@ func (h *Handler) login(c *gin.Context) {
 	}
 	h.setRefreshCookie(c, tokens)
 	response.Success(c, http.StatusOK, gin.H{"admin": newAdminResponse(adminValue), "tokens": newTokenResponse(tokens)})
-}
-
-func remoteAddress(request *http.Request) string {
-	value := strings.TrimSpace(request.RemoteAddr)
-	host, _, err := net.SplitHostPort(value)
-	if err == nil && host != "" {
-		return host
-	}
-	return value
 }
 
 func (h *Handler) refresh(c *gin.Context) {

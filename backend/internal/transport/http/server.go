@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	_ "github.com/chenyme/grok2api/backend/docs"
@@ -51,7 +52,10 @@ type Dependencies struct {
 	APIKeyHeaders []string
 	// TrustedProxies are reverse-proxy CIDRs/IPs trusted for client IP headers.
 	// Empty disables trusting X-Forwarded-For from untrusted clients.
-	TrustedProxies     []string
+	TrustedProxies []string
+	// TrustedPlatform is an optional CDN/edge header used as the client IP source
+	// (e.g. "cloudflare" → CF-Connecting-IP). Empty keeps Gin defaults (XFF / X-Real-IP).
+	TrustedPlatform    string
 	SwaggerEnabled     bool
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
@@ -128,6 +132,9 @@ func New(deps Dependencies) *gin.Engine {
 	} else if err := router.SetTrustedProxies(deps.TrustedProxies); err != nil {
 		panic("httpserver: invalid trustedProxies: " + err.Error())
 	}
+	if platform := resolveTrustedPlatform(deps.TrustedPlatform); platform != "" {
+		router.TrustedPlatform = platform
+	}
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.SecurityHeaders(), middleware.MaxBodyBytes(deps.MaxBodyBytes), middleware.Timeout(deps.RequestTimeout), middleware.AccessLog(deps.Logger))
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
 	router.GET("/readyz", func(c *gin.Context) {
@@ -192,4 +199,21 @@ func New(deps Dependencies) *gin.Engine {
 		inferenceHandler.Register(v1)
 	registerFrontend(router, deps.FrontendStaticPath)
 	return router
+}
+
+// resolveTrustedPlatform maps config aliases to Gin platform header names.
+func resolveTrustedPlatform(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "cloudflare", "cf", gin.PlatformCloudflare:
+		return gin.PlatformCloudflare
+	case "flyio", "fly", gin.PlatformFlyIO:
+		return gin.PlatformFlyIO
+	case "appengine", "gae", gin.PlatformGoogleAppEngine:
+		return gin.PlatformGoogleAppEngine
+	default:
+		// Allow custom header names such as True-Client-IP.
+		return strings.TrimSpace(value)
+	}
 }
