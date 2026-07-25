@@ -594,6 +594,12 @@ func (r *mutableEgressRepository) DeleteEgressNode(_ context.Context, id uint64)
 	r.node = domain.Node{}
 	return nil
 }
+func (r *mutableEgressRepository) GetEgressOperationsConfig(context.Context) (domain.OperationsConfig, error) {
+	return domain.DefaultOperationsConfig(), nil
+}
+func (r *mutableEgressRepository) SaveEgressOperationsConfig(_ context.Context, value domain.OperationsConfig) (domain.OperationsConfig, error) {
+	return value, nil
+}
 
 func (r *countingEgressRepository) ListEgressNodes(ctx context.Context, scope domain.Scope, sort repository.SortQuery) ([]domain.Node, error) {
 	r.calls++
@@ -620,4 +626,10 @@ func (egressRepositoryTestStub) UpdateEgressNode(context.Context, domain.Node) (
 }
 func (egressRepositoryTestStub) DeleteEgressNode(context.Context, uint64) error {
 	return errors.New("unsupported")
+}
+func (egressRepositoryTestStub) GetEgressOperationsConfig(context.Context) (domain.OperationsConfig, error) {
+	return domain.DefaultOperationsConfig(), nil
+}
+func (egressRepositoryTestStub) SaveEgressOperationsConfig(_ context.Context, value domain.OperationsConfig) (domain.OperationsConfig, error) {
+	return value, nil
 }

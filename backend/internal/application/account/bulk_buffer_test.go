@@ -86,6 +86,12 @@ func (r *bulkBufferRepoStub) HasActive(context.Context, accountdomain.Provider) 
 func (r *bulkBufferRepoStub) ListRoutingCandidates(context.Context, accountdomain.Provider, string, string) ([]accountdomain.RoutingCandidate, error) {
 	return nil, nil
 }
+func (r *bulkBufferRepoStub) ListRoutingAccountBases(context.Context, accountdomain.Provider, string) ([]accountdomain.RoutingAccountBase, error) {
+	return nil, nil
+}
+func (r *bulkBufferRepoStub) ListRoutingAccountOverlays(context.Context, accountdomain.Provider, string) (accountdomain.RoutingOverlaySnapshot, error) {
+	return accountdomain.RoutingOverlaySnapshot{}, nil
+}
 func (r *bulkBufferRepoStub) Get(context.Context, uint64) (accountdomain.Credential, error) {
 	return accountdomain.Credential{}, repository.ErrNotFound
 }

@@ -474,3 +474,11 @@ func (consoleEgressRepositoryStub) UpdateEgressNode(context.Context, egressdomai
 func (consoleEgressRepositoryStub) DeleteEgressNode(context.Context, uint64) error {
 	return errors.New("unsupported")
 }
+
+func (consoleEgressRepositoryStub) GetEgressOperationsConfig(context.Context) (egressdomain.OperationsConfig, error) {
+	return egressdomain.DefaultOperationsConfig(), nil
+}
+
+func (consoleEgressRepositoryStub) SaveEgressOperationsConfig(_ context.Context, value egressdomain.OperationsConfig) (egressdomain.OperationsConfig, error) {
+	return value, nil
+}

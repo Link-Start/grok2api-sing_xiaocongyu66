@@ -365,6 +365,14 @@ func (egressRepositoryStub) DeleteEgressNode(context.Context, uint64) error {
 	return errors.New("unsupported")
 }
 
+func (egressRepositoryStub) GetEgressOperationsConfig(context.Context) (egressdomain.OperationsConfig, error) {
+	return egressdomain.DefaultOperationsConfig(), nil
+}
+
+func (egressRepositoryStub) SaveEgressOperationsConfig(_ context.Context, value egressdomain.OperationsConfig) (egressdomain.OperationsConfig, error) {
+	return value, nil
+}
+
 func TestLiteChatRejectsInvalidImageConfigBeforeUpstream(t *testing.T) {
 	adapter := &Adapter{}
 	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{

@@ -346,16 +346,24 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Media.MaxTotalBytes = value.Media.MaxTotalBytes
 	base.Media.CleanupThresholdPercent = value.Media.CleanupThresholdPercent
 	base.Media.CleanupInterval = config.Duration(value.Media.CleanupInterval)
-	// Reasoning replay is process/YAML config (not yet in admin editable domain).
-	// Preserve base defaults when applying persisted runtime settings.
+	// Reasoning replay / segmented selector / preferFreeBuild are process/YAML config
+	// (not yet in admin editable domain). Preserve base defaults when applying persisted settings.
 	replayEnabled := base.Routing.ReasoningReplayEnabled
 	replayTTL := base.Routing.ReasoningReplayTTL
 	replayMax := base.Routing.ReasoningReplayMaxEntries
+	preferFreeBuild := base.Routing.PreferFreeBuild
+	segmentedEnabled := base.Routing.SegmentedSelectorEnabled
+	segmentedMin := base.Routing.SegmentedMinCandidates
+	segmentedWindow := base.Routing.SegmentedWindowSize
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
 		RetryStatusCodes: append([]int(nil), value.Routing.RetryStatusCodes...), RetryServerErrors: value.Routing.RetryServerErrors,
 		DeprioritizeFailedAccounts: value.Routing.DeprioritizeFailedAccounts,
+		PreferFreeBuild:            preferFreeBuild,
+		SegmentedSelectorEnabled:   segmentedEnabled,
+		SegmentedMinCandidates:     segmentedMin,
+		SegmentedWindowSize:        segmentedWindow,
 		ReasoningReplayEnabled:     replayEnabled, ReasoningReplayTTL: replayTTL, ReasoningReplayMaxEntries: replayMax,
 	}
 	if base.Routing.ReasoningReplayTTL.Value() <= 0 {
