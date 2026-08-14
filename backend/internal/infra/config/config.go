@@ -68,6 +68,7 @@ type Config struct {
 	QualityGuard      QualityGuardConfig      `yaml:"qualityGuard"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
+	DBBuffer          DBBufferConfig          `yaml:"dbBuffer"`
 }
 
 type ServerConfig struct {
@@ -194,6 +195,12 @@ type BatchConfig struct {
 	SyncConcurrency       int
 	RefreshConcurrency    int
 	RandomDelay           Duration
+}
+
+type DBBufferConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Driver  string `yaml:"driver"` // "redis" or "sqlite"
+	Path    string `yaml:"path"`   // for sqlite buffer file, e.g. "./data/bulk-buffer.db"
 }
 
 type MediaConfig struct {

@@ -18,12 +18,14 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/pkg/perfmetrics"
 	"github.com/chenyme/grok2api/backend/internal/pkg/resultcache"
 	"github.com/chenyme/grok2api/backend/internal/repository"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -427,6 +429,11 @@ type Service struct {
 	buildBotFlagCache      *resultcache.Cache[string, []uint64]
 	logger                 *slog.Logger
 	now                    func() time.Time
+	// dbBuffer: optional buffering for bulk ops. Pull from main DB to buffer (redis/sqlite),
+	// work on buffer, batch flush back to main DB to reduce main DB pressure.
+	dbBuffer            config.DBBufferConfig
+	dbBufferRedis       *redis.Client
+	dbBufferRedisPrefix string
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -484,7 +491,14 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
 		logger: slog.Default(),
 		now:    func() time.Time { return time.Now().UTC() },
+		dbBuffer: config.DBBufferConfig{Enabled: false, Driver: "none"},
 	}
+}
+
+// SetDBBuffer enables optional buffering (redis or local sqlite) for bulk DB ops as switch.
+// Pull data to buffer, work on buffer, batch flush to main DB to reduce main DB pressure.
+func (s *Service) SetDBBuffer(buf config.DBBufferConfig) {
+	s.dbBuffer = buf
 }
 
 func (s *Service) SetBulkPool(pool *batch.Pool) {

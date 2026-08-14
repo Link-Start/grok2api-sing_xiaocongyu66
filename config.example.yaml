@@ -14,13 +14,29 @@ server:
   requestTimeout: 2h
   # [按需修改] 仅在本地或受信任环境开启，生产环境保持 false。
   swaggerEnabled: false
+  # [按需修改] 反代 CIDR/IP；留空则不信任客户端伪造的 X-Forwarded-For。
+  # 看到大量 10.x/172.16.x/192.168.x 时，通常是反代/LB 的内网地址，不是用户伪造。
+  # 把「直连本服务的那一跳」CIDR 写进来后，审计/日志会从 X-Forwarded-For / X-Real-IP 取真实客户端 IP。
+  # 示例（Docker/K8s/云内网反代）：
+  # trustedProxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+  # 更稳妥：只写你的反代精确 IP，例如 ["10.16.18.225/32"]
+  trustedProxies: []
+  # [按需修改] CDN/边缘真实 IP 头。空=用 X-Forwarded-For / X-Real-IP。
+  # cloudflare → CF-Connecting-IP；flyio → Fly-Client-IP；也可写自定义头名如 True-Client-IP
+  trustedPlatform: ""
 
 auth:
   # [通常不要修改] 管理端访问与刷新令牌有效期。
   accessTokenTTL: 15m
   refreshTokenTTL: 720h
-  # [按需修改] 外部地址使用 HTTPS 时必须设为 true。
+  # [必须修改：HTTPS 反代/公网] 使用 HTTPS 时设为 true，否则 Refresh Cookie 可能被明文传输。
   secureCookies: false
+  # [按需修改] 额外接受客户端 API Key 的自定义请求头名（值仍是 g2a_... 完整密钥）。
+  # 始终支持：Authorization: Bearer g2a_... 与 X-API-Key: g2a_...
+  # 示例：用 congyu_15fc: g2a_15fc... 传钥时配置：
+  # apiKeyHeaders:
+  #   - "congyu_15fc"
+  apiKeyHeaders: []
 
 secrets:
   # [必须修改] 至少 32 个字符。快速生成：openssl rand -hex 32
@@ -60,12 +76,35 @@ runtimeStore:
     # [必须修改：仅 driver=redis] 填写 Redis 连接信息。
     address: "127.0.0.1:6379"
     username: ""
-    password: ""
+    # [按需修改] Redis 需要密码时填写；留空表示无密码（不是“空密码登录”）。
+    # password: "change-me"
     database: 0
     # [通常不要修改] 同一 Redis 中部署多个实例组时才需要更换。
     keyPrefix: "grok2api:"
     # [按需修改] Redis 使用 TLS 时设为 true。
     tls: false
+
+provider:
+  console:
+    # [通常不要修改] Grok Console Responses API 地址。
+    baseURL: "https://console.x.ai"
+    # [通常不要修改] 必须与 Console 出口节点的浏览器指纹保持一致。
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    # [按需修改] Console 单次对话超时。
+    chatTimeout: 5m
+  # [通常不要修改] 默认全部关闭，对齐 CLIProxy：不主动请求 xAI 余额/额度。
+  # 账号可用性由真实推理结果与上游错误码驱动；仅 access token 临近过期时刷新。
+  proactiveUpstreamSync:
+    # false：导入/后台不调用 Build /billing（含 format=credits）。
+    billing: false
+    # false：不调用 Web /rest/rate-limits，也不跑 quota_recovery / 成功后额度回刷。
+    webQuota: false
+    # false：不在导入或启动时批量 ListModels。
+    modelCatalogCatchup: false
+    # false：管理端手动「刷新余额」接口返回 upstreamSyncDisabled。
+    allowManualBillingRefresh: false
+    # false：管理端手动「刷新额度」接口返回 upstreamSyncDisabled。
+    allowManualQuotaRefresh: false
 
 deployment:
   # [通常不要修改] 单实例保持 1；多实例必须同时使用 PostgreSQL、Redis 和共享媒体目录。
@@ -78,13 +117,44 @@ deployment:
   sharedMedia: false
 
 media:
-  # [通常不要修改] 当前仅支持 local；容量和清理策略在管理端设置。
-  driver: local
+  # [按需修改] local = 本机目录；r2 = Cloudflare R2（S3 兼容）。
+  # 容量与清理阈值在管理端设置（仅对 local 统计磁盘占用更有意义）。
+  driver: local # local | r2
   local:
     # [按需修改] 图片二进制目录；数据库只保存资源元数据。
     path: "./data/media"
+  r2:
+    # [必须修改：仅 driver=r2] Cloudflare R2 S3 API 端点。
+    # endpoint: "https://<accountid>.r2.cloudflarestorage.com"
+    # accessKeyId: "replace-with-r2-access-key-id"
+    # secretAccessKey: "replace-with-r2-secret-access-key"
+    # bucket: "grok2api-media"
+    # region: "auto"
+    # [按需修改] 桶内前缀，便于多实例共用一个 bucket。
+    # prefix: "grok2api"
+    # [按需修改] 自定义域名/CDN（可选，网关仍通过 /v1/media/images 代理读取）。
+    # publicBaseURL: "https://media.example.com"
 
 routing:
+  # [通常不要修改] 会话粘性与失败换号。
+  stickyTTL: 1h
+  cooldownBase: 30s
+  cooldownMax: 30m
+  capacityWait: 500ms
+  maxAttempts: 3
+  # [按需修改] 上游返回这些状态码时换账号重试（默认 402/429/503；403 默认不换号以免连坐）。
+  # 账号级永久拒绝仍会走凭据刷新；Web 出口反爬 403 仍按节点处理。
+  retryStatusCodes: [402, 429, 503]
+  # [通常不要修改] true 时所有 5xx 都会触发换号。
+  retryServerErrors: true
+  # Prompt 缓存亲和：稳定 x-grok-conv-id，提高上游真实 cached_tokens 命中（不伪造 token）。
+  # 优先 Claude Code / Codex / Grok CLI 会话头；否则按 API Key+IP+UA 指纹映射。
+  # 映射写入 SQL（prompt_cache_affinity）持久化，Redis/memory 作热缓存。
+  promptCacheAffinity:
+    enabled: true
+    fingerprint: true
+    expire: true
+    ttl: 24h
   # [按需修改] 服务端推理回放缓存：多轮时自动补回客户端未携带的 encrypted_content。
   reasoningReplayEnabled: true
   reasoningReplayTTL: 1h

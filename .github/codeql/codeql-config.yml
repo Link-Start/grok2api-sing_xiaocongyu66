@@ -1,0 +1,11 @@
+name: "grok2api-sing CodeQL"
+
+# Focus analysis on first-party gateway code. Vendored sing-box is large and
+# produces protocol/false-positive noise (Trojan SHA224 wire keys, DNS tooling).
+queries:
+  - uses: security-and-quality
+
+paths-ignore:
+  - third_party/**
+  - "**/node_modules/**"
+  - frontend/dist/**

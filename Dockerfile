@@ -28,20 +28,26 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS backend-builder
 ARG TARGETOS
 ARG TARGETARCH
 
-WORKDIR /src/backend
+WORKDIR /src
 RUN apk add --no-cache ca-certificates git
 
-COPY backend/go.mod backend/go.sum ./
+# Vendored full SagerNet/sing-box tree (replace in backend/go.mod).
+COPY third_party/sing-box ./third_party/sing-box
+COPY backend/go.mod backend/go.sum ./backend/
+WORKDIR /src/backend
 RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
     go mod download
 
 COPY backend/cmd ./cmd
 COPY backend/internal ./internal
 COPY backend/docs/docs.go ./docs/docs.go
+# Align with sing-box client defaults: full outbound protocols in-process.
+# Default image tags: full proxy set except Hysteria/TUIC (needs with_quic + qpack pin).
+ARG SINGBOX_TAGS="with_gvisor,with_wireguard,with_utls"
 RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=grok2api-go-build,target=/root/.cache/go-build,sharing=locked \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/grok2api ./cmd/grok2api
+    go build -tags "${SINGBOX_TAGS}" -buildvcs=false -trimpath -ldflags="-s -w" -o /out/grok2api ./cmd/grok2api
 
 
 FROM alpine:${ALPINE_VERSION}

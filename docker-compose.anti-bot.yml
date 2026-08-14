@@ -1,0 +1,47 @@
+# Anti-bot stack aligned with jiujiu532/grok2api (WARP + Privoxy + FlareSolverr).
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.anti-bot.yml up -d
+# Then in Admin → Settings → Grok Web:
+#   enable FlareSolverr, URL = http://flaresolverr:8191
+# And add egress nodes pointing at socks5://warp:1080 or http://privoxy:8118.
+
+services:
+  warp:
+    container_name: warp
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+
+  privoxy:
+    container_name: privoxy
+    image: ghcr.io/jiujiu532/privoxy-warp:latest
+    restart: unless-stopped
+    depends_on:
+      - warp
+    # HTTP proxy on 8118, forwarding to warp SOCKS inside the compose network.
+    # From grok2api: http://privoxy:8118
+
+  flaresolverr:
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_LEVEL: info
+      # Optional: send FlareSolverr browser traffic through WARP via privoxy
+      # PROXY_URL: http://privoxy:8118
+
+  grok2api:
+    depends_on:
+      - flaresolverr
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # Optional bootstrap env if your entrypoint maps these into runtime settings:
+      # FLARESOLVERR_URL: http://flaresolverr:8191
