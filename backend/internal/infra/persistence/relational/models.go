@@ -553,3 +553,14 @@ type egressOperationsConfigModel struct {
 }
 
 func (egressOperationsConfigModel) TableName() string { return "egress_operations_config" }
+
+// promptCacheAffinityModel persists fingerprint → xAI affinity id across restarts.
+type promptCacheAffinityModel struct {
+	Fingerprint string    `gorm:"size:64;primaryKey;check:chk_prompt_cache_affinity_fp,length(fingerprint) = 64"`
+	AffinityID  string    `gorm:"size:80;not null;check:chk_prompt_cache_affinity_id,length(trim(affinity_id)) BETWEEN 1 AND 80"`
+	ExpiresAt   *time.Time
+	CreatedAt   time.Time `gorm:"not null"`
+	UpdatedAt   time.Time `gorm:"not null"`
+}
+
+func (promptCacheAffinityModel) TableName() string { return "prompt_cache_affinity" }

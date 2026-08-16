@@ -246,3 +246,123 @@ func gatewayCompactionSummaryMessage(text string) map[string]any {
 		"content": []any{map[string]any{"type": "input_text", "text": text}},
 	}
 }
+
+func isCompactionInputItem(item map[string]any) bool {
+	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
+	return typ == "compaction"
+}
+
+func compactionBlobString(item map[string]any) string {
+	switch v := item["encrypted_content"].(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return fmt.Sprintf("%v", v)
+	default:
+		if v == nil {
+			return ""
+		}
+		if data, err := json.Marshal(v); err == nil {
+			return string(data)
+		}
+		return ""
+	}
+}
+
+func foreignCompactionBoundaryMessage() map[string]any {
+	return compatibilityBoundaryMessage("A compacted context from another account or provider cannot be decoded by Grok Build. Continue from the retained conversation messages (start a new session if this blocks progress).")
+}
+
+func scrubUpstreamCompactionBlobs(body []byte) ([]byte, int) {
+	if len(body) == 0 {
+		return body, 0
+	}
+	var payload any
+	if json.Unmarshal(body, &payload) != nil {
+		return body, 0
+	}
+	cleaned, removed := scrubCompactionValue(payload)
+	if removed == 0 {
+		return body, 0
+	}
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return body, 0
+	}
+	return encoded, removed
+}
+
+func scrubCompactionValue(value any) (any, int) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), 1
+		}
+		removed := 0
+		for key, nested := range typed {
+			if strings.EqualFold(key, "encrypted_content") || strings.EqualFold(key, "encryptedContent") {
+				if _, isCompaction := typed["type"]; isCompaction && isCompactionInputItem(typed) {
+					return foreignCompactionBoundaryMessage(), 1
+				}
+			}
+			next, n := scrubCompactionValue(nested)
+			if n > 0 {
+				typed[key] = next
+				removed += n
+			}
+		}
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), removed + 1
+		}
+		return typed, removed
+	case []any:
+		removed := 0
+		for index, nested := range typed {
+			next, n := scrubCompactionValue(nested)
+			if n > 0 {
+				typed[index] = next
+				removed += n
+			}
+		}
+		return typed, removed
+	default:
+		return value, 0
+	}
+}
+
+func looksLikeCompactionObject(item map[string]any) bool {
+	if isCompactionInputItem(item) {
+		return true
+	}
+	blob := compactionBlobString(item)
+	if blob == "" {
+		if v, ok := item["encryptedContent"].(string); ok {
+			blob = v
+		}
+	}
+	if blob == "" {
+		return false
+	}
+	if strings.HasPrefix(blob, gatewayCompactionPrefix) {
+		return true
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
+	if typ != "" && typ != "compaction" {
+		return false
+	}
+	if len(blob) < 64 {
+		return false
+	}
+	meta := 0
+	for key := range item {
+		switch strings.ToLower(key) {
+		case "type", "id", "encrypted_content", "encryptedcontent", "status":
+			meta++
+		default:
+			return false
+		}
+	}
+	return meta >= 1 && (item["encrypted_content"] != nil || item["encryptedContent"] != nil)
+}

@@ -49,6 +49,7 @@ var schemaModels = []any{
 	&mediaAssetModel{},
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
+	&promptCacheAffinityModel{},
 }
 
 var schemaIndexes = []string{
