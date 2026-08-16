@@ -78,6 +78,14 @@ type BatchConfig struct {
 	SyncConcurrency       int
 	RefreshConcurrency    int
 	RandomDelay           string
+	DBBuffer              DBBufferConfig
+}
+
+// DBBufferConfig is the admin-editable DB buffer policy.
+type DBBufferConfig struct {
+	Enabled bool   `json:"enabled"`
+	Driver  string `json:"driver"`
+	Path    string `json:"path"`
 }
 
 type MediaConfig struct {
@@ -108,6 +116,21 @@ type RoutingConfig struct {
 	AccountIsolatedConnectionsProvided bool
 	SegmentedSelector                  SegmentedSelectorConfig
 	SegmentedSelectorProvided          bool
+	PromptCacheAffinity                PromptCacheAffinityConfig
+	ReasoningReplay                    ReasoningReplayConfig
+}
+
+type PromptCacheAffinityConfig struct {
+	Enabled     bool   `json:"enabled"`
+	Fingerprint bool   `json:"fingerprint"`
+	Expire      bool   `json:"expire"`
+	TTL         string `json:"ttl"`
+}
+
+type ReasoningReplayConfig struct {
+	Enabled    bool   `json:"enabled"`
+	TTL        string `json:"ttl"`
+	MaxEntries int    `json:"maxEntries"`
 }
 
 type SegmentedSelectorConfig struct {

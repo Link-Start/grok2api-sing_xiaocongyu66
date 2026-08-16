@@ -195,13 +195,28 @@ type BatchConfig struct {
 	SyncConcurrency       int
 	RefreshConcurrency    int
 	RandomDelay           Duration
+	// DBBuffer enables optional buffering for bulk DB-heavy operations (e.g. account conversion,
+	// batch updates). Data is pulled from main DB into the buffer (Redis or local SQLite),
+	// processed there to reduce main DB load, then batched back to main DB.
+	DBBuffer DBBufferConfig `yaml:"dbBuffer"`
 }
 
 type DBBufferConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Driver  string `yaml:"driver"` // "redis" or "sqlite"
-	Path    string `yaml:"path"`   // for sqlite buffer file, e.g. "./data/bulk-buffer.db"
+	Path    string `yaml:"path"`
 }
+
+// PromptCacheAffinityConfig controls prompt-cache affinity stabilization.
+type PromptCacheAffinityConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	Fingerprint bool     `yaml:"fingerprint"`
+	Expire      bool     `yaml:"expire"`
+	TTL         Duration `yaml:"ttl"`
+}
+
+// DefaultRetryStatusCodes: 403 is intentionally excluded so permanent bans do not cascade across the pool.
+var DefaultRetryStatusCodes = []int{402, 429, 503}
 
 type MediaConfig struct {
 	Driver                  string           `yaml:"driver"`
@@ -232,6 +247,15 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
+	// RetryStatusCodes lists exact upstream HTTP codes that trigger account failover.
+	// Empty falls back to DefaultRetryStatusCodes after load/validate normalization.
+	RetryStatusCodes []int `yaml:"retryStatusCodes"`
+	// RetryServerErrors retries any status >= 500 when true (default).
+	RetryServerErrors bool `yaml:"retryServerErrors"`
+	// DeprioritizeFailedAccounts ranks accounts with higher failure_count last.
+	DeprioritizeFailedAccounts bool `yaml:"deprioritizeFailedAccounts"`
+	// PromptCacheAffinity stabilizes x-grok-conv-id for upstream prompt-cache hits.
+	PromptCacheAffinity PromptCacheAffinityConfig `yaml:"promptCacheAffinity"`
 }
 
 type AuditConfig struct {
@@ -896,4 +920,39 @@ func isExampleSecret(value string) bool {
 	default:
 		return false
 	}
+}
+
+func NormalizeRoutingRetry(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.Routing.RetryStatusCodes) == 0 {
+		cfg.Routing.RetryStatusCodes = append([]int(nil), DefaultRetryStatusCodes...)
+		return
+	}
+	seen := make(map[int]struct{}, len(cfg.Routing.RetryStatusCodes))
+	normalized := make([]int, 0, len(cfg.Routing.RetryStatusCodes))
+	for _, code := range cfg.Routing.RetryStatusCodes {
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		normalized = append(normalized, code)
+	}
+	cfg.Routing.RetryStatusCodes = normalized
+}
+
+func IsRetryableStatus(status int, codes []int, retryServerErrors bool) bool {
+	if retryServerErrors && status >= 500 {
+		return true
+	}
+	if len(codes) == 0 {
+		codes = DefaultRetryStatusCodes
+	}
+	for _, code := range codes {
+		if status == code {
+			return true
+		}
+	}
+	return false
 }
