@@ -89,7 +89,7 @@ func (r *bulkBufferRepoStub) ListRoutingCandidates(context.Context, accountdomai
 func (r *bulkBufferRepoStub) ListRoutingAccountBases(context.Context, accountdomain.Provider, string) ([]accountdomain.RoutingAccountBase, error) {
 	return nil, nil
 }
-func (r *bulkBufferRepoStub) ListRoutingAccountOverlays(context.Context, accountdomain.Provider, string) (accountdomain.RoutingOverlaySnapshot, error) {
+func (r *bulkBufferRepoStub) ListRoutingAccountOverlays(context.Context, accountdomain.Provider, uint64, string) (accountdomain.RoutingOverlaySnapshot, error) {
 	return accountdomain.RoutingOverlaySnapshot{}, nil
 }
 func (r *bulkBufferRepoStub) Get(context.Context, uint64) (accountdomain.Credential, error) {
@@ -107,14 +107,14 @@ func (r *bulkBufferRepoStub) UpsertByIdentity(context.Context, accountdomain.Cre
 func (r *bulkBufferRepoStub) Update(context.Context, accountdomain.Credential) (accountdomain.Credential, error) {
 	return accountdomain.Credential{}, nil
 }
-func (r *bulkBufferRepoStub) UpdateMany(context.Context, []uint64, repository.AccountUpdates) (int64, error) {
+func (r *bulkBufferRepoStub) UpdateMany(context.Context, accountdomain.Provider, []uint64, repository.AccountUpdates) (int64, error) {
 	return 0, nil
 }
 func (r *bulkBufferRepoStub) Delete(context.Context, uint64) error { return nil }
 func (r *bulkBufferRepoStub) DeleteMany(context.Context, []uint64) (int64, error) {
 	return 0, nil
 }
-func (r *bulkBufferRepoStub) UpdateTokens(context.Context, uint64, string, string, time.Time) (accountdomain.Credential, error) {
+func (r *bulkBufferRepoStub) UpdateTokens(context.Context, uint64, string, string, time.Time, int) (accountdomain.Credential, error) {
 	return accountdomain.Credential{}, nil
 }
 func (r *bulkBufferRepoStub) BackfillCredentialRefreshSchedules(context.Context, time.Time, int) (int, error) {
@@ -129,7 +129,7 @@ func (r *bulkBufferRepoStub) ListDueCredentialRefreshIDs(context.Context, time.T
 func (r *bulkBufferRepoStub) NextCredentialRefreshDueAt(context.Context) (*time.Time, error) {
 	return nil, nil
 }
-func (r *bulkBufferRepoStub) UpdateCredentialRefreshFailure(context.Context, uint64, int, time.Time, string, bool) error {
+func (r *bulkBufferRepoStub) UpdateCredentialRefreshFailure(context.Context, uint64, repository.CredentialRefreshFailure) error {
 	return nil
 }
 func (r *bulkBufferRepoStub) UpdateObservedModel(context.Context, uint64, string, time.Time) error {
