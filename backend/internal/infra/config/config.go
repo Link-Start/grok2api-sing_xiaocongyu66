@@ -865,6 +865,9 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:      true,
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
+			PromptCacheAffinity: PromptCacheAffinityConfig{
+				Enabled: true, Fingerprint: true, Expire: true, TTL: Duration(24 * time.Hour),
+			},
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
