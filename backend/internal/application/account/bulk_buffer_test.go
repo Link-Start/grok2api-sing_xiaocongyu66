@@ -83,7 +83,7 @@ func (r *bulkBufferRepoStub) ListMissingConsoleSyncBatch(context.Context, uint64
 func (r *bulkBufferRepoStub) HasActive(context.Context, accountdomain.Provider) (bool, error) {
 	return false, nil
 }
-func (r *bulkBufferRepoStub) ListRoutingCandidates(context.Context, accountdomain.Provider, string, string) ([]accountdomain.RoutingCandidate, error) {
+func (r *bulkBufferRepoStub) ListRoutingCandidates(context.Context, accountdomain.Provider, uint64, string, string) ([]accountdomain.RoutingCandidate, error) {
 	return nil, nil
 }
 func (r *bulkBufferRepoStub) ListRoutingAccountBases(context.Context, accountdomain.Provider, string) ([]accountdomain.RoutingAccountBase, error) {
