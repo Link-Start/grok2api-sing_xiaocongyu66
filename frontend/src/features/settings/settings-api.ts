@@ -46,11 +46,13 @@ export type EgressNodeDTO = {
 	probeStatus: "unknown" | "healthy" | "unhealthy"; lastProbedAt?: string; probeLatencyMs: number; exitIp?: string; probeError?: string;
 	probeProvider?: "ipinfo" | "cloudflare";
 	ipv4Probe: EgressIPProbeDTO; ipv6Probe: EgressIPProbeDTO;
+	scopes?: EgressScope[];
 };
 
 export type EgressNodeInput = {
 	name: string; scope: EgressScope; enabled: boolean; proxyPool: boolean; proxyURL?: string;
 	accountCapacity: number; clearProxyURL?: boolean; userAgent: string; cloudflareCookies?: string; clearCookies?: boolean;
+	scopes?: EgressScope[];
 };
 
 export type EgressScope = "grok_build" | "grok_web" | "grok_console" | "grok_web_asset" | "grok_console_asset";
@@ -442,4 +444,34 @@ export function assignEgressAccounts(nodeID: string, provider: "grok_build" | "g
 
 export function unassignEgressAccounts(provider: "grok_build" | "grok_web" | "grok_console", ids: string[]): Promise<{ assigned: number }> {
   return apiRequest("/api/admin/v1/egress-nodes/accounts", { method: "DELETE", body: { provider, ids } }, createObjectDecoder<{ assigned: number }>("egress account assignment", { assigned: isNumber }));
+}
+
+export const EGRESS_SCOPES = ["grok_build", "grok_web", "grok_console", "grok_web_asset"] as const;
+
+export function clearEgressNodesErrors(ids: string[]): Promise<{ cleared: number }> {
+  return apiRequest("/api/admin/v1/egress-nodes/clear-errors", { method: "POST", body: { ids } }, createObjectDecoder<{ cleared: number }>("clear errors", { cleared: isNumber }));
+}
+
+export function createEgressNodesBatch(input: { namePrefix: string; scope: EgressScope; scopes?: EgressScope[]; enabled?: boolean; proxyText: string; userAgent?: string; cloudflareCookies?: string }): Promise<{ created: number; failed: number; errors: string[] }> {
+  return importEgressText({ name: input.namePrefix, scope: input.scope, accountCapacity: 0, content: input.proxyText }).then((r) => ({ created: r.imported, failed: r.failed, errors: [] as string[] }));
+}
+
+export function getEgressReport(scope?: EgressScope): Promise<{ total: number; healthy: number; unhealthy: number }> {
+  return listEgressNodes({ scope }).then((dto) => ({
+    total: dto.items.length,
+    healthy: dto.items.filter((n: EgressNodeDTO) => n.enabled).length,
+    unhealthy: dto.items.filter((n: EgressNodeDTO) => !n.enabled).length,
+  }));
+}
+
+export function setEgressNodesEnabled(ids: string[], enabled: boolean): Promise<{ updated: number; enabled: boolean }> {
+  return updateEgressNodesEnabled(ids, enabled).then((r) => ({ ...r, enabled }));
+}
+
+export function testAllEgressNodes(scope?: EgressScope): Promise<{ passed: number; failed: number; total: number }> {
+  return testEgressNodes().then((r: any) => {
+    const results = r.results ?? [];
+    const passed = results.filter((x: any) => x.success).length;
+    return { passed, failed: results.length - passed, total: results.length };
+  });
 }

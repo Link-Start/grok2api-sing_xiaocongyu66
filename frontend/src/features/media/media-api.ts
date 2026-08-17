@@ -125,3 +125,15 @@ export function uploadVideoInput(file: File): Promise<MediaInputDTO> {
   body.append("file", file, file.name);
   return apiRequest("/api/admin/v1/media/inputs/upload", { method: "POST", body }, decodeMediaInput);
 }
+
+export type MediaStorageInfoDTO = {
+  driver: string;
+  label: string;
+};
+
+export function getMediaStorageInfo(): Promise<MediaStorageInfoDTO> {
+  return apiRequest("/api/admin/v1/media/storage", {}, (raw: unknown) => {
+    const obj = raw as Record<string, unknown>;
+    return { driver: String(obj?.driver ?? "local"), label: String(obj?.label ?? "Local") } as MediaStorageInfoDTO;
+  });
+}

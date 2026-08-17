@@ -221,8 +221,11 @@ export function ProxiesPage() {
     onSettled: () => setTestingId(null),
     onSuccess: (result) => {
       invalidateAll();
-      if (result.ok) toast.success(t("proxies.testPassed", { name: result.name, ms: result.latencyMs }));
-      else toast.error(t("proxies.testFailed", { name: result.name, error: localizeProbeError(result.error || "failed", t) }));
+      const ok = result.status === "healthy";
+      const node = listQuery.data?.items.find((n) => n.id === testingId);
+      const name = node?.name ?? "node";
+      if (ok) toast.success(t("proxies.testPassed", { name, ms: result.latencyMs }));
+      else toast.error(t("proxies.testFailed", { name, error: localizeProbeError(result.error || "failed", t) }));
     },
     onError: (error) => showError(error, t("proxies.operationFailed")),
   });
