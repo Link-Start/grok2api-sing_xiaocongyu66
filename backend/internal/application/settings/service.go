@@ -543,7 +543,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		return config.Config{}, errors.New("audit.commitDelayMS 不能为负数")
 	}
 	next := current
-	next.Server.MaxConcurrentRequests = input.Server.MaxConcurrentRequests
+	if input.Server.MaxConcurrentRequests > 0 {
+		next.Server.MaxConcurrentRequests = input.Server.MaxConcurrentRequests
+	}
 	next.Provider.Build.BaseURL = strings.TrimSpace(input.ProviderBuild.BaseURL)
 	next.Provider.Build.FallbackBaseURL = config.NormalizeBuildFallbackBaseURL(input.ProviderBuild.FallbackBaseURL)
 	next.Provider.Build.ClientVersion = strings.TrimSpace(input.ProviderBuild.ClientVersion)
@@ -572,6 +574,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
 		SyncConcurrency: input.Batch.SyncConcurrency, RefreshConcurrency: input.Batch.RefreshConcurrency,
+		DBBuffer: config.DBBufferConfig{Enabled: input.Batch.DBBuffer.Enabled, Driver: input.Batch.DBBuffer.Driver, Path: input.Batch.DBBuffer.Path},
 	}
 	next.Media.MaxImageBytes = input.Media.MaxImageBytes
 	next.Media.MaxTotalBytes = input.Media.MaxTotalBytes
@@ -589,6 +592,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	}
 	if input.Routing.MarkBuildChatDeniedAsReauthProvided {
 		next.Routing.MarkBuildChatDeniedAsReauth = input.Routing.MarkBuildChatDeniedAsReauth
+	}
+	next.Routing.PromptCacheAffinity.Enabled = input.Routing.PromptCacheAffinity.Enabled
+	next.Routing.PromptCacheAffinity.Fingerprint = input.Routing.PromptCacheAffinity.Fingerprint
+	next.Routing.PromptCacheAffinity.Expire = input.Routing.PromptCacheAffinity.Expire
+	if strings.TrimSpace(input.Routing.PromptCacheAffinity.TTL) != "" {
+		next.Routing.PromptCacheAffinity.TTL = config.Duration(parseDurationOrKeep(input.Routing.PromptCacheAffinity.TTL, next.Routing.PromptCacheAffinity.TTL))
 	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -765,4 +774,12 @@ func normalizeForbiddenCodes(values []string) []string {
 		result = append(result, code)
 	}
 	return result
+}
+
+func parseDurationOrKeep(s string, fallback config.Duration) time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil {
+		return time.Duration(fallback)
+	}
+	return d
 }
