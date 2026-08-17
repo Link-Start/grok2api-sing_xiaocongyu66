@@ -109,6 +109,31 @@ type AccountSummary struct {
 	ReauthRequired int64
 }
 
+// WebPoolSummary is the basic / super / heavy account distribution for Grok Web.
+type WebPoolSummary struct {
+	Basic WebPoolBucket
+	Super WebPoolBucket
+	Heavy WebPoolBucket
+	Auto  WebPoolBucket
+}
+
+// WebPoolBucket counts accounts in one Web tier pool.
+type WebPoolBucket struct {
+	Total     int64
+	Available int64
+}
+
+// ConsoleQuotaSummary is the local console free-model quota rotation snapshot.
+type ConsoleQuotaSummary struct {
+	Total      int64
+	Available  int64
+	Healthy    int64
+	Rotating   int64
+	Exhausted  int64
+	Remaining  int64
+	Capacity   int64
+}
+
 type ModelListFilter struct {
 	Provider    string
 	Providers   []string

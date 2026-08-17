@@ -34,7 +34,7 @@ func TestMergeEditableEmptyPromptCacheTTLKeepsCurrent(t *testing.T) {
 	cfg := testConfig(t)
 	service := NewService(cfg, time.Time{}, 0, &runtimeSettingsRepositoryStub{}, nil, nil)
 	input := service.Get().Config
-	input.Routing.PromptCacheAffinity.TTL = 0
+	input.Routing.PromptCacheAffinity.TTL = ""
 	next, err := mergeEditable(cfg, input)
 	if err != nil {
 		t.Fatalf("mergeEditable empty ttl: %v", err)

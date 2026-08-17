@@ -445,6 +445,57 @@ func maxBatchConcurrency(value config.BatchConfig) int {
 	return max(value.ImportConcurrency, value.ConversionConcurrency, value.SyncConcurrency, value.RefreshConcurrency)
 }
 
+func warnBatchVsPostgres(logger *slog.Logger, cfg config.Config) {
+	if logger == nil || cfg.Database.Driver != "postgres" {
+		return
+	}
+	maxOpen := cfg.Database.Postgres.MaxOpenConns
+	if maxOpen < 1 {
+		return
+	}
+	peak := maxBatchConcurrency(cfg.Batch)
+	if peak <= maxOpen/2 {
+		return
+	}
+	logger.Warn("batch_concurrency_high_vs_postgres",
+		"max_open_conns", maxOpen,
+		"peak_batch", peak,
+		"import", cfg.Batch.ImportConcurrency,
+		"conversion", cfg.Batch.ConversionConcurrency,
+		"sync", cfg.Batch.SyncConcurrency,
+		"refresh", cfg.Batch.RefreshConcurrency,
+		"hint", "if you see SQLSTATE 53300, lower batch concurrency or raise maxOpenConns",
+	)
+}
+
+func effectiveBatchConfig(cfg config.Config) config.BatchConfig {
+	out := cfg.Batch
+	if cfg.Database.Driver != "postgres" {
+		return out
+	}
+	maxOpen := cfg.Database.Postgres.MaxOpenConns
+	if maxOpen < 1 {
+		return out
+	}
+	budget := max(1, maxOpen/3)
+	clamp := func(v int) int {
+		if v < 1 {
+			return 1
+		}
+		if v > budget {
+			return budget
+		}
+		return v
+	}
+	out.ImportConcurrency = clamp(out.ImportConcurrency)
+	if out.ConversionConcurrency < 1 {
+		out.ConversionConcurrency = 1
+	}
+	out.SyncConcurrency = clamp(out.SyncConcurrency)
+	out.RefreshConcurrency = clamp(out.RefreshConcurrency)
+	return out
+}
+
 func webProviderConfig(cfg config.Config) webprovider.Config {
 	return webprovider.Config{
 		BaseURL: cfg.Provider.Web.BaseURL, QuotaTimeoutSeconds: int(cfg.Provider.Web.QuotaTimeout.Value().Seconds()),

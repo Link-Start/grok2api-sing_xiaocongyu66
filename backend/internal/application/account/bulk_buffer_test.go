@@ -191,6 +191,46 @@ func (r *bulkBufferRepoStub) ListQuotaRecoveryWindows(context.Context, int) ([]a
 func (r *bulkBufferRepoStub) ListStaleWebQuotaAccountIDs(context.Context, time.Time, int) ([]uint64, error) {
 	return nil, nil
 }
+func (r *bulkBufferRepoStub) CountAvailableAmong(context.Context, accountdomain.Provider, []uint64, time.Time) (int64, error) {
+	return 0, nil
+}
+func (r *bulkBufferRepoStub) CountCleanupWithLinked(context.Context, accountdomain.Provider, []string, time.Time, []accountdomain.Provider) (repository.CleanupPreview, error) {
+	return repository.CleanupPreview{}, nil
+}
+func (r *bulkBufferRepoStub) CountProviderAccountsByIDs(context.Context, accountdomain.Provider, []uint64) (int64, error) {
+	return 0, nil
+}
+func (r *bulkBufferRepoStub) DeleteAccountStatusBatchWithLinked(context.Context, accountdomain.Provider, string, time.Time, uint64, int, []accountdomain.Provider) (repository.LinkedDeleteOutcome, int, uint64, error) {
+	return repository.LinkedDeleteOutcome{}, 0, 0, nil
+}
+func (r *bulkBufferRepoStub) DeleteAutoCleanReauthCandidates(context.Context, time.Time, bool, []uint64) ([]uint64, error) {
+	return nil, nil
+}
+func (r *bulkBufferRepoStub) DeleteManyWithLinked(context.Context, accountdomain.Provider, []uint64, []accountdomain.Provider, bool) (repository.LinkedDeleteOutcome, error) {
+	return repository.LinkedDeleteOutcome{}, nil
+}
+func (r *bulkBufferRepoStub) GetCredentialMaterial(context.Context, uint64, accountdomain.Provider) (accountdomain.CredentialMaterial, error) {
+	return accountdomain.CredentialMaterial{}, repository.ErrNotFound
+}
+func (r *bulkBufferRepoStub) ListAutoCleanReauthCandidates(context.Context, time.Time, bool, uint64, int) ([]uint64, error) {
+	return nil, nil
+}
+func (r *bulkBufferRepoStub) ListEnabledCredentialRefreshAccountIDs(context.Context, accountdomain.Provider, bool) ([]uint64, error) {
+	return nil, nil
+}
+func (r *bulkBufferRepoStub) MarkWebBirthDateSet(context.Context, uint64, time.Time) error { return nil }
+func (r *bulkBufferRepoStub) MarkWebNSFWEnabled(context.Context, uint64, time.Time) error { return nil }
+func (r *bulkBufferRepoStub) MarkWebTermsAccepted(context.Context, uint64, int, time.Time) error { return nil }
+func (r *bulkBufferRepoStub) ResetProviderQuotaState(context.Context, accountdomain.Provider, bool) (int64, error) {
+	return 0, nil
+}
+func (r *bulkBufferRepoStub) ResetQuotaState(context.Context, accountdomain.Provider, []uint64) error { return nil }
+func (r *bulkBufferRepoStub) ResolveLinkedDeleteIDs(context.Context, accountdomain.Provider, []uint64, []accountdomain.Provider) (repository.LinkedDeleteResolution, error) {
+	return repository.LinkedDeleteResolution{}, nil
+}
+func (r *bulkBufferRepoStub) UpdateObservedModelIfNewer(context.Context, uint64, string, time.Time) (bool, error) {
+	return false, nil
+}
 
 func TestOpenBulkWorkingSetPrefetchesLinked(t *testing.T) {
 	repo := &bulkBufferRepoStub{byID: map[uint64]accountdomain.Credential{
