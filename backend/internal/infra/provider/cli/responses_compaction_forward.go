@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
@@ -64,14 +64,17 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 	}
 	upstreamRequest := request
 	upstreamRequest.Streaming = true
-	// Compaction sampling always hits /responses (not /responses/compact).
-	upstreamRequest.Path = "/responses"
 	primaryBase := a.primaryBaseURL()
-	base := a.apiBaseForOperation(ctx, request.Credential, request.Method, upstreamRequest.Path)
+	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, reqURL, err := a.doResponseRequest(ctx, upstreamRequest, accessToken, body, base)
+		stage := "compaction"
+		if attempt > 1 {
+			stage = "compaction_retry"
+		}
+		attemptCtx := infraegress.WithPhysicalCallStage(ctx, stage)
+		resp, reqURL, err := a.doResponseRequest(attemptCtx, upstreamRequest, accessToken, body, base)
 		if err != nil {
 			lastErr = err
 			if attempt < maxAttempts && waitGatewayCompactionRetry(ctx, retryDelay) {
@@ -80,28 +83,34 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 			return nil, err
 		}
 
-		if a.shouldProbeXAIInferenceFallback(ctx, request.Credential, request.Method, upstreamRequest.Path, resp.StatusCode) && strings.EqualFold(base, primaryBase) {
+		var recoveredPrimaryFailure *provider.DiagnosticResponse
+		if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
 			primaryBody, primaryTruncated, readErr := provider.ReadDiagnosticBody(resp.Body)
 			_ = resp.Body.Close()
 			if readErr != nil {
 				return nil, readErr
 			}
 			primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
-			fallbackBase := a.fallbackBaseURL()
-			if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
-				fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, upstreamRequest, accessToken, body, fallbackBase)
-				if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
-					cred := request.Credential
-					a.activateBuildAPIFallback(ctx, &cred)
-					resp, reqURL, base = fallbackResp, fallbackURL, fallbackBase
-				} else {
-					if fallbackErr == nil {
-						_ = fallbackResp.Body.Close()
+			if shouldSkipXAIFallback(primaryBody) {
+				resp = primaryResp
+			} else {
+				fallbackBase := a.fallbackBaseURL()
+				if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
+					fallbackCtx := infraegress.WithPhysicalCallStage(attemptCtx, "plane_fallback")
+					fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(fallbackCtx, upstreamRequest, accessToken, body, fallbackBase)
+					if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
+						recoveredPrimaryFailure = bufferedFailureDiagnostic(primaryResp, primaryBody, primaryTruncated)
+						a.activateBuildAPIFallback(ctx, &request.Credential)
+						resp, reqURL, base = fallbackResp, fallbackURL, fallbackBase
+					} else {
+						if fallbackErr == nil {
+							_ = fallbackResp.Body.Close()
+						}
+						resp = primaryResp
 					}
+				} else {
 					resp = primaryResp
 				}
-			} else {
-				resp = primaryResp
 			}
 		}
 
@@ -150,23 +159,13 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 		}
 
 		continuation := gatewayCompactionContinuation(sample.summary)
-		// Do NOT return type=compaction + encrypted_content blobs.
-		// Multi-account pools and gateway-emulated g2a_compact_v1 blobs cause Grok
-		// "Could not decode the compaction blob" when the CLI replays them later.
-		// Return a portable assistant message with the summary text only.
-		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, continuation, request.Model, request.Streaming)
+		blob, encodeErr := a.compaction.encode(request.PromptCacheKey, continuation)
+		if encodeErr != nil {
+			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 编码失败"), nil
+		}
+		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, blob, request.Model, request.Streaming)
 		if convertErr != nil {
 			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 响应编码失败"), nil
-		}
-		if a.compactRecall != nil {
-			if responseID := gatewayCompactResponseID(sample.response, converted); responseID != "" {
-				a.compactRecall.remember(responseID, request.PromptCacheKey, continuation)
-			}
-		}
-		if warnings == "" {
-			warnings = "remote_compaction_v2_text_only"
-		} else if !strings.Contains(warnings, "remote_compaction_v2_text_only") {
-			warnings = warnings + ",remote_compaction_v2_text_only"
 		}
 		headers := resp.Header.Clone()
 		headers.Del("Content-Encoding")
@@ -178,90 +177,11 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 		return &provider.Response{
 			StatusCode: resp.StatusCode, Status: resp.Status, Header: headers,
 			Body: io.NopCloser(bytes.NewReader(converted)), UpstreamURL: reqURL,
-			ModelCatalogChanged: modelCatalogChanged,
+			RecoveredPrimaryFailure: recoveredPrimaryFailure,
+			ModelCatalogChanged:     modelCatalogChanged,
 		}, nil
 	}
 	return nil, lastErr
-}
-
-func gatewayCompactResponseID(sample map[string]any, encoded []byte) string {
-	if sample != nil {
-		if id := strings.TrimSpace(stringField(sample, "id")); id != "" {
-			return id
-		}
-	}
-	// Fall back to parsing the encoded SSE/JSON we return to the client.
-	if id := strings.TrimSpace(extractResponseIDFromCompactionPayload(encoded)); id != "" {
-		return id
-	}
-	return ""
-}
-
-func extractResponseIDFromCompactionPayload(data []byte) string {
-	// Non-stream JSON body.
-	var payload map[string]any
-	if json.Unmarshal(data, &payload) == nil {
-		if id := strings.TrimSpace(stringField(payload, "id")); id != "" {
-			return id
-		}
-	}
-	// Stream: find "id":"resp_..." near response.completed.
-	text := string(data)
-	marker := `"id":"`
-	for _, part := range strings.Split(text, marker) {
-		if !strings.HasPrefix(part, "resp_") && !strings.HasPrefix(part, "cmp_") {
-			// still accept any quoted id after marker in completed events
-		}
-		end := strings.IndexByte(part, '"')
-		if end <= 0 {
-			continue
-		}
-		id := part[:end]
-		if strings.HasPrefix(id, "resp_") {
-			return id
-		}
-	}
-	return ""
-}
-
-// doResponseRequest posts a prepared Responses body to the given API base.
-func (a *Adapter) doResponseRequest(
-	ctx context.Context,
-	request provider.ResponseResourceRequest,
-	accessToken string,
-	body []byte,
-	base string,
-) (*http.Response, string, error) {
-	var bodyReader io.Reader
-	if len(body) > 0 {
-		bodyReader = bytes.NewReader(body)
-	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), request.Credential.ID)
-	url := a.urlWithBase(base, request.Path)
-	req, err := http.NewRequestWithContext(requestCtx, request.Method, url, bodyReader)
-	if err != nil {
-		return nil, "", err
-	}
-	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
-		return nil, "", err
-	}
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if request.Streaming {
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Accept-Encoding", "identity")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-	if request.IdempotencyID != "" {
-		req.Header.Set("Idempotency-Key", request.IdempotencyID)
-	}
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	return resp, url, nil
 }
 
 func parseGatewayCompactionStream(data []byte) (gatewayCompactionSample, error) {
@@ -394,34 +314,23 @@ func extractCompactionSummary(response map[string]any) string {
 	return strings.Join(parts, "\n")
 }
 
-// buildGatewayCompactionResponse returns a completed Responses payload whose
-// output is a plain assistant message (summary text), never type=compaction.
-// summaryText is the portable continuation the client should keep in history.
-func buildGatewayCompactionResponse(response map[string]any, summaryText, model string, streaming bool) ([]byte, string, error) {
+func buildGatewayCompactionResponse(response map[string]any, blob, model string, streaming bool) ([]byte, string, error) {
 	response = cloneJSONObject(response)
+	normalizeGatewayCompactionUsage(response)
 	responseID := strings.TrimSpace(stringField(response, "id"))
 	if responseID == "" {
 		responseID = "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
-	summaryText = strings.TrimSpace(summaryText)
-	if summaryText == "" {
-		summaryText = "Conversation context was compacted. Continue from the retained messages."
-	}
 	item := map[string]any{
-		"id":   "msg_" + strings.TrimPrefix(responseID, "resp_"),
-		"type": "message",
-		"role": "assistant",
-		"status": "completed",
-		"content": []any{
-			map[string]any{"type": "output_text", "text": summaryText},
-		},
+		"id":   "cmp_" + strings.TrimPrefix(responseID, "resp_"),
+		"type": "compaction", "encrypted_content": blob,
 	}
 	response["id"] = responseID
 	response["object"] = "response"
 	response["status"] = "completed"
 	response["model"] = model
 	response["output"] = []any{item}
-	response["output_text"] = summaryText
+	delete(response, "output_text")
 	if !streaming {
 		encoded, err := json.Marshal(response)
 		return encoded, "application/json", err
@@ -429,7 +338,6 @@ func buildGatewayCompactionResponse(response map[string]any, summaryText, model 
 	createdResponse := cloneJSONObject(response)
 	createdResponse["status"] = "in_progress"
 	createdResponse["output"] = []any{}
-	delete(createdResponse, "output_text")
 	inProgressResponse := cloneJSONObject(createdResponse)
 	events := []struct {
 		name string
@@ -438,10 +346,9 @@ func buildGatewayCompactionResponse(response map[string]any, summaryText, model 
 		{"response.created", map[string]any{"type": "response.created", "sequence_number": 0, "response": createdResponse}},
 		{"response.in_progress", map[string]any{"type": "response.in_progress", "sequence_number": 1, "response": inProgressResponse}},
 		{"response.output_item.added", map[string]any{"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": item}},
-		{"response.output_text.delta", map[string]any{"type": "response.output_text.delta", "sequence_number": 3, "output_index": 0, "content_index": 0, "delta": summaryText}},
-		{"response.output_text.done", map[string]any{"type": "response.output_text.done", "sequence_number": 4, "output_index": 0, "content_index": 0, "text": summaryText}},
-		{"response.output_item.done", map[string]any{"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": item}},
-		{"response.completed", map[string]any{"type": "response.completed", "sequence_number": 6, "response": response}},
+		{"keepalive", map[string]any{"type": "keepalive", "sequence_number": 3}},
+		{"response.output_item.done", map[string]any{"type": "response.output_item.done", "sequence_number": 4, "output_index": 0, "item": item}},
+		{"response.completed", map[string]any{"type": "response.completed", "sequence_number": 5, "response": response}},
 	}
 	var output bytes.Buffer
 	for _, event := range events {
@@ -454,14 +361,63 @@ func buildGatewayCompactionResponse(response map[string]any, summaryText, model 
 	return output.Bytes(), "text/event-stream", nil
 }
 
+// normalizeGatewayCompactionUsage keeps the synthetic response acceptable to
+// Codex even when Grok omits one of the required standard usage fields. If the
+// upstream omitted usage entirely, leave it absent rather than fabricating it.
+func normalizeGatewayCompactionUsage(response map[string]any) {
+	usage, ok := response["usage"].(map[string]any)
+	if !ok {
+		if response["usage"] == nil {
+			delete(response, "usage")
+		}
+		return
+	}
+	input := nonNegativeJSONInteger(usage["input_tokens"])
+	output := nonNegativeJSONInteger(usage["output_tokens"])
+	minimumTotal := int64(math.MaxInt64)
+	if input <= math.MaxInt64-output {
+		minimumTotal = input + output
+	}
+	usage["input_tokens"] = input
+	usage["output_tokens"] = output
+	if total, valid := nonNegativeJSONIntegerOK(usage["total_tokens"]); !valid || total < minimumTotal {
+		usage["total_tokens"] = minimumTotal
+	}
+}
+
+func nonNegativeJSONInteger(value any) int64 {
+	number, _ := nonNegativeJSONIntegerOK(value)
+	return number
+}
+
+func nonNegativeJSONIntegerOK(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if typed < 0 || typed != float64(int64(typed)) {
+			return 0, false
+		}
+		return int64(typed), true
+	case int64:
+		return max(int64(0), typed), typed >= 0
+	case int:
+		return int64(max(0, typed)), typed >= 0
+	default:
+		return 0, false
+	}
+}
+
 func gatewayCompactionHTTPFailure(resp *http.Response, reqURL string, modelCatalogChanged bool, warnings string) (*provider.Response, bool, error) {
 	body, truncated, err := provider.ReadDiagnosticBody(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, false, err
 	}
-	transient := gatewayCompactionStatusTransient(resp.StatusCode, string(body))
 	headers := resp.Header.Clone()
+	transient := gatewayCompactionStatusTransient(resp.StatusCode, string(body))
+	if strings.EqualFold(strings.TrimSpace(headers.Get("X-Should-Retry")), "false") {
+		transient = false
+	}
+	rateLimit := provider.RateLimitFromResponse(resp.StatusCode, headers, body)
 	headers.Set("Content-Length", strconv.Itoa(len(body)))
 	if warnings != "" {
 		headers.Set("X-Grok2API-Compatibility-Warnings", warnings)
@@ -473,7 +429,7 @@ func gatewayCompactionHTTPFailure(resp *http.Response, reqURL string, modelCatal
 	return &provider.Response{
 		StatusCode: resp.StatusCode, Status: resp.Status, Header: headers,
 		Body: io.NopCloser(bytes.NewReader(body)), UpstreamURL: reqURL,
-		Diagnostic: diagnostic, ModelCatalogChanged: modelCatalogChanged,
+		Diagnostic: diagnostic, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged,
 	}, transient, nil
 }
 

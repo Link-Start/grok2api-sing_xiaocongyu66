@@ -10,6 +10,7 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -17,12 +18,10 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// defaultModelSyncWorkers is the standalone model-sync pool for Build remote /models.
-// Keep well below Postgres maxOpen (HF free tiers ~20) so UpsertDiscovered is not
-// starved by SQLSTATE 53300 after thousands of concurrent ListModels calls.
-const defaultModelSyncWorkers = 8
+const defaultModelSyncWorkers = 25
 const syncFailurePersistTimeout = 5 * time.Second
-const staticCapabilityChunk = 500
+
+var maxModelBatchSize = repository.MaxPageSize * len(modeldomain.Capabilities())
 
 var (
 	ErrInvalidFilter = errors.New("模型筛选条件无效")
@@ -51,26 +50,29 @@ type AccountOption struct {
 	Name string
 }
 
-type ListFilter struct {
-	Provider string
-	Status   string
-	Sort     repository.SortQuery
+type RouteGroup struct {
+	Routes               []modeldomain.Route
+	EndpointCapabilities []string
 }
 
-// StaticCatalogSeeder re-applies built-in Web/Console model_routes (ReplaceProviderRoutes).
-// Wired from app bootstrap so model package does not import web/console providers.
-type StaticCatalogSeeder func(ctx context.Context) (int, error)
+type ListFilter struct {
+	Provider    string
+	Providers   []string
+	Tiers       []string
+	Status      string
+	ActiveScope bool
+	Sort        repository.SortQuery
+}
 
 // Service 负责上游模型发现、内部来源路由与对外模型名称维护。
 type Service struct {
-	models              repository.ModelRepository
-	accounts            repository.AccountRepository
-	account             *accountapp.Service
-	providers           *provider.Registry
-	bulkPool            *batch.Pool
-	logger              *slog.Logger
-	syncAll             singleflight.Group
-	staticCatalogSeeder StaticCatalogSeeder
+	models    repository.ModelRepository
+	accounts  repository.AccountRepository
+	account   *accountapp.Service
+	providers *provider.Registry
+	bulkPool  *batch.Pool
+	logger    *slog.Logger
+	syncAll   singleflight.Group
 }
 
 func NewService(models repository.ModelRepository, accounts repository.AccountRepository, accountService *accountapp.Service, providers *provider.Registry) *Service {
@@ -89,14 +91,20 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 	}
 }
 
-// SetStaticCatalogSeeder installs the Web/Console catalog reseed hook used by admin「同步模型」.
-func (s *Service) SetStaticCatalogSeeder(seeder StaticCatalogSeeder) {
-	if s != nil {
-		s.staticCatalogSeeder = seeder
+func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]modeldomain.Route, int64, error) {
+	page, pageSize = normalizePage(page, pageSize)
+	if !validProviderFilter(filter.Provider) || !validProviderFilters(filter.Providers) || !validTierFilters(filter.Tiers) || !validModelFilter(filter.Status, "", "enabled", "disabled") || !repository.IsValidSort(filter.Sort, "publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt") {
+		return nil, 0, ErrInvalidFilter
 	}
+	var enabled *bool
+	if filter.Status != "" {
+		value := filter.Status == "enabled"
+		enabled = &value
+	}
+	return s.models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}, Filter: repository.ModelListFilter{Provider: filter.Provider, Providers: filter.Providers, Tiers: filter.Tiers, Enabled: enabled, ActiveScope: filter.ActiveScope}})
 }
 
-func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]modeldomain.Route, int64, error) {
+func (s *Service) ListGroups(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]RouteGroup, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
 	if !validProviderFilter(filter.Provider) || !validModelFilter(filter.Status, "", "enabled", "disabled") || !repository.IsValidSort(filter.Sort, "publicId", "upstreamModel", "status", "provider", "accountSupport", "lastSyncedAt") {
 		return nil, 0, ErrInvalidFilter
@@ -106,11 +114,87 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Status == "enabled"
 		enabled = &value
 	}
-	return s.models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}, Filter: repository.ModelListFilter{Provider: filter.Provider, Enabled: enabled}})
+	values, total, err := s.models.ListGroups(ctx, repository.ModelListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+		Filter: repository.ModelListFilter{Provider: filter.Provider, Enabled: enabled},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	groups := make([]RouteGroup, 0, len(values))
+	for _, value := range values {
+		groups = append(groups, RouteGroup{Routes: value.Routes, EndpointCapabilities: s.endpointCapabilities(value.Routes)})
+	}
+	return groups, total, nil
+}
+
+func (s *Service) endpointCapabilities(routes []modeldomain.Route) []string {
+	if len(routes) == 0 || s.providers == nil {
+		return nil
+	}
+	definition, ok := s.providers.Definition(routes[0].Provider)
+	if !ok {
+		return nil
+	}
+	return endpointCapabilitiesForDefinition(routes, definition)
+}
+
+func endpointCapabilitiesForDefinition(routes []modeldomain.Route, definition provider.Definition) []string {
+	available := make(map[string]bool, 6)
+	for _, route := range routes {
+		switch route.Capability {
+		case modeldomain.CapabilityResponses, modeldomain.CapabilityChat:
+			available["completions"] = definition.Conversation.ChatCompletions
+			available["responses"] = definition.Conversation.Responses
+			available["messages"] = definition.Conversation.Messages
+		case modeldomain.CapabilityImage:
+			available["image"] = definition.Media.ImageGeneration
+		case modeldomain.CapabilityImageEdit:
+			available["image_edit"] = definition.Media.ImageEdit
+		case modeldomain.CapabilityVideo:
+			available["video"] = definition.Media.VideoGeneration
+		}
+	}
+	order := []string{"completions", "responses", "messages", "image", "image_edit", "video"}
+	result := make([]string, 0, len(order))
+	for _, capability := range order {
+		if available[capability] {
+			result = append(result, capability)
+		}
+	}
+	return result
 }
 
 func validProviderFilter(value string) bool {
 	return value == "" || account.Provider(value).IsValid()
+}
+
+func validProviderFilters(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !account.Provider(value).IsValid() {
+			return false
+		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
+}
+
+func validTierFilters(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "free" && value != "super" {
+			return false
+		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
 }
 
 func validModelFilter(value string, allowed ...string) bool {
@@ -126,141 +210,23 @@ func (s *Service) ListEnabled(ctx context.Context) ([]modeldomain.Route, error) 
 	return s.models.ListEnabled(ctx)
 }
 
-func (s *Service) ListConfiguredEnabled(ctx context.Context) ([]modeldomain.Route, error) {
-	return s.models.ListConfiguredEnabled(ctx)
-}
-
-// ListPublicModels builds GET /v1/models like jiujiu532: pre-registered client IDs.
-// - enabled model_routes (Build discovered + Web/Console built-in catalog rows)
-// - effort aliases whose target upstream is currently enabled in model_routes
-//   (e.g. multi-agent-xhigh only while multi-agent-0309 stays enabled)
-// Account availability is checked at request time, not at list time.
-func (s *Service) ListPublicModels(ctx context.Context) ([]modeldomain.Route, []string, error) {
-	values, err := s.models.ListConfiguredEnabled(ctx)
-	if err != nil {
-		return nil, nil, err
+func (s *Service) ListEnabledForClientKey(ctx context.Context, key clientkeydomain.Key) ([]modeldomain.Route, error) {
+	scope, valid := clientkeydomain.NormalizeAccountScope(clientkeydomain.AccountScope{Providers: key.ProviderScope, Tiers: key.TierScope})
+	if !valid {
+		return nil, ErrInvalidFilter
 	}
-	return values, s.aliasesForRoutes(ctx, values), nil
-}
-
-// aliasesForRoutes returns client alias IDs for /v1/models.
-// Effort shortcuts may be real model_routes rows (own id for key ACL):
-//   - if the alias public id is already an enabled route, include it (deduped by list)
-//   - if a dedicated route exists but is disabled, do NOT re-surface via registry
-//   - legacy virtual aliases (no dedicated row) still appear when upstream is enabled
-func (s *Service) aliasesForRoutes(ctx context.Context, routes []modeldomain.Route) []string {
-	if s == nil || s.providers == nil {
-		return nil
+	if !scope.IsRestricted() {
+		return s.models.ListEnabled(ctx)
 	}
-	present := make(map[string]struct{}, len(routes)*2)
-	enabledAlias := make(map[string]struct{}, len(routes))
-	for _, route := range routes {
-		if !route.Enabled {
-			continue
-		}
-		upstream := strings.TrimSpace(route.UpstreamModel)
-		if upstream != "" {
-			present[string(route.Provider)+"\x00"+upstream] = struct{}{}
-		}
-		if ext := modeldomain.ExternalPublicID(route.Provider, route.PublicID); ext != "" {
-			present["ext\x00"+ext] = struct{}{}
-			enabledAlias[ext] = struct{}{}
-		}
+	providers := scope.Providers.Values()
+	if len(providers) == 1 && providers[0] == "all" {
+		providers = nil
 	}
-	aliases := s.providers.ListModelAliases()
-	if len(aliases) == 0 {
-		return nil
+	tiers := scope.Tiers.Values()
+	if len(tiers) == 1 && tiers[0] == "all" {
+		tiers = nil
 	}
-	out := make([]string, 0, len(aliases))
-	for _, alias := range aliases {
-		name := strings.TrimSpace(alias.Alias)
-		if name == "" {
-			continue
-		}
-		if _, ok := enabledAlias[name]; ok {
-			out = append(out, name)
-			continue
-		}
-		// Dedicated effort row exists but is disabled (or missing from enabled list):
-		// do not resurrect it just because the base upstream is still enabled.
-		if s.models != nil {
-			if dedicated, err := s.models.GetByPublicIDIncludingDisabled(ctx, name); err == nil {
-				_ = dedicated
-				continue
-			}
-		}
-		upstream := strings.TrimSpace(alias.UpstreamModel)
-		key := string(alias.Provider) + "\x00" + upstream
-		if _, ok := present[key]; !ok {
-			if _, ok := present["ext\x00"+modeldomain.ExternalPublicID(alias.Provider, alias.PublicModel)]; !ok {
-				continue
-			}
-		}
-		out = append(out, name)
-	}
-	return out
-}
-
-// ListPublicAliases returns all registered alias names (unfiltered). Prefer aliasesForRoutes
-// for /v1/models so the response tracks the live model list.
-func (s *Service) ListPublicAliases() []string {
-	if s == nil || s.providers == nil {
-		return nil
-	}
-	aliases := s.providers.ListModelAliases()
-	if len(aliases) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(aliases))
-	for _, alias := range aliases {
-		name := strings.TrimSpace(alias.Alias)
-		if name == "" {
-			continue
-		}
-		out = append(out, name)
-	}
-	return out
-}
-
-// ListPublicAliasRoutes returns synthetic admin rows for aliases whose upstream is in the
-// enabled model list (same source as /v1/models). Search filters the alias name.
-func (s *Service) ListPublicAliasRoutes(ctx context.Context, search string) []modeldomain.Route {
-	if s == nil || s.providers == nil || s.models == nil {
-		return nil
-	}
-	routes, err := s.models.ListConfiguredEnabled(ctx)
-	if err != nil {
-		return nil
-	}
-	allowed := make(map[string]struct{}, len(routes))
-	for _, name := range s.aliasesForRoutes(ctx, routes) {
-		allowed[name] = struct{}{}
-	}
-	if len(allowed) == 0 {
-		return nil
-	}
-	search = strings.ToLower(strings.TrimSpace(search))
-	now := time.Now().UTC()
-	out := make([]modeldomain.Route, 0, len(allowed))
-	for _, alias := range s.providers.ListModelAliases() {
-		name := strings.TrimSpace(alias.Alias)
-		if name == "" {
-			continue
-		}
-		if _, ok := allowed[name]; !ok {
-			continue
-		}
-		if search != "" && !strings.Contains(strings.ToLower(name), search) {
-			continue
-		}
-		out = append(out, modeldomain.Route{
-			PublicID: name, Provider: alias.Provider, UpstreamModel: alias.UpstreamModel,
-			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog,
-			Enabled: true, SupportedAccounts: 1, SyncedAccounts: 1, TotalAccounts: 1,
-			CreatedAt: now, UpdatedAt: now,
-		})
-	}
-	return out
+	return s.models.ListEnabledForScope(ctx, repository.ModelListFilter{Providers: providers, Tiers: tiers})
 }
 
 func (s *Service) Get(ctx context.Context, id uint64) (modeldomain.Route, error) {
@@ -276,16 +242,8 @@ func (s *Service) GetByPublicIDCandidates(ctx context.Context, publicID string) 
 	return s.models.GetByPublicIDCandidates(ctx, publicID)
 }
 
-func (s *Service) GetConfiguredPublicIDCandidates(ctx context.Context, publicID string) ([]modeldomain.Route, error) {
-	return s.models.GetConfiguredPublicIDCandidates(ctx, publicID)
-}
-
 func (s *Service) GetByProviderUpstream(ctx context.Context, providerValue account.Provider, upstreamModel string) (modeldomain.Route, error) {
 	return s.models.GetByProviderUpstream(ctx, providerValue, upstreamModel)
-}
-
-func (s *Service) GetConfiguredByProviderUpstream(ctx context.Context, providerValue account.Provider, upstreamModel string) (modeldomain.Route, error) {
-	return s.models.GetConfiguredByProviderUpstream(ctx, providerValue, upstreamModel)
 }
 
 func (s *Service) Create(ctx context.Context, input CreateInput) (modeldomain.Route, error) {
@@ -351,7 +309,7 @@ func (s *Service) Delete(ctx context.Context, id uint64) error {
 }
 
 func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -430,7 +388,7 @@ func (s *Service) validateBoundAccounts(ctx context.Context, providerValue accou
 
 // BatchSetEnabled 批量更新模型路由启停状态。
 func (s *Service) BatchSetEnabled(ctx context.Context, ids []uint64, enabled bool) (int64, error) {
-	values, err := normalizeBatchIDs(ids)
+	values, err := normalizeModelRouteBatchIDs(ids)
 	if err != nil {
 		return 0, err
 	}
@@ -462,21 +420,6 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 	if len(providerValues) == 0 {
 		return 0, fmt.Errorf("没有已注册的 Provider")
 	}
-
-	startedAt := time.Now()
-	// Always reseed built-in Web/Console routes first. Admin「同步模型」used to only
-	// refresh account capability rows + Build discovery, so Console multi-agent etc.
-	// never reappeared if missing from model_routes (and the UI only allows adding Build).
-	catalogRoutes := 0
-	if s.staticCatalogSeeder != nil {
-		n, err := s.staticCatalogSeeder(ctx)
-		if err != nil {
-			return 0, err
-		}
-		catalogRoutes = n
-		s.logger.Info("model_static_catalog_reseeded", "routes", catalogRoutes)
-	}
-
 	credentials := make([]account.Credential, 0)
 	for _, providerValue := range providerValues {
 		values, err := s.accounts.ListEnabled(ctx, providerValue)
@@ -486,102 +429,53 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 		credentials = append(credentials, values...)
 	}
 	if len(credentials) == 0 {
-		// No accounts: still succeed if static catalogs were written (Console/Web routes).
-		if catalogRoutes > 0 {
-			s.logger.Info("model_bulk_sync_completed",
-				"total", 0, "static", 0, "remote", 0, "catalog_routes", catalogRoutes,
-				"succeeded", 0, "duration_ms", time.Since(startedAt).Milliseconds(),
-			)
-			return catalogRoutes, nil
-		}
 		return 0, fmt.Errorf("没有可用于模型同步的账号")
 	}
-
-	// Split static catalogs (Web/Console: in-process model list) from remote
-	// discovery (Build: HTTP /models). Static path is bulk SQL; remote stays pooled.
-	staticCreds := make([]account.Credential, 0, len(credentials))
-	remoteCreds := make([]account.Credential, 0)
-	for _, value := range credentials {
-		if s.staticModelCatalog(value.Provider) {
-			staticCreds = append(staticCreds, value)
-		} else {
-			remoteCreds = append(remoteCreds, value)
+	results, summary, runErr := batch.Map(ctx, credentials, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
+		adapter, ok := s.providers.Models(value.Provider)
+		if !ok {
+			return nil, fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
 		}
+		return s.syncAccountCapabilities(workCtx, value, adapter)
+	})
+	pool := s.bulkPool.Snapshot()
+	s.logger.Info("model_bulk_sync_completed", "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", pool.Limit, "pool_active", pool.Active, "pool_queued", pool.Queued, "pool_peak", pool.Peak, "error", runErr)
+	if runErr != nil {
+		return 0, runErr
 	}
 
 	uniqueModels := make(map[account.Provider]map[string]struct{}, len(providerValues))
-	addModels := func(providerValue account.Provider, models []string) {
-		// Always collect models for UpsertDiscovered. When the static seeder already
-		// wrote catalog routes, UpsertDiscovered is a no-op for those upstream IDs.
-		// When seeder is unset (tests) or only partial, this still creates routes.
-		providerModels := uniqueModels[providerValue]
+	succeeded := 0
+	var lastErr error
+	for index, result := range results {
+		if result.Err != nil {
+			var panicErr *batch.PanicError
+			if errors.As(result.Err, &panicErr) {
+				s.logger.Error("model_sync_panicked", "account_id", credentials[index].ID, "error", panicErr, "stack", string(panicErr.Stack))
+			}
+			lastErr = result.Err
+			continue
+		}
+		succeeded++
+		providerModels := uniqueModels[credentials[index].Provider]
 		if providerModels == nil {
 			providerModels = make(map[string]struct{})
-			uniqueModels[providerValue] = providerModels
+			uniqueModels[credentials[index].Provider] = providerModels
 		}
-		for _, value := range models {
+		for _, value := range result.Value {
 			value = strings.TrimSpace(value)
 			if value != "" {
 				providerModels[value] = struct{}{}
 			}
 		}
 	}
-
-	succeeded := 0
-	var lastErr error
-
-	staticOK, staticErr := s.syncStaticCatalogAccounts(ctx, staticCreds, addModels)
-	succeeded += staticOK
-	if staticErr != nil {
-		lastErr = staticErr
-		s.logger.Warn("model_static_bulk_sync_failed", "accounts", len(staticCreds), "succeeded", staticOK, "error", staticErr)
-	}
-
-	if len(remoteCreds) > 0 {
-		results, summary, runErr := batch.Map(ctx, remoteCreds, batch.Options{Workers: s.bulkPool.Limit(), Pool: s.bulkPool}, func(workCtx context.Context, value account.Credential) ([]string, error) {
-			adapter, ok := s.providers.Models(value.Provider)
-			if !ok {
-				return nil, fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
-			}
-			return s.syncAccountCapabilities(workCtx, value, adapter)
-		})
-		pool := s.bulkPool.Snapshot()
-		s.logger.Info("model_remote_bulk_sync_completed",
-			"total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded,
-			"failed", summary.Failed, "panicked", summary.Panicked,
-			"duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled,
-			"pool_limit", pool.Limit, "pool_peak", pool.Peak, "error", runErr,
-		)
-		if runErr != nil && lastErr == nil {
-			lastErr = runErr
-		}
-		for index, result := range results {
-			if result.Err != nil {
-				var panicErr *batch.PanicError
-				if errors.As(result.Err, &panicErr) {
-					s.logger.Error("model_sync_panicked", "account_id", remoteCreds[index].ID, "error", panicErr, "stack", string(panicErr.Stack))
-				}
-				lastErr = result.Err
-				continue
-			}
-			succeeded++
-			addModels(remoteCreds[index].Provider, result.Value)
-		}
-	}
-
-	s.logger.Info("model_bulk_sync_completed",
-		"total", len(credentials), "static", len(staticCreds), "remote", len(remoteCreds),
-		"catalog_routes", catalogRoutes, "succeeded", succeeded,
-		"duration_ms", time.Since(startedAt).Milliseconds(),
-		"pool_limit", s.bulkPool.Limit(), "error", lastErr,
-	)
-	if succeeded == 0 && catalogRoutes == 0 {
+	if succeeded == 0 {
 		if lastErr != nil {
 			return 0, lastErr
 		}
 		return 0, fmt.Errorf("没有账号成功同步模型")
 	}
-	syncedModels := catalogRoutes
+	syncedModels := 0
 	for _, providerValue := range providerValues {
 		providerModels := uniqueModels[providerValue]
 		if len(providerModels) == 0 {
@@ -596,74 +490,7 @@ func (s *Service) syncAllAccounts(ctx context.Context) (int, error) {
 		}
 		syncedModels += len(models)
 	}
-	// Prefer returning discovered model count; partial static/remote errors already logged.
-	if lastErr != nil && syncedModels == 0 {
-		return 0, lastErr
-	}
 	return syncedModels, nil
-}
-
-func (s *Service) staticModelCatalog(providerValue account.Provider) bool {
-	if s.providers == nil {
-		return false
-	}
-	definition, ok := s.providers.Definition(providerValue)
-	return ok && definition.ModelCatalog == provider.ModelCatalogStatic
-}
-
-// syncStaticCatalogAccounts writes Web/Console capability rows in bulk (no upstream HTTP).
-// Models still depend on account fields (e.g. Web tier) so each account is resolved once
-// in-process, then flushed in large SQL chunks.
-func (s *Service) syncStaticCatalogAccounts(ctx context.Context, credentials []account.Credential, addModels func(account.Provider, []string)) (int, error) {
-	if len(credentials) == 0 {
-		return 0, nil
-	}
-	startedAt := time.Now()
-	syncedAt := time.Now().UTC()
-	items := make([]repository.AccountCapabilitySync, 0, len(credentials))
-	var lastErr error
-	for _, value := range credentials {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		adapter, ok := s.providers.Models(value.Provider)
-		if !ok {
-			lastErr = fmt.Errorf("Provider %s 未注册模型同步能力", value.Provider)
-			continue
-		}
-		// Static ListModels never needs EnsureCredential / token refresh.
-		models, err := adapter.ListModels(ctx, value)
-		if err != nil {
-			s.markCapabilitySyncFailed(value.ID, syncedAt, err)
-			lastErr = err
-			continue
-		}
-		models = normalizeDiscoveredModels(models)
-		items = append(items, repository.AccountCapabilitySync{
-			AccountID: value.ID, UpstreamModels: models, SyncedAt: syncedAt,
-		})
-		addModels(value.Provider, models)
-	}
-	if len(items) == 0 {
-		return 0, lastErr
-	}
-	// Flush in chunks so a canceled request still keeps progress already written.
-	for start := 0; start < len(items); start += staticCapabilityChunk {
-		if err := ctx.Err(); err != nil {
-			s.logger.Info("model_static_bulk_sync_partial",
-				"written", start, "total", len(items), "duration_ms", time.Since(startedAt).Milliseconds(), "error", err,
-			)
-			return start, err
-		}
-		end := min(start+staticCapabilityChunk, len(items))
-		if err := s.models.ReplaceAccountCapabilitiesMany(ctx, items[start:end]); err != nil {
-			return start, err
-		}
-	}
-	s.logger.Info("model_static_bulk_sync_completed",
-		"accounts", len(items), "duration_ms", time.Since(startedAt).Milliseconds(),
-	)
-	return len(items), lastErr
 }
 
 // HasSuccessfulAccountSync 判断账号是否已有成功模型能力快照，不触发上游请求。
@@ -726,6 +553,18 @@ func (s *Service) syncAccountCapabilities(ctx context.Context, value account.Cre
 		return nil, err
 	}
 	models := normalizeDiscoveredModels(values)
+	if normalizer, ok := adapter.(provider.AccountModelCapabilityNormalizer); ok {
+		var billing *account.Billing
+		snapshot, billingErr := s.accounts.GetBilling(ctx, credential.ID)
+		if billingErr == nil {
+			billing = &snapshot
+		} else if !errors.Is(billingErr, repository.ErrNotFound) {
+			// Billing 不存在按 Unknown 处理；其他仓储错误保留失败语义。
+			s.markCapabilitySyncFailed(credential.ID, attemptedAt, billingErr)
+			return nil, billingErr
+		}
+		models = normalizeDiscoveredModels(normalizer.NormalizeAccountModelCapabilities(models, billing, credential))
+	}
 	if err := s.models.ReplaceAccountCapabilities(ctx, credential.ID, models, attemptedAt); err != nil {
 		s.markCapabilitySyncFailed(credential.ID, attemptedAt, err)
 		return nil, err
@@ -758,24 +597,23 @@ func (s *Service) markCapabilitySyncFailed(accountID uint64, attemptedAt time.Ti
 }
 
 func normalizePage(page, pageSize int) (int, int) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
-	return page, pageSize
+	return repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 }
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, repository.MaxPageSize, "模型")
+}
+
+func normalizeModelRouteBatchIDs(ids []uint64) ([]uint64, error) {
+	return normalizeIDs(ids, maxModelBatchSize, "模型能力路由")
+}
+
+func normalizeIDs(ids []uint64, limit int, label string) ([]uint64, error) {
 	if len(ids) == 0 {
 		return nil, invalidInput("至少选择一个模型")
 	}
-	if len(ids) > 500 {
-		return nil, invalidInput("单次最多处理 500 个模型")
+	if len(ids) > limit {
+		return nil, invalidInput(fmt.Sprintf("单次最多处理 %d 条%s", limit, label))
 	}
 	seen := make(map[uint64]struct{}, len(ids))
 	result := make([]uint64, 0, len(ids))

@@ -20,7 +20,7 @@ const (
 
 // Generated from xai-org/grok-build's full_replace_summary_prompt.txt using
 // build_summary_prompt(None), so the optional {user_context_section} slot is
-// empty. The local Grok 0.2.103 probe confirmed that this text is appended as
+// empty. The Grok Build source confirms that this text is appended as
 // the final user item for every compaction attempt.
 //
 //go:embed responses_compaction_prompt.txt
@@ -83,12 +83,8 @@ func (c *gatewayCompactionCodec) decode(session, blob string) (string, bool, err
 }
 
 // expandGatewayCompactionHistory restores gateway-owned remote-v2 state to a
-// portable developer message. Foreign OpenAI/Claude/Gemini/native-Grok blobs
-// are never forwarded to Grok Build: its decoder rejects account-scoped or
-// modified compact state with "Could not decode the compaction blob".
-//
-// Session mismatch or corrupt g2a blobs degrade to a boundary message instead
-// of hard-failing the request (prompt_cache_key rotation / multi-account pools).
+// portable developer message. Foreign OpenAI/Claude/Gemini blobs are never
+// forwarded to Grok Build: its decoder cannot decrypt those provider states.
 func expandGatewayCompactionHistory(body []byte, codec *gatewayCompactionCodec, session string) ([]byte, int, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -102,22 +98,23 @@ func expandGatewayCompactionHistory(body []byte, codec *gatewayCompactionCodec, 
 	changed := false
 	for index, raw := range items {
 		item, ok := raw.(map[string]any)
-		if !ok {
+		if !ok || stringField(item, "type") != "compaction" {
 			continue
 		}
-		if !isCompactionInputItem(item) {
-			continue
-		}
-		blob := compactionBlobString(item)
-		summary, owned, err := decodeGatewayCompactionBlob(codec, session, blob)
-		if err != nil || !owned {
-			// Corrupt/mismatched g2a or any non-gateway blob: never forward upstream.
+		blob, _ := item["encrypted_content"].(string)
+		summary, owned, err := codec.decode(session, blob)
+		if err != nil {
 			foreign++
-			items[index] = foreignCompactionBoundaryMessage()
+			items[index] = compatibilityBoundaryMessage("A prior compacted context could not be decoded by this gateway instance. Continue from the retained conversation messages.")
 			changed = true
 			continue
 		}
-		items[index] = gatewayCompactionSummaryMessage(summary)
+		if owned {
+			items[index] = gatewayCompactionSummaryMessage(summary)
+		} else {
+			foreign++
+			items[index] = compatibilityBoundaryMessage("A compacted context created by another provider cannot be decoded by Grok Build. Continue from the retained conversation messages.")
+		}
 		changed = true
 	}
 	if !changed {
@@ -128,155 +125,9 @@ func expandGatewayCompactionHistory(body []byte, codec *gatewayCompactionCodec, 
 	return encoded, foreign, err
 }
 
-func decodeGatewayCompactionBlob(codec *gatewayCompactionCodec, session, blob string) (summary string, owned bool, err error) {
-	if codec == nil {
-		if strings.HasPrefix(blob, gatewayCompactionPrefix) {
-			return "", true, fmt.Errorf("compaction codec unavailable")
-		}
-		return "", false, nil
-	}
-	return codec.decode(session, blob)
-}
-
-func isCompactionInputItem(item map[string]any) bool {
-	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
-	return typ == "compaction"
-}
-
-func compactionBlobString(item map[string]any) string {
-	switch v := item["encrypted_content"].(type) {
-	case string:
-		return v
-	case json.Number:
-		return v.String()
-	case float64:
-		// JSON numbers should not appear; stringify defensively.
-		return fmt.Sprintf("%v", v)
-	default:
-		if v == nil {
-			return ""
-		}
-		// Nested objects/arrays cannot be valid Grok compact state for us.
-		if data, err := json.Marshal(v); err == nil {
-			return string(data)
-		}
-		return ""
-	}
-}
-
-func foreignCompactionBoundaryMessage() map[string]any {
-	return compatibilityBoundaryMessage("A compacted context from another account or provider cannot be decoded by Grok Build. Continue from the retained conversation messages (start a new session if this blocks progress).")
-}
-
-// scrubUpstreamCompactionBlobs is a last-mile guard: after all normalizations,
-// ensure no type=compaction object remains anywhere in the outbound JSON tree.
-// Grok Build rejects modified/account-scoped compact state with:
-// "Could not decode the compaction blob".
-func scrubUpstreamCompactionBlobs(body []byte) ([]byte, int) {
-	if len(body) == 0 {
-		return body, 0
-	}
-	var payload any
-	if json.Unmarshal(body, &payload) != nil {
-		return body, 0
-	}
-	cleaned, removed := scrubCompactionValue(payload)
-	if removed == 0 {
-		return body, 0
-	}
-	encoded, err := json.Marshal(cleaned)
-	if err != nil {
-		return body, 0
-	}
-	return encoded, removed
-}
-
-// scrubCompactionValue walks maps/arrays and replaces every compaction object
-// with a portable boundary message (including nested content parts).
-func scrubCompactionValue(value any) (any, int) {
-	switch typed := value.(type) {
-	case map[string]any:
-		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
-			return foreignCompactionBoundaryMessage(), 1
-		}
-		removed := 0
-		for key, nested := range typed {
-			// CamelCase variants some clients echo from SDKs.
-			if strings.EqualFold(key, "encrypted_content") || strings.EqualFold(key, "encryptedContent") {
-				if _, isCompaction := typed["type"]; isCompaction && isCompactionInputItem(typed) {
-					return foreignCompactionBoundaryMessage(), 1
-				}
-			}
-			next, n := scrubCompactionValue(nested)
-			if n > 0 {
-				typed[key] = next
-				removed += n
-			}
-		}
-		// Re-check after children: type may only be visible after nested cleanup.
-		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
-			return foreignCompactionBoundaryMessage(), removed + 1
-		}
-		return typed, removed
-	case []any:
-		removed := 0
-		for index, nested := range typed {
-			next, n := scrubCompactionValue(nested)
-			if n > 0 {
-				typed[index] = next
-				removed += n
-			}
-		}
-		return typed, removed
-	default:
-		return value, 0
-	}
-}
-
-// looksLikeCompactionObject catches compact state objects that omit/alias type
-// but still carry a compact encrypted payload Grok would try to decode.
-func looksLikeCompactionObject(item map[string]any) bool {
-	if isCompactionInputItem(item) {
-		return true
-	}
-	blob := compactionBlobString(item)
-	if blob == "" {
-		// Also accept camelCase field.
-		if v, ok := item["encryptedContent"].(string); ok {
-			blob = v
-		}
-	}
-	if blob == "" {
-		return false
-	}
-	if strings.HasPrefix(blob, gatewayCompactionPrefix) {
-		return true
-	}
-	// Native Grok compact blobs are long opaque strings; if the object only has
-	// id + encrypted_content (and optional status), treat as compact state.
-	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
-	if typ != "" && typ != "compaction" {
-		return false
-	}
-	if len(blob) < 64 {
-		return false
-	}
-	// Count non-meta keys.
-	meta := 0
-	for key := range item {
-		switch strings.ToLower(key) {
-		case "type", "id", "encrypted_content", "encryptedcontent", "status":
-			meta++
-		default:
-			return false
-		}
-	}
-	return meta >= 1 && (item["encrypted_content"] != nil || item["encryptedContent"] != nil)
-}
-
-// prepareGatewayCompactionSample mirrors Grok Build 0.2.103 full-replace
-// sampling: normal /responses SSE, instructions=null, tools retained but
-// disabled, concise reasoning summary, and the canonical final user prompt.
+// prepareGatewayCompactionSample mirrors Grok Build full-replace
+// sampling: normal /responses SSE, instructions=null, tools retained with
+// tool_choice=auto, concise reasoning summary, and the canonical final user prompt.
 func prepareGatewayCompactionSample(body []byte) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -295,7 +146,8 @@ func prepareGatewayCompactionSample(body []byte) ([]byte, error) {
 	payload["store"] = false
 	payload["temperature"] = 1.0
 	if tools, ok := payload["tools"].([]any); ok && len(tools) > 0 {
-		payload["tool_choice"] = "none"
+		// 0.2.105 起默认使用 auto；部分部署会拒绝 tools + tool_choice=none。
+		payload["tool_choice"] = "auto"
 	} else {
 		delete(payload, "tool_choice")
 	}
@@ -393,4 +245,124 @@ func gatewayCompactionSummaryMessage(text string) map[string]any {
 		"type": "message", "role": "user",
 		"content": []any{map[string]any{"type": "input_text", "text": text}},
 	}
+}
+
+func isCompactionInputItem(item map[string]any) bool {
+	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
+	return typ == "compaction"
+}
+
+func compactionBlobString(item map[string]any) string {
+	switch v := item["encrypted_content"].(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return fmt.Sprintf("%v", v)
+	default:
+		if v == nil {
+			return ""
+		}
+		if data, err := json.Marshal(v); err == nil {
+			return string(data)
+		}
+		return ""
+	}
+}
+
+func foreignCompactionBoundaryMessage() map[string]any {
+	return compatibilityBoundaryMessage("A compacted context from another account or provider cannot be decoded by Grok Build. Continue from the retained conversation messages (start a new session if this blocks progress).")
+}
+
+func scrubUpstreamCompactionBlobs(body []byte) ([]byte, int) {
+	if len(body) == 0 {
+		return body, 0
+	}
+	var payload any
+	if json.Unmarshal(body, &payload) != nil {
+		return body, 0
+	}
+	cleaned, removed := scrubCompactionValue(payload)
+	if removed == 0 {
+		return body, 0
+	}
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return body, 0
+	}
+	return encoded, removed
+}
+
+func scrubCompactionValue(value any) (any, int) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), 1
+		}
+		removed := 0
+		for key, nested := range typed {
+			if strings.EqualFold(key, "encrypted_content") || strings.EqualFold(key, "encryptedContent") {
+				if _, isCompaction := typed["type"]; isCompaction && isCompactionInputItem(typed) {
+					return foreignCompactionBoundaryMessage(), 1
+				}
+			}
+			next, n := scrubCompactionValue(nested)
+			if n > 0 {
+				typed[key] = next
+				removed += n
+			}
+		}
+		if isCompactionInputItem(typed) || looksLikeCompactionObject(typed) {
+			return foreignCompactionBoundaryMessage(), removed + 1
+		}
+		return typed, removed
+	case []any:
+		removed := 0
+		for index, nested := range typed {
+			next, n := scrubCompactionValue(nested)
+			if n > 0 {
+				typed[index] = next
+				removed += n
+			}
+		}
+		return typed, removed
+	default:
+		return value, 0
+	}
+}
+
+func looksLikeCompactionObject(item map[string]any) bool {
+	if isCompactionInputItem(item) {
+		return true
+	}
+	blob := compactionBlobString(item)
+	if blob == "" {
+		if v, ok := item["encryptedContent"].(string); ok {
+			blob = v
+		}
+	}
+	if blob == "" {
+		return false
+	}
+	if strings.HasPrefix(blob, gatewayCompactionPrefix) {
+		return true
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringField(item, "type")))
+	if typ != "" && typ != "compaction" {
+		return false
+	}
+	if len(blob) < 64 {
+		return false
+	}
+	meta := 0
+	for key := range item {
+		switch strings.ToLower(key) {
+		case "type", "id", "encrypted_content", "encryptedcontent", "status":
+			meta++
+		default:
+			return false
+		}
+	}
+	return meta >= 1 && (item["encrypted_content"] != nil || item["encryptedContent"] != nil)
 }

@@ -13,11 +13,7 @@ import (
 )
 
 var (
-	resetDurationPattern           = regexp.MustCompile(`(?i)(\d+)\s*([dhms])`)
-	consoleRateLimitUsagePattern   = regexp.MustCompile(`(?i)\bRequests?\s+per\s+(Second|Minute)\s*\(\s*actual\s*/\s*limit\s*\)\s*:\s*(\d+)\s*/\s*(\d+)`)
-	consoleRateLimitTeamPattern    = regexp.MustCompile(`(?i)\bteam\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b`)
-	consoleRateLimitModelPattern   = regexp.MustCompile(`(?i)\bmodel\s+["']?([A-Za-z0-9][A-Za-z0-9._:/-]*)`)
-	consoleRateLimitModelTrimChars = ".,;"
+	resetDurationPattern = regexp.MustCompile(`(?i)(\d+)\s*([dhms])`)
 )
 
 func normalizeRequest(body []byte, spec ModelSpec) ([]byte, error) {
@@ -26,9 +22,8 @@ func normalizeRequest(body []byte, spec ModelSpec) ([]byte, error) {
 		return nil, fmt.Errorf("解析 Console Responses 请求: %w", err)
 	}
 	payload["model"] = spec.UpstreamModel
-	// Console is stateless.  Match the reference adapter's compatibility
-	// boundary: replay the supplied input and silently discard stateful client
-	// hints instead of rejecting an otherwise valid request.
+	// Console is stateless. Replay the supplied input and silently discard
+	// stateful client hints instead of rejecting an otherwise valid request.
 	payload["store"] = false
 	for _, field := range []string{
 		"metadata", "previous_response_id", "service_tier", "prompt_cache_key",
@@ -44,9 +39,6 @@ func normalizeRequest(body []byte, spec ModelSpec) ([]byte, error) {
 	normalizeReasoning(payload, spec)
 	ensureReasoningInclude(payload)
 	retainedClientTools := normalizeConsoleTools(payload)
-	if spec.SearchTools {
-		mergeSearchTools(payload)
-	}
 	normalizeConsoleToolChoice(payload, retainedClientTools)
 	return json.Marshal(payload)
 }
@@ -146,7 +138,20 @@ func normalizeReasoning(payload map[string]any, spec ModelSpec) {
 	}
 	reasoning, _ := payload["reasoning"].(map[string]any)
 	if reasoning == nil {
+		if spec.DefaultReasoningEffort == "" {
+			delete(payload, "reasoning")
+			return
+		}
 		reasoning = make(map[string]any)
+	}
+	if !spec.SupportsReasoningEffort {
+		delete(reasoning, "effort")
+		if len(reasoning) == 0 {
+			delete(payload, "reasoning")
+		} else {
+			payload["reasoning"] = reasoning
+		}
+		return
 	}
 	effort, _ := reasoning["effort"].(string)
 	effort = normalizeEffort(effort)
@@ -200,6 +205,8 @@ func ensureReasoningInclude(payload map[string]any) {
 func normalizeConsoleTools(payload map[string]any) bool {
 	value, exists := payload["tools"]
 	if !exists || value == nil {
+		delete(payload, "tools")
+		delete(payload, "tool_choice")
 		return false
 	}
 	tools, ok := value.([]any)
@@ -252,40 +259,18 @@ func normalizeConsoleTools(payload map[string]any) bool {
 	}
 	if len(result) == 0 {
 		delete(payload, "tools")
+		delete(payload, "tool_choice")
 		return false
 	}
 	payload["tools"] = result
 	return retainedClientTools
 }
 
-func mergeSearchTools(payload map[string]any) {
-	defaults := []any{
-		map[string]any{"type": "web_search", "enable_image_understanding": true},
-		map[string]any{"type": "x_search", "enable_video_understanding": true},
-	}
-	positions := map[string]int{"web_search": 0, "x_search": 1}
-	result := append([]any(nil), defaults...)
-	if value, exists := payload["tools"]; exists && value != nil {
-		tools, _ := value.([]any)
-		for _, tool := range tools {
-			identity := toolIdentity(tool)
-			if index, exists := positions[identity]; identity != "" && exists {
-				result[index] = tool
-				continue
-			}
-			if identity != "" {
-				positions[identity] = len(result)
-			}
-			result = append(result, tool)
-		}
-	}
-	payload["tools"] = result
-	if _, exists := payload["tool_choice"]; !exists {
-		payload["tool_choice"] = "auto"
-	}
-}
-
 func normalizeConsoleToolChoice(payload map[string]any, retainedClientTools bool) {
+	if _, exists := payload["tools"]; !exists {
+		delete(payload, "tool_choice")
+		return
+	}
 	choice, exists := payload["tool_choice"]
 	if !exists {
 		payload["tool_choice"] = "auto"
@@ -376,94 +361,5 @@ func parseConsoleRetryAfterHeader(value string, now time.Time) time.Duration {
 }
 
 func parseConsoleRateLimitMetadata(body []byte) *provider.RateLimitMetadata {
-	for _, text := range consoleRateLimitTexts(body) {
-		metadata := parseConsoleRateLimitText(text)
-		if metadata != nil {
-			return metadata
-		}
-	}
-	return nil
-}
-
-func consoleRateLimitTexts(body []byte) []string {
-	texts := []string{string(body)}
-	var value any
-	if err := json.Unmarshal(body, &value); err != nil {
-		return texts
-	}
-	collectConsoleRateLimitTexts(value, &texts)
-	return texts
-}
-
-func collectConsoleRateLimitTexts(value any, texts *[]string) {
-	switch typed := value.(type) {
-	case map[string]any:
-		if message, ok := typed["message"].(string); ok {
-			appendConsoleRateLimitText(message, texts)
-		}
-		for _, nested := range typed {
-			collectConsoleRateLimitTexts(nested, texts)
-		}
-	case []any:
-		for _, nested := range typed {
-			collectConsoleRateLimitTexts(nested, texts)
-		}
-	case string:
-		appendConsoleRateLimitText(typed, texts)
-	}
-}
-
-func appendConsoleRateLimitText(text string, texts *[]string) {
-	if strings.TrimSpace(text) == "" {
-		return
-	}
-	*texts = append(*texts, text)
-}
-
-func parseConsoleRateLimitText(text string) *provider.RateLimitMetadata {
-	match := consoleRateLimitUsagePattern.FindStringSubmatch(text)
-	if match == nil {
-		return nil
-	}
-	actual, actualErr := strconv.Atoi(match[2])
-	limit, limitErr := strconv.Atoi(match[3])
-	if actualErr != nil || limitErr != nil {
-		return nil
-	}
-	scope := provider.RateLimitScopeRPM
-	retryAfter := time.Minute
-	if strings.EqualFold(match[1], "second") {
-		scope = provider.RateLimitScopeRPS
-		retryAfter = 2 * time.Second
-	}
-	if parsed := consoleRetryAfter([]byte(text)); parsed > 0 {
-		retryAfter = parsed
-		if scope == provider.RateLimitScopeRPS && retryAfter < 2*time.Second {
-			retryAfter = 2 * time.Second
-		}
-	}
-	return &provider.RateLimitMetadata{
-		Scope:      scope,
-		TeamID:     consoleRateLimitTeamID(text),
-		Model:      consoleRateLimitModel(text),
-		Actual:     actual,
-		Limit:      limit,
-		RetryAfter: retryAfter,
-	}
-}
-
-func consoleRateLimitTeamID(text string) string {
-	match := consoleRateLimitTeamPattern.FindStringSubmatch(text)
-	if match == nil {
-		return ""
-	}
-	return match[1]
-}
-
-func consoleRateLimitModel(text string) string {
-	match := consoleRateLimitModelPattern.FindStringSubmatch(text)
-	if match == nil {
-		return ""
-	}
-	return strings.TrimRight(match[1], consoleRateLimitModelTrimChars)
+	return provider.ParseRateLimitMetadata(body)
 }

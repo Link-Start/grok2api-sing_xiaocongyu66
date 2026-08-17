@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"log/slog"
 	"net/http"
 	"sync"
 
@@ -36,22 +35,9 @@ func (g *ConcurrencyGate) UpdateLimit(limit int) {
 // Middleware 返回绑定当前 Gate 状态的 Gin 中间件。
 func (g *ConcurrencyGate) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Allowlisted constants only — never sink FullPath / raw Method (CodeQL log-injection).
-		route := classifiedRoute(c)
-		method := c.Request.Method
-		switch method {
-		case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
-		default:
-			method = "OTHER"
-		}
 		g.mu.Lock()
 		if g.active >= g.limit {
-			active, limit := g.active, g.limit
 			g.mu.Unlock()
-			slog.Warn("inference_concurrency_gate_full",
-				"active", active, "limit", limit, "route", route, "method", method,
-				"hint", "raise server.maxConcurrentRequests or reduce parallel clients",
-			)
 			c.Header("Retry-After", "1")
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{
 				"code": "server_overloaded", "message": "服务并发已达到上限，请稍后重试", "param": nil, "type": "server_error",
@@ -59,11 +45,7 @@ func (g *ConcurrencyGate) Middleware() gin.HandlerFunc {
 			return
 		}
 		g.active++
-		active, limit := g.active, g.limit
 		g.mu.Unlock()
-		if active == 1 || active == limit || active%8 == 0 {
-			slog.Info("inference_concurrency_gate", "active", active, "limit", limit, "route", route, "method", method)
-		}
 		defer func() {
 			g.mu.Lock()
 			g.active--

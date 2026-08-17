@@ -14,8 +14,8 @@ func TestMergeEditablePreservesServerConcurrencyWhenOmitted(t *testing.T) {
 	input.Server = ServerConfig{}
 	// Common HF form values that previously failed with enabled+none buffer.
 	input.Batch.DBBuffer = DBBufferConfig{Enabled: true, Driver: "none", Path: ""}
-	if input.PromptCacheAffinity.TTL == "" {
-		input.PromptCacheAffinity.TTL = "24h"
+	if input.Routing.PromptCacheAffinity.TTL == "" {
+		input.Routing.PromptCacheAffinity.TTL = "24h"
 	}
 
 	next, err := mergeEditable(cfg, input)
@@ -34,7 +34,7 @@ func TestMergeEditableEmptyPromptCacheTTLKeepsCurrent(t *testing.T) {
 	cfg := testConfig(t)
 	service := NewService(cfg, time.Time{}, 0, &runtimeSettingsRepositoryStub{}, nil, nil)
 	input := service.Get().Config
-	input.PromptCacheAffinity.TTL = ""
+	input.Routing.PromptCacheAffinity.TTL = ""
 	next, err := mergeEditable(cfg, input)
 	if err != nil {
 		t.Fatalf("mergeEditable empty ttl: %v", err)

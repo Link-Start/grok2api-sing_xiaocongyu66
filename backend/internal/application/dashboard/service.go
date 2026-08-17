@@ -7,14 +7,12 @@ import (
 	"time"
 
 	dashboarddomain "github.com/chenyme/grok2api/backend/internal/domain/dashboard"
-	"github.com/chenyme/grok2api/backend/internal/infra/runtime/connections"
 	"github.com/chenyme/grok2api/backend/internal/pkg/resultcache"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 var ErrInvalidPeriod = errors.New("Dashboard 时间范围无效")
 var ErrInvalidTimezone = errors.New("Dashboard 时区无效")
-var ErrInvalidRange = errors.New("Dashboard 自定义时间范围无效")
 
 const dashboardCacheTTL = 15 * time.Second
 
@@ -25,7 +23,6 @@ const (
 	Period7Days   Period = "7d"
 	Period30Days  Period = "30d"
 	Period90Days  Period = "90d"
-	PeriodCustom  Period = "custom"
 )
 
 type Range struct {
@@ -43,13 +40,12 @@ type SeriesPoint struct {
 	ReasoningTokens    int64
 	Tokens             int64
 	BilledCostUSDTicks int64
-	Models             []ModelBucket
 }
 
-type ModelBucket struct {
-	Model              string
-	Tokens             int64
-	BilledCostUSDTicks int64
+type ActivityPoint struct {
+	Start    time.Time
+	End      time.Time
+	Requests int64
 }
 
 type ModelUsage struct {
@@ -63,59 +59,40 @@ type ModelUsage struct {
 	BilledCostUSDTicks int64
 }
 
-type ClientUsage struct {
-	Client string
-	Label  string
-	Count  int64
-}
-
 type Result struct {
 	Period      Period
 	GeneratedAt time.Time
 	Range       Range
 	Resources   dashboarddomain.Resources
 	Usage       dashboarddomain.Usage
-	SuccessRate float64
-	LiveRates   dashboarddomain.LiveRates
-	Today       dashboarddomain.DayUsage
 	Series      []SeriesPoint
+	Activity    []ActivityPoint
 	TopModels   []ModelUsage
-	Clients     []ClientUsage
-	// Connections is always live (not cached with period aggregates).
-	Connections dashboarddomain.Connections
+	Providers   []dashboarddomain.ProviderUsage
 }
 
 // Service 负责 Dashboard 时间范围校验和固定时间桶编排。
 type Service struct {
-	dashboard   repository.DashboardRepository
-	connections connections.Tracker
-	now         func() time.Time
-	cache       *resultcache.Cache[string, Result]
+	dashboard repository.DashboardRepository
+	now       func() time.Time
+	cache     *resultcache.Cache[string, Result]
 }
 
 func NewService(dashboard repository.DashboardRepository) *Service {
 	return &Service{dashboard: dashboard, now: time.Now, cache: resultcache.New[string, Result](32, dashboardCacheTTL)}
 }
 
-// SetConnectionsTracker attaches live /v1 concurrency stats for the dashboard.
-func (s *Service) SetConnectionsTracker(tracker connections.Tracker) {
-	if s != nil {
-		s.connections = tracker
-	}
-}
-
 // Get 返回指定时间范围的 Dashboard 聚合快照。
-// customStart/customEnd are RFC3339 timestamps used when period=custom.
-func (s *Service) Get(ctx context.Context, rawPeriod, rawTimezone, customStart, customEnd string) (Result, error) {
-	return s.get(ctx, rawPeriod, rawTimezone, customStart, customEnd, true)
+func (s *Service) Get(ctx context.Context, rawPeriod, rawTimezone string) (Result, error) {
+	return s.get(ctx, rawPeriod, rawTimezone, true)
 }
 
 // Refresh 绕过短缓存，供管理员显式刷新时读取最新聚合数据。
-func (s *Service) Refresh(ctx context.Context, rawPeriod, rawTimezone, customStart, customEnd string) (Result, error) {
-	return s.get(ctx, rawPeriod, rawTimezone, customStart, customEnd, false)
+func (s *Service) Refresh(ctx context.Context, rawPeriod, rawTimezone string) (Result, error) {
+	return s.get(ctx, rawPeriod, rawTimezone, false)
 }
 
-func (s *Service) get(ctx context.Context, rawPeriod, rawTimezone, customStart, customEnd string, useCache bool) (Result, error) {
+func (s *Service) get(ctx context.Context, rawPeriod, rawTimezone string, useCache bool) (Result, error) {
 	period, bucketCount, bucketDays, err := parsePeriod(rawPeriod)
 	if err != nil {
 		return Result{}, err
@@ -125,72 +102,34 @@ func (s *Service) get(ctx context.Context, rawPeriod, rawTimezone, customStart, 
 		return Result{}, err
 	}
 	rawNow := s.now()
-	var customRange *Range
-	if period == PeriodCustom {
-		r, rangeErr := parseCustomRange(customStart, customEnd, location, rawNow)
-		if rangeErr != nil {
-			return Result{}, rangeErr
-		}
-		customRange = &r
-	}
-	var result Result
 	if !useCache {
-		result, err = s.load(ctx, period, bucketCount, bucketDays, location, rawNow, customRange)
-	} else {
-		cacheKey := string(period) + "\x00" + location.String()
-		if customRange != nil {
-			cacheKey += "\x00" + customRange.Start.UTC().Format(time.RFC3339) + "\x00" + customRange.End.UTC().Format(time.RFC3339)
-		}
-		result, err = s.cache.Load(ctx, cacheKey, rawNow, func() (Result, error) {
-			return s.load(ctx, period, bucketCount, bucketDays, location, rawNow, customRange)
-		})
+		return s.load(ctx, period, bucketCount, bucketDays, location, rawNow)
 	}
-	if err != nil {
-		return Result{}, err
-	}
-	// Live concurrency is never cached with period aggregates.
-	result.Connections = s.liveConnections(ctx)
-	return result, nil
+	cacheKey := string(period) + "\x00" + location.String()
+	return s.cache.Load(ctx, cacheKey, rawNow, func() (Result, error) {
+		return s.load(ctx, period, bucketCount, bucketDays, location, rawNow)
+	})
 }
 
-func (s *Service) liveConnections(ctx context.Context) dashboarddomain.Connections {
-	if s.connections == nil {
-		return dashboarddomain.Connections{}
-	}
-	stats := s.connections.Snapshot(ctx)
-	clients := make([]dashboarddomain.ClientUsage, 0, len(stats.Clients))
-	for _, item := range stats.Clients {
-		clients = append(clients, dashboarddomain.ClientUsage{
-			Client: item.Client, Label: item.Label, Count: item.Active,
-		})
-	}
-	return dashboarddomain.Connections{
-		Active: stats.Active, Peak: stats.Peak, Total: stats.Total, Clients: clients,
-	}
-}
-
-func (s *Service) load(ctx context.Context, period Period, bucketCount, bucketDays int, location *time.Location, rawNow time.Time, custom *Range) (Result, error) {
+func (s *Service) load(ctx context.Context, period Period, bucketCount, bucketDays int, location *time.Location, rawNow time.Time) (Result, error) {
 	now := rawNow.In(location)
-	var series []SeriesPoint
-	if period == PeriodCustom && custom != nil {
-		series = buildCustomSeries(custom.Start.In(location), custom.End.In(location))
-	} else {
-		series = buildSeries(now, period, bucketCount, bucketDays)
-	}
-	if len(series) == 0 {
-		return Result{}, ErrInvalidPeriod
-	}
-	boundaries := make([]time.Time, 0, len(series)+1)
+	series := buildSeries(now, period, bucketCount, bucketDays)
+	boundaries := make([]time.Time, 0, len(series))
 	for _, point := range series {
 		boundaries = append(boundaries, point.Start)
 	}
 	boundaries = append(boundaries, series[len(series)-1].End)
+	activity := buildActivitySeries(now)
+	activityBoundaries := make([]time.Time, 0, len(activity)+1)
+	for _, point := range activity {
+		activityBoundaries = append(activityBoundaries, point.Start)
+	}
+	activityBoundaries = append(activityBoundaries, activity[len(activity)-1].End)
 	generatedAt := rawNow.UTC()
-	// Period totals + RPM/TPM share the same [boundaries[0], boundaries[last]) window.
-	// todayStart/todayEnd and liveWindow are retained for repository interface compatibility.
-	periodStart := boundaries[0]
-	periodEnd := boundaries[len(boundaries)-1]
-	aggregate, err := s.dashboard.Snapshot(ctx, boundaries, generatedAt, periodStart, periodEnd, periodEnd.Sub(periodStart))
+	aggregate, err := s.dashboard.Snapshot(ctx, repository.DashboardSnapshotWindow{
+		BucketBoundaries:   boundaries,
+		ActivityBoundaries: activityBoundaries,
+	}, generatedAt)
 	if err != nil {
 		return Result{}, err
 	}
@@ -206,30 +145,26 @@ func (s *Service) load(ctx context.Context, period Period, bucketCount, bucketDa
 		series[bucket.Index].Tokens = bucket.Tokens
 		series[bucket.Index].BilledCostUSDTicks = bucket.BilledCostUSDTicks
 	}
-	for _, bucket := range aggregate.ModelBuckets {
-		if bucket.Index < 0 || bucket.Index >= len(series) {
+	for _, bucket := range aggregate.ActivityBuckets {
+		if bucket.Index < 0 || bucket.Index >= len(activity) {
 			continue
 		}
-		series[bucket.Index].Models = append(series[bucket.Index].Models, ModelBucket{Model: bucket.Model, Tokens: bucket.Tokens, BilledCostUSDTicks: bucket.BilledCostUSDTicks})
-	}
-	successRate := 0.0
-	if aggregate.Usage.Requests > 0 {
-		successRate = float64(aggregate.Usage.SuccessfulRequests) / float64(aggregate.Usage.Requests) * 100
+		activity[bucket.Index].Requests = bucket.Requests
 	}
 	topModels := make([]ModelUsage, 0, len(aggregate.TopModels))
 	for _, item := range aggregate.TopModels {
 		topModels = append(topModels, ModelUsage{Model: item.Model, Requests: item.Requests, InputTokens: item.InputTokens, CachedInputTokens: item.CachedInputTokens, OutputTokens: item.OutputTokens, ReasoningTokens: item.ReasoningTokens, Tokens: item.Tokens, BilledCostUSDTicks: item.BilledCostUSDTicks})
 	}
-	clients := make([]ClientUsage, 0, len(aggregate.Clients))
-	for _, item := range aggregate.Clients {
-		clients = append(clients, ClientUsage{Client: item.Client, Label: item.Label, Count: item.Count})
-	}
 	return Result{
-		Period: period, GeneratedAt: generatedAt,
-		Range:     Range{Start: boundaries[0], End: boundaries[len(boundaries)-1]},
-		Resources: aggregate.Resources, Usage: aggregate.Usage, SuccessRate: successRate,
-		LiveRates: aggregate.LiveRates, Today: aggregate.Today,
-		Series: series, TopModels: topModels, Clients: clients,
+		Period:      period,
+		GeneratedAt: generatedAt,
+		Range:       Range{Start: boundaries[0], End: boundaries[len(boundaries)-1]},
+		Resources:   aggregate.Resources,
+		Usage:       aggregate.Usage,
+		Series:      series,
+		Activity:    activity,
+		TopModels:   topModels,
+		Providers:   aggregate.Providers,
 	}, nil
 }
 
@@ -260,60 +195,10 @@ func parsePeriod(value string) (Period, int, int, error) {
 	case Period30Days:
 		return Period30Days, 30, 1, nil
 	case Period90Days:
-		return Period90Days, 6, 15, nil
-	case PeriodCustom:
-		return PeriodCustom, 0, 0, nil
+		return Period90Days, 13, 7, nil
 	default:
 		return "", 0, 0, ErrInvalidPeriod
 	}
-}
-
-// parseCustomRange accepts RFC3339 (or date-only YYYY-MM-DD) in [2009-01-01, 2030-12-31].
-func parseCustomRange(rawStart, rawEnd string, location *time.Location, now time.Time) (Range, error) {
-	start, err := parseFlexibleTime(rawStart, location, false)
-	if err != nil {
-		return Range{}, ErrInvalidRange
-	}
-	end, err := parseFlexibleTime(rawEnd, location, true)
-	if err != nil {
-		return Range{}, ErrInvalidRange
-	}
-	if !end.After(start) {
-		return Range{}, ErrInvalidRange
-	}
-	// Guardrails: allow historical from 2009 and through end of 2030 (exclusive end may be 2031-01-01).
-	minStart := time.Date(2009, 1, 1, 0, 0, 0, 0, location)
-	maxEnd := time.Date(2031, 1, 1, 0, 0, 0, 0, location)
-	if start.Before(minStart) || end.After(maxEnd) {
-		return Range{}, ErrInvalidRange
-	}
-	// Cap span to the full allowed window (2009–2030 inclusive, leap years).
-	if end.Sub(start) > 23*365*24*time.Hour {
-		return Range{}, ErrInvalidRange
-	}
-	_ = now
-	return Range{Start: start.UTC(), End: end.UTC()}, nil
-}
-
-func parseFlexibleTime(raw string, location *time.Location, endOfDay bool) (time.Time, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return time.Time{}, ErrInvalidRange
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t.In(location), nil
-	}
-	if t, err := time.ParseInLocation("2006-01-02T15:04:05", raw, location); err == nil {
-		return t, nil
-	}
-	if t, err := time.ParseInLocation("2006-01-02", raw, location); err == nil {
-		if endOfDay {
-			// Exclusive end: next day 00:00 so full calendar day is included.
-			return t.AddDate(0, 0, 1), nil
-		}
-		return t, nil
-	}
-	return time.Time{}, ErrInvalidRange
 }
 
 func alignedRange(now time.Time, period Period) (time.Time, time.Time) {
@@ -334,7 +219,7 @@ func alignedRange(now time.Time, period Period) (time.Time, time.Time) {
 }
 
 func buildSeries(now time.Time, period Period, bucketCount, bucketDays int) []SeriesPoint {
-	start, _ := alignedRange(now, period)
+	start, end := alignedRange(now, period)
 	series := make([]SeriesPoint, bucketCount)
 	for index := range series {
 		bucketStart := start.AddDate(0, 0, index*bucketDays)
@@ -343,66 +228,22 @@ func buildSeries(now time.Time, period Period, bucketCount, bucketDays int) []Se
 			bucketStart = start.Add(time.Duration(index) * time.Hour)
 			bucketEnd = bucketStart.Add(time.Hour)
 		}
+		if bucketEnd.After(end) {
+			bucketEnd = end
+		}
 		series[index] = SeriesPoint{Start: bucketStart.UTC(), End: bucketEnd.UTC()}
 	}
 	return series
 }
 
-// buildCustomSeries picks a bucket size so charts stay under ~120 points
-// while always covering the full [start, end) range (usage totals stay correct).
-func buildCustomSeries(start, end time.Time) []SeriesPoint {
-	if !end.After(start) {
-		return nil
-	}
-	const maxBuckets = 120
-	duration := end.Sub(start)
-	var step time.Duration
-	switch {
-	case duration <= 48*time.Hour:
-		step = time.Hour
-	case duration <= 90*24*time.Hour:
-		step = 24 * time.Hour
-	case duration <= 3*365*24*time.Hour:
-		step = 7 * 24 * time.Hour
-	case duration <= 10*365*24*time.Hour:
-		step = 30 * 24 * time.Hour
-	default:
-		step = 90 * 24 * time.Hour
-	}
-	// Ensure we never exceed maxBuckets by widening the step if needed.
-	if step > 0 {
-		needed := int(duration/step) + 1
-		if needed > maxBuckets {
-			step = duration / time.Duration(maxBuckets-1)
-			if step < time.Hour {
-				step = time.Hour
-			}
-		}
-	}
-	series := make([]SeriesPoint, 0, maxBuckets)
-	cursor := start
-	for cursor.Before(end) {
-		next := cursor.Add(step)
-		if next.After(end) || len(series) == maxBuckets-1 {
-			next = end
-		}
-		if !next.After(cursor) {
-			break
-		}
-		series = append(series, SeriesPoint{Start: cursor.UTC(), End: next.UTC()})
-		cursor = next
-		if len(series) >= maxBuckets {
-			break
-		}
-	}
-	// Safety: if loop stopped early, force a final bucket to the real end.
-	if len(series) > 0 && series[len(series)-1].End.Before(end.UTC()) {
-		last := &series[len(series)-1]
-		if len(series) < maxBuckets {
-			series = append(series, SeriesPoint{Start: last.End, End: end.UTC()})
-		} else {
-			last.End = end.UTC()
-		}
+func buildActivitySeries(now time.Time) []ActivityPoint {
+	location := now.Location()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	start := today.AddDate(0, 0, -179)
+	series := make([]ActivityPoint, 180)
+	for index := range series {
+		dayStart := start.AddDate(0, 0, index)
+		series[index] = ActivityPoint{Start: dayStart.UTC(), End: dayStart.AddDate(0, 0, 1).UTC()}
 	}
 	return series
 }

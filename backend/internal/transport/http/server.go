@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	_ "github.com/chenyme/grok2api/backend/docs"
@@ -28,8 +27,6 @@ import (
 	egresshttp "github.com/chenyme/grok2api/backend/internal/transport/http/egress"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/inference"
 	mediahttp "github.com/chenyme/grok2api/backend/internal/transport/http/media"
-	"github.com/chenyme/grok2api/backend/internal/infra/runtime/connections"
-	"github.com/chenyme/grok2api/backend/internal/pkg/promptcache"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	modelhttp "github.com/chenyme/grok2api/backend/internal/transport/http/model"
 	settingshttp "github.com/chenyme/grok2api/backend/internal/transport/http/settings"
@@ -40,41 +37,34 @@ import (
 )
 
 type Dependencies struct {
-	Logger              *slog.Logger
-	RequestTimeout      time.Duration
-	MaxBodyBytes        int64
-	ConcurrencyGate     *middleware.ConcurrencyGate
-	PromptCacheAffinity *promptcache.Resolver
-	Connections         connections.Tracker
-	SecureCookies       bool
-	// APIKeyHeaders are optional custom HTTP headers that may carry the client API key
-	// (in addition to Authorization Bearer and X-API-Key). Example: "congyu_15fc".
-	APIKeyHeaders []string
-	// TrustedProxies are reverse-proxy CIDRs/IPs trusted for client IP headers.
-	// Empty disables trusting X-Forwarded-For from untrusted clients.
-	TrustedProxies []string
-	// TrustedPlatform is an optional CDN/edge header used as the client IP source
-	// (e.g. "cloudflare" → CF-Connecting-IP). Empty keeps Gin defaults (XFF / X-Real-IP).
-	TrustedPlatform    string
+	Logger             *slog.Logger
+	RequestTimeout     time.Duration
+	MaxBodyBytes       int64
+	ConcurrencyGate    *middleware.ConcurrencyGate
+	SecureCookies      bool
 	SwaggerEnabled     bool
 	PublicAPIBaseURL   string
 	FrontendStaticPath string
 	// Readiness 返回可观测的分层就绪状态。Ready 仅为旧调用方保留。
-	Readiness    func(context.Context) ReadinessSnapshot
-	Ready        func(context.Context) bool
-	TrafficReady func() bool
-	AdminAuth    *adminauthapp.Service
-	Accounts     *accountapp.Service
-	AccountSync  *accountsyncapp.Service
-	Models       *modelapp.Service
-	ClientKeys   *clientkeyapp.Service
-	Audits       *auditapp.Service
-	Dashboard    *dashboardapp.Service
-	Gateway      *gateway.Service
-	Media        *mediaapp.Service
-	Settings     *settingsapp.Service
-	Egress       *egressapp.Service
-	Updates      *updatecheckapp.Service
+	Readiness              func(context.Context) ReadinessSnapshot
+	Ready                  func(context.Context) bool
+	TrafficReady           func() bool
+	AdminAuth              *adminauthapp.Service
+	Accounts               *accountapp.Service
+	AccountSync            *accountsyncapp.Service
+	Models                 *modelapp.Service
+	ClientKeys             *clientkeyapp.Service
+	Audits                 *auditapp.Service
+	Dashboard              *dashboardapp.Service
+	Gateway                *gateway.Service
+	Media                  *mediaapp.Service
+	Settings               *settingsapp.Service
+	Egress                 *egressapp.Service
+	QualityGuardStatePath  string
+	QualityGuardConfigPath string
+	QualityGuardToken      string
+	QualityGuardProbe      egressapp.QualityProbeInput
+	Updates                *updatecheckapp.Service
 }
 
 type ReadinessComponent struct {
@@ -125,16 +115,6 @@ func New(deps Dependencies) *gin.Engine {
 		deps.Logger = slog.Default()
 	}
 	router := gin.New()
-	// Empty trusted proxies: ClientIP ignores client-supplied X-Forwarded-For (anti-spoof).
-	// When operators set reverse-proxy CIDRs, honor forwarded headers from those hops only.
-	if len(deps.TrustedProxies) == 0 {
-		_ = router.SetTrustedProxies(nil)
-	} else if err := router.SetTrustedProxies(deps.TrustedProxies); err != nil {
-		panic("httpserver: invalid trustedProxies: " + err.Error())
-	}
-	if platform := resolveTrustedPlatform(deps.TrustedPlatform); platform != "" {
-		router.TrustedPlatform = platform
-	}
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.SecurityHeaders(), middleware.MaxBodyBytes(deps.MaxBodyBytes), middleware.Timeout(deps.RequestTimeout), middleware.AccessLog(deps.Logger))
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
 	router.GET("/readyz", func(c *gin.Context) {
@@ -168,11 +148,13 @@ func New(deps Dependencies) *gin.Engine {
 	accounthttp.NewHandler(deps.Accounts, deps.AccountSync).Register(adminProtected)
 	modelhttp.NewHandler(deps.Models).Register(adminProtected)
 	clientkeyhttp.NewHandler(deps.ClientKeys).Register(adminProtected)
-	audithttp.NewHandler(deps.Audits).Register(adminProtected)
+	auditHandler := audithttp.NewHandler(deps.Audits)
+	auditHandler.Register(adminProtected)
 	dashboardhttp.NewHandler(deps.Dashboard).Register(adminProtected)
 	mediaHandler.RegisterAdmin(adminProtected)
 	settingshttp.NewHandler(deps.Settings).Register(adminProtected)
-	egresshttp.NewHandler(deps.Egress).Register(adminProtected)
+	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe)
+	egressHandler.Register(adminProtected)
 	systemhttp.NewHandler(func() string {
 		if deps.Settings != nil {
 			return deps.Settings.PublicAPIBaseURL()
@@ -180,8 +162,16 @@ func New(deps Dependencies) *gin.Engine {
 		return deps.PublicAPIBaseURL
 	}, deps.Updates).Register(adminProtected)
 
+	if deps.QualityGuardToken != "" {
+		qualityGuardInternal := router.Group("/api/internal/v1/quality-guard")
+		qualityGuardInternal.Use(middleware.QualityGuardAuth(deps.QualityGuardToken))
+		audithttp.NewQualityGuardHandler(deps.Audits, deps.QualityGuardProbe.ClientKeyID).RegisterQualityGuard(qualityGuardInternal)
+		egressHandler.RegisterQualityGuard(qualityGuardInternal)
+	}
+
 	v1 := router.Group("/v1")
 	v1.Use(deps.ConcurrencyGate.Middleware())
+	v1.Use(middleware.ObserveBodyMemory())
 	if deps.TrafficReady != nil {
 		v1.Use(func(c *gin.Context) {
 			if deps.TrafficReady() {
@@ -193,27 +183,12 @@ func New(deps Dependencies) *gin.Engine {
 			}})
 		})
 	}
-	v1.Use(middleware.ClientAuthWithConnections(deps.ClientKeys, deps.Connections, deps.APIKeyHeaders...))
-	inferenceHandler := inference.NewHandler(deps.Gateway, deps.Models, deps.MaxBodyBytes)
-		inferenceHandler.SetPromptCacheAffinity(deps.PromptCacheAffinity)
-		inferenceHandler.Register(v1)
+	v1.Use(middleware.ClientAuth(deps.ClientKeys))
+	inferenceHandler := inference.NewHandler(deps.Gateway, deps.Models, deps.MaxBodyBytes, deps.PublicAPIBaseURL)
+	if deps.Settings != nil {
+		inferenceHandler.SetPublicAPIBaseURLResolver(deps.Settings.PublicAPIBaseURL)
+	}
+	inferenceHandler.Register(v1)
 	registerFrontend(router, deps.FrontendStaticPath)
 	return router
-}
-
-// resolveTrustedPlatform maps config aliases to Gin platform header names.
-func resolveTrustedPlatform(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "":
-		return ""
-	case "cloudflare", "cf", gin.PlatformCloudflare:
-		return gin.PlatformCloudflare
-	case "flyio", "fly", gin.PlatformFlyIO:
-		return gin.PlatformFlyIO
-	case "appengine", "gae", gin.PlatformGoogleAppEngine:
-		return gin.PlatformGoogleAppEngine
-	default:
-		// Allow custom header names such as True-Client-IP.
-		return strings.TrimSpace(value)
-	}
 }

@@ -2,30 +2,68 @@ package egress
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
-	flaresolverr "github.com/chenyme/grok2api/backend/internal/pkg/flaresolverr"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
-// RandomUserAgentToken is persisted when the admin enables per-request UA rotation.
-const RandomUserAgentToken = "random"
-
 var (
-	ErrInvalidInput = errors.New("代理节点参数无效")
-	ErrInvalidSort  = errors.New("代理节点排序条件无效")
-	ErrNotFound     = errors.New("代理节点不存在")
+	ErrInvalidInput            = errors.New("代理节点参数无效")
+	ErrInvalidFilter           = errors.New("出口代理筛选条件无效")
+	ErrInvalidSort             = errors.New("代理节点排序条件无效")
+	ErrNotFound                = errors.New("代理节点不存在")
+	ErrProbeStale              = errors.New("代理配置在探测期间已更新，请重新测试")
+	ErrQualityProbeUnavailable = errors.New("出口质量探测不可用")
+	ErrQualityProbeNoAccount   = errors.New("质量检测暂无可调度账号")
+	ErrClearanceUnavailable    = errors.New("Clearance 刷新不可用")
 )
+
+const (
+	DefaultQualityProbePrompt          = "Reply with exactly QUALITY_OK."
+	DefaultQualityProbeExpected        = "QUALITY_OK"
+	DefaultQualityProbeMaxOutputTokens = 64
+	MaxQualityProbePromptBytes         = 4096
+	MaxQualityProbeExpectedBytes       = 512
+	MaxQualityProbeOutputTokens        = 2048
+)
+
+type QualityProbeInput struct {
+	ClientKeyID     uint64
+	Model           string
+	Prompt          string
+	Expected        string
+	MaxOutputTokens int
+}
+
+type QualityProbeResult struct {
+	RequestID             string
+	NodeID                uint64
+	Model                 string
+	StatusCode            int
+	FirstTokenMS          int64
+	DurationMS            int64
+	GenerationMS          int64
+	ChunkCount            int
+	OutputTokens          int64
+	ReasoningTokens       int64
+	VisibleTokens         int64
+	VisibleCharacters     int
+	OutputTokensPerSecond float64
+	ExpectedMatched       bool
+	ResponseSHA256        string
+}
+
+type QualityProber interface {
+	ProbeEgressQuality(context.Context, uint64, QualityProbeInput) (QualityProbeResult, error)
+}
 
 const (
 	maxProxyURLBytes         = 8192
@@ -34,18 +72,12 @@ const (
 	proxyAccountSentinel     = "grok2api_account_placeholder"
 )
 
-// RuntimeSource supplies in-memory request/probe stats from the egress manager.
-type RuntimeSource interface {
-	RuntimeStats(nodeID uint64) (success, failure int64, inflight int, lastProbeAt *time.Time, lastOK *bool, lastMs int64, lastErr string)
-	ProbeNode(ctx context.Context, nodeID uint64) (domain.ProbeResult, error)
-	ProbeAll(ctx context.Context, scope domain.Scope) ([]domain.ProbeResult, error)
-}
-
 type Input struct {
 	Name              string
-	Scope             domain.Scope   // primary / legacy single scope
-	Scopes            []domain.Scope // multi-select; when set, overrides Scope
+	Scope             domain.Scope
 	Enabled           bool
+	ProxyPool         *bool
+	AccountCapacity   *int
 	ProxyURL          *string
 	ClearProxyURL     bool
 	UserAgent         string
@@ -53,192 +85,223 @@ type Input struct {
 	ClearCookies      bool
 }
 
-// FlareSolverrConfig controls automatic Cloudflare clearance refresh via FlareSolverr.
-type FlareSolverrConfig struct {
-	Enabled         bool
-	URL             string
-	TargetURL       string
-	Timeout         time.Duration
-	RefreshInterval time.Duration
+type ListFilter struct {
+	Scope       domain.Scope
+	Enabled     string
+	ProbeStatus string
+	Assignment  string
+	Sort        repository.SortQuery
+}
+
+type ServiceRepository interface {
+	repository.EgressRepository
+	repository.EgressNodePageRepository
 }
 
 type Service struct {
-	repository repository.EgressRepository
-	cipher     *security.Cipher
-	runtime    RuntimeSource
-	logger     *slog.Logger
-	mu         sync.RWMutex
-	webUA      string
-	consoleUA  string
-	flare      FlareSolverrConfig
+	repository        ServiceRepository
+	accounts          AccountBindingRepository
+	operations        OperationsRepository
+	cipher            *security.Cipher
+	mu                sync.RWMutex
+	browserUA         string
+	clearance         ClearanceManager
+	prober            NodeProber
+	operationsCache   OperationsConfigInvalidator
+	qualityProber     QualityProber
+	assignmentMu      sync.Mutex
+	lastAssignmentRun time.Time
+	assignmentRunning bool
 }
 
-func NewService(repository repository.EgressRepository, cipher *security.Cipher, webUA, consoleUA string) *Service {
-	return &Service{
-		repository: repository, cipher: cipher,
-		webUA: strings.TrimSpace(webUA), consoleUA: strings.TrimSpace(consoleUA),
-		logger: slog.Default(),
-		flare: FlareSolverrConfig{
-			TargetURL: "https://grok.com/", Timeout: 60 * time.Second, RefreshInterval: time.Hour,
-		},
-	}
-}
-
-func (s *Service) SetLogger(logger *slog.Logger) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+func (s *Service) SetQualityProber(value QualityProber) {
 	s.mu.Lock()
-	s.logger = logger
+	s.qualityProber = value
 	s.mu.Unlock()
 }
 
-func (s *Service) SetRuntime(runtime RuntimeSource) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.runtime = runtime
-}
-
-func (s *Service) UpdateDefaults(webUA, consoleUA string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.webUA = strings.TrimSpace(webUA)
-	s.consoleUA = strings.TrimSpace(consoleUA)
-}
-
-// UpdateFlareSolverr hot-reloads FlareSolverr clearance settings.
-func (s *Service) UpdateFlareSolverr(cfg FlareSolverrConfig) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.TrimSpace(cfg.TargetURL) == "" {
-		cfg.TargetURL = "https://grok.com/"
+func (s *Service) ProbeQuality(ctx context.Context, nodeID uint64, input QualityProbeInput) (QualityProbeResult, error) {
+	if nodeID == 0 || input.ClientKeyID == 0 {
+		return QualityProbeResult{}, fmt.Errorf("%w: nodeId 和 clientKeyId 必填", ErrInvalidInput)
 	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 60 * time.Second
+	input.Model = strings.TrimSpace(input.Model)
+	input.Prompt = strings.TrimSpace(input.Prompt)
+	input.Expected = strings.TrimSpace(input.Expected)
+	if input.Model == "" {
+		return QualityProbeResult{}, fmt.Errorf("%w: model 必填", ErrInvalidInput)
 	}
-	if cfg.RefreshInterval <= 0 {
-		cfg.RefreshInterval = time.Hour
+	if input.Prompt == "" {
+		input.Prompt = DefaultQualityProbePrompt
 	}
-	s.flare = cfg
-}
-
-func (s *Service) flareConfig() FlareSolverrConfig {
+	if input.Expected == "" {
+		input.Expected = DefaultQualityProbeExpected
+	}
+	if len(input.Prompt) > MaxQualityProbePromptBytes || len(input.Expected) > MaxQualityProbeExpectedBytes {
+		return QualityProbeResult{}, fmt.Errorf("%w: 探测文本过长", ErrInvalidInput)
+	}
+	if input.MaxOutputTokens == 0 {
+		input.MaxOutputTokens = DefaultQualityProbeMaxOutputTokens
+	}
+	if input.MaxOutputTokens < 1 || input.MaxOutputTokens > MaxQualityProbeOutputTokens {
+		return QualityProbeResult{}, fmt.Errorf("%w: maxOutputTokens 必须在 1 到 %d 之间", ErrInvalidInput, MaxQualityProbeOutputTokens)
+	}
+	node, err := s.repository.GetEgressNode(ctx, nodeID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return QualityProbeResult{}, ErrNotFound
+	}
+	if err != nil {
+		return QualityProbeResult{}, err
+	}
+	if node.Scope != domain.ScopeBuild || strings.TrimSpace(node.EncryptedProxyURL) == "" {
+		return QualityProbeResult{}, fmt.Errorf("%w: 质量探测仅支持已配置代理的 grok_build 节点", ErrInvalidInput)
+	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.flare
+	prober := s.qualityProber
+	s.mu.RUnlock()
+	if prober == nil {
+		return QualityProbeResult{}, ErrQualityProbeUnavailable
+	}
+	return prober.ProbeEgressQuality(ctx, nodeID, input)
+}
+
+// AccountBindingRepository is intentionally narrow so existing account
+// repository consumers do not gain egress concerns.
+type AccountBindingRepository interface {
+	CountProviderAccountsByIDs(context.Context, accountdomain.Provider, []uint64) (int64, error)
+	UpdateEgressBindings(context.Context, accountdomain.Provider, []uint64, *uint64, accountdomain.EgressAssignmentMode, time.Time) (int64, error)
+	ListEgressAssignments(context.Context, accountdomain.Provider) ([]accountdomain.Credential, error)
+	ListEgressBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)
+	ListEgressSourceBindingProviders(context.Context, uint64) ([]accountdomain.Provider, error)
+}
+
+type AssignmentResult struct {
+	Assigned int
+}
+
+type UnhealthyCleanupPreview struct {
+	Nodes               int64
+	BoundAccounts       int64
+	SubscriptionManaged int64
+}
+
+// BatchNodeDeleter is optional so lightweight repository adapters only need
+// the single-node contract unless they can provide an atomic bulk operation.
+type BatchNodeDeleter interface {
+	DeleteEgressNodes(context.Context, []uint64) (int, error)
+}
+
+type BatchNodeEnabledUpdater interface {
+	UpdateEgressNodesEnabled(context.Context, []uint64, bool) (int, error)
+}
+
+type ClearanceManager interface {
+	RefreshClearance(context.Context, uint64) error
+	ForgetClearance(uint64)
+}
+
+type BatchClearanceManager interface {
+	ForgetClearances([]uint64)
+}
+
+func NewService(repository ServiceRepository, cipher *security.Cipher, browserUA string, accounts ...AccountBindingRepository) *Service {
+	service := &Service{repository: repository, cipher: cipher, browserUA: strings.TrimSpace(browserUA)}
+	if operations, ok := repository.(OperationsRepository); ok {
+		service.operations = operations
+	}
+	if len(accounts) > 0 {
+		service.accounts = accounts[0]
+	}
+	return service
+}
+
+func (s *Service) UpdateDefaults(browserUA string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.browserUA = strings.TrimSpace(browserUA)
+}
+
+func (s *Service) SetClearanceManager(value ClearanceManager) {
+	s.mu.Lock()
+	s.clearance = value
+	s.mu.Unlock()
 }
 
 func (s *Service) DefaultUserAgents() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return map[string]string{
-		string(domain.ScopeBuild): "", string(domain.ScopeWeb): s.webUA, string(domain.ScopeConsole): s.consoleUA,
-		string(domain.ScopeWebAsset): s.webUA,
+		string(domain.ScopeBuild): "", string(domain.ScopeWeb): s.browserUA, string(domain.ScopeConsole): s.browserUA,
+		string(domain.ScopeWebAsset): s.browserUA, string(domain.ScopeConsoleAsset): s.browserUA,
 	}
 }
 
-func (s *Service) List(ctx context.Context, scope domain.Scope, sortQuery repository.SortQuery) ([]domain.PublicNode, error) {
-	if !repository.IsValidSort(sortQuery, "name", "scope", "proxy", "clearance", "health", "successRate", "failureRate", "requests") {
+func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]domain.PublicNode, int64, error) {
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
+	if !validListScope(filter.Scope) || !validListValue(filter.Enabled, "enabled", "disabled") ||
+		!validListValue(filter.ProbeStatus, string(domain.ProbeStatusHealthy), string(domain.ProbeStatusUnhealthy), string(domain.ProbeStatusUnknown)) ||
+		!validListValue(filter.Assignment, "bound", "unbound") {
+		return nil, 0, ErrInvalidFilter
+	}
+	if !repository.IsValidSort(filter.Sort, "name", "scope", "proxy", "clearance", "health") {
+		return nil, 0, ErrInvalidSort
+	}
+	var enabled *bool
+	if filter.Enabled != "" {
+		value := filter.Enabled == "enabled"
+		enabled = &value
+	}
+	values, total, err := s.repository.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search), Sort: filter.Sort},
+		Filter: repository.EgressNodeListFilter{
+			Scope: filter.Scope, Enabled: enabled, ProbeStatus: domain.ProbeStatus(filter.ProbeStatus), Assignment: filter.Assignment,
+		},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return s.publicNodes(values), total, nil
+}
+
+func (s *Service) ListAll(ctx context.Context, scope domain.Scope, sort repository.SortQuery) ([]domain.PublicNode, error) {
+	if !validListScope(scope) {
+		return nil, ErrInvalidFilter
+	}
+	if !repository.IsValidSort(sort, "name", "scope", "proxy", "clearance", "health") {
 		return nil, ErrInvalidSort
 	}
-	// Runtime-only columns are sorted after enrichment; DB sort uses a safe field.
-	dbSort := sortQuery
-	switch sortQuery.Field {
-	case "successRate", "failureRate", "requests":
-		dbSort = repository.SortQuery{}
-	}
-	values, err := s.repository.ListEgressNodes(ctx, scope, dbSort)
+	values, err := s.repository.ListEgressNodes(ctx, scope, sort)
 	if err != nil {
 		return nil, err
 	}
+	return s.publicNodes(values), nil
+}
+
+func (s *Service) publicNodes(values []domain.Node) []domain.PublicNode {
 	result := make([]domain.PublicNode, 0, len(values))
 	for _, value := range values {
 		result = append(result, s.publicNode(value))
 	}
-	sortPublicNodes(result, sortQuery)
-	return result, nil
+	return result
 }
 
-func sortPublicNodes(values []domain.PublicNode, sortQuery repository.SortQuery) {
-	field := sortQuery.Field
-	if field != "successRate" && field != "failureRate" && field != "requests" {
-		return
-	}
-	desc := sortQuery.Direction == repository.SortDescending
-	sort.SliceStable(values, func(i, j int) bool {
-		var left, right float64
-		switch field {
-		case "successRate":
-			left, right = values[i].SuccessRate, values[j].SuccessRate
-		case "failureRate":
-			left, right = values[i].FailureRate, values[j].FailureRate
-		case "requests":
-			left, right = float64(values[i].RequestCount), float64(values[j].RequestCount)
-		}
-		if left == right {
-			return values[i].ID < values[j].ID
-		}
-		if desc {
-			return left > right
-		}
-		return left < right
-	})
+func validListScope(scope domain.Scope) bool {
+	return scope == "" || scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset || scope == domain.ScopeConsoleAsset
 }
 
-func (s *Service) Report(ctx context.Context, scope domain.Scope) (domain.Report, error) {
-	nodes, err := s.List(ctx, scope, repository.SortQuery{})
-	if err != nil {
-		return domain.Report{}, err
-	}
-	report := domain.Report{TotalNodes: len(nodes), Nodes: nodes}
-	for _, node := range nodes {
-		if node.Enabled {
-			report.EnabledNodes++
-		}
-		if node.ProxyConfigured {
-			report.ProxyNodes++
-		}
-		if node.Enabled && node.Health >= 0.5 && (node.CooldownUntil == nil || time.Now().UTC().After(*node.CooldownUntil)) {
-			report.HealthyNodes++
-		}
-		report.SuccessCount += node.SuccessCount
-		failures := node.RequestCount - node.SuccessCount
-		if failures < 0 {
-			failures = 0
-		}
-		report.FailureCount += failures
-		report.RequestCount += node.RequestCount
-	}
-	if report.RequestCount > 0 {
-		report.SuccessRate = float64(report.SuccessCount) / float64(report.RequestCount)
-		report.FailureRate = float64(report.FailureCount) / float64(report.RequestCount)
-	}
-	return report, nil
+func allServiceScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
-func (s *Service) Probe(ctx context.Context, id uint64) (domain.ProbeResult, error) {
-	s.mu.RLock()
-	runtime := s.runtime
-	s.mu.RUnlock()
-	if runtime == nil {
-		return domain.ProbeResult{}, fmt.Errorf("%w: 出口运行时未就绪", ErrInvalidInput)
+func validListValue(value string, allowed ...string) bool {
+	if value == "" {
+		return true
 	}
-	if _, err := s.repository.GetEgressNode(ctx, id); errors.Is(err, repository.ErrNotFound) {
-		return domain.ProbeResult{}, ErrNotFound
-	} else if err != nil {
-		return domain.ProbeResult{}, err
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
 	}
-	return runtime.ProbeNode(ctx, id)
-}
-
-func (s *Service) ProbeAll(ctx context.Context, scope domain.Scope) ([]domain.ProbeResult, error) {
-	s.mu.RLock()
-	runtime := s.runtime
-	s.mu.RUnlock()
-	if runtime == nil {
-		return nil, fmt.Errorf("%w: 出口运行时未就绪", ErrInvalidInput)
-	}
-	return runtime.ProbeAll(ctx, scope)
+	return false
 }
 
 func (s *Service) Create(ctx context.Context, input Input) (domain.PublicNode, error) {
@@ -247,88 +310,10 @@ func (s *Service) Create(ctx context.Context, input Input) (domain.PublicNode, e
 		return domain.PublicNode{}, err
 	}
 	created, err := s.repository.CreateEgressNode(ctx, value)
+	if err == nil {
+		s.forgetClearance(created.ID)
+	}
 	return s.publicNode(created), err
-}
-
-const maxBatchProxyNodes = 500
-
-// BatchCreateInput creates many proxy nodes from a shared name prefix and URL list.
-// Names are generated as "{prefix}#1", "{prefix}#2", … (1-based).
-type BatchCreateInput struct {
-	NamePrefix        string
-	Scope             domain.Scope
-	Scopes            []domain.Scope
-	Enabled           bool
-	ProxyURLs         []string
-	UserAgent         string
-	CloudflareCookies *string
-}
-
-// BatchCreateResult summarizes bulk import.
-type BatchCreateResult struct {
-	Created int
-	Failed  int
-	Skipped int
-	Items   []domain.PublicNode
-	Errors  []string
-}
-
-func (s *Service) CreateBatch(ctx context.Context, input BatchCreateInput) (BatchCreateResult, error) {
-	prefix := strings.TrimSpace(input.NamePrefix)
-	if prefix == "" {
-		prefix = "代理"
-	}
-	if len(prefix) > 140 {
-		return BatchCreateResult{}, fmt.Errorf("%w: 名称前缀不能超过 140 个字符", ErrInvalidInput)
-	}
-	urls := make([]string, 0, len(input.ProxyURLs))
-	seen := make(map[string]struct{}, len(input.ProxyURLs))
-	for _, raw := range input.ProxyURLs {
-		for _, line := range strings.Split(raw, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			// Allow "name|url" optional override; default uses prefix#n.
-			if _, exists := seen[line]; exists {
-				continue
-			}
-			seen[line] = struct{}{}
-			urls = append(urls, line)
-		}
-	}
-	if len(urls) == 0 {
-		return BatchCreateResult{}, fmt.Errorf("%w: 至少填写一个代理地址", ErrInvalidInput)
-	}
-	if len(urls) > maxBatchProxyNodes {
-		return BatchCreateResult{}, fmt.Errorf("%w: 单次最多导入 %d 个代理", ErrInvalidInput, maxBatchProxyNodes)
-	}
-	result := BatchCreateResult{Items: make([]domain.PublicNode, 0, len(urls))}
-	for index, proxyURL := range urls {
-		name := fmt.Sprintf("%s#%d", prefix, index+1)
-		urlCopy := proxyURL
-		node, err := s.Create(ctx, Input{
-			Name: name, Scope: input.Scope, Scopes: input.Scopes, Enabled: input.Enabled,
-			ProxyURL: &urlCopy, UserAgent: input.UserAgent, CloudflareCookies: input.CloudflareCookies,
-		})
-		if err != nil {
-			result.Failed++
-			if len(result.Errors) < 20 {
-				result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", name, err))
-			}
-			continue
-		}
-		result.Created++
-		result.Items = append(result.Items, node)
-	}
-	if result.Created == 0 && result.Failed > 0 {
-		msg := "批量导入全部失败"
-		if len(result.Errors) > 0 {
-			msg = result.Errors[0]
-		}
-		return result, fmt.Errorf("%w: %s", ErrInvalidInput, msg)
-	}
-	return result, nil
 }
 
 func (s *Service) Update(ctx context.Context, id uint64, input Input) (domain.PublicNode, error) {
@@ -339,12 +324,128 @@ func (s *Service) Update(ctx context.Context, id uint64, input Input) (domain.Pu
 	if err != nil {
 		return domain.PublicNode{}, err
 	}
+	previousScope := value.Scope
 	value, err = s.applyInput(value, input, false)
 	if err != nil {
 		return domain.PublicNode{}, err
 	}
+	if err := s.validateFallbackNodeUpdate(ctx, value); err != nil {
+		return domain.PublicNode{}, err
+	}
+	if previousScope != value.Scope {
+		if err := s.validateNodeBindingScope(ctx, value.ID, value.Scope); err != nil {
+			return domain.PublicNode{}, err
+		}
+	}
 	updated, err := s.repository.UpdateEgressNode(ctx, value)
+	if err == nil {
+		s.forgetClearance(updated.ID)
+	}
 	return s.publicNode(updated), err
+}
+
+func (s *Service) validateFallbackNodeUpdate(ctx context.Context, node domain.Node) error {
+	if s.operations == nil {
+		return nil
+	}
+	config, err := s.operations.GetEgressOperationsConfig(ctx)
+	if err != nil {
+		return err
+	}
+	return s.validateFallbackNodeUpdateWithConfig(node, config)
+}
+
+func (s *Service) validateFallbackNodeUpdateWithConfig(node domain.Node, config domain.OperationsConfig) error {
+	for _, scope := range allServiceScopes() {
+		fallback := config.FallbackFor(scope)
+		if fallback.Mode != domain.FallbackModeFixed || fallback.NodeID != node.ID {
+			continue
+		}
+		if err := s.validateFixedFallbackNode(scope, node, false); err != nil {
+			return fmt.Errorf("节点已配置为 %s 固定回退，无法应用当前修改: %w", scope, err)
+		}
+	}
+	return nil
+}
+
+// UpdateManyEnabled changes only the scheduling state, leaving proxy secrets,
+// health, probes, and account bindings untouched.
+func (s *Service) UpdateManyEnabled(ctx context.Context, nodeIDs []uint64, enabled bool) (int, error) {
+	ids := uniqueIDs(nodeIDs)
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("%w: 代理节点参数无效", ErrInvalidInput)
+	}
+
+	// Disabling a fixed fallback would make the persisted routing policy
+	// invalid. At most five fallback nodes need point lookups, regardless of
+	// the batch size.
+	if !enabled && s.operations != nil {
+		config, err := s.operations.GetEgressOperationsConfig(ctx)
+		if err != nil {
+			return 0, err
+		}
+		selected := make(map[uint64]struct{}, len(ids))
+		for _, id := range ids {
+			selected[id] = struct{}{}
+		}
+		fallbackNodeIDs := make(map[uint64]struct{}, len(allServiceScopes()))
+		for _, scope := range allServiceScopes() {
+			fallback := config.FallbackFor(scope)
+			if fallback.Mode == domain.FallbackModeFixed {
+				if _, exists := selected[fallback.NodeID]; exists {
+					fallbackNodeIDs[fallback.NodeID] = struct{}{}
+				}
+			}
+		}
+		for id := range fallbackNodeIDs {
+			node, err := s.repository.GetEgressNode(ctx, id)
+			if errors.Is(err, repository.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			node.Enabled = false
+			if err := s.validateFallbackNodeUpdateWithConfig(node, config); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	if batch, ok := s.repository.(BatchNodeEnabledUpdater); ok {
+		updated, err := batch.UpdateEgressNodesEnabled(ctx, ids, enabled)
+		if errors.Is(err, repository.ErrEgressFallbackInUse) {
+			return 0, fmt.Errorf("%w: 固定回退节点不能被批量禁用", ErrInvalidInput)
+		}
+		if err != nil {
+			return 0, err
+		}
+		if updated > 0 {
+			s.forgetClearances(ids)
+		}
+		return updated, nil
+	}
+
+	updated := 0
+	for _, id := range ids {
+		node, err := s.repository.GetEgressNode(ctx, id)
+		if errors.Is(err, repository.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return updated, err
+		}
+		if node.Enabled == enabled {
+			continue
+		}
+		node.Enabled = enabled
+		if _, err := s.repository.UpdateEgressNode(ctx, node); err != nil {
+			return updated, err
+		}
+		s.forgetClearance(id)
+		updated++
+	}
+	return updated, nil
 }
 
 func (s *Service) Delete(ctx context.Context, id uint64) error {
@@ -352,325 +453,385 @@ func (s *Service) Delete(ctx context.Context, id uint64) error {
 	if errors.Is(err, repository.ErrNotFound) {
 		return ErrNotFound
 	}
+	if err == nil {
+		s.forgetClearance(id)
+		s.invalidateOperationsConfig()
+	}
 	return err
 }
 
-// SetEnabledBatch enables or disables many nodes.
-func (s *Service) SetEnabledBatch(ctx context.Context, ids []uint64, enabled bool) (int, error) {
-	updated := 0
-	for _, id := range ids {
-		if id == 0 {
-			continue
-		}
-		value, err := s.repository.GetEgressNode(ctx, id)
-		if errors.Is(err, repository.ErrNotFound) {
-			continue
-		}
+// DeleteMany removes nodes in one repository operation when available. The
+// relational implementation also clears any account bindings in that same
+// transaction, so a deleted node can never remain referenced by an account.
+func (s *Service) DeleteMany(ctx context.Context, nodeIDs []uint64) (int, error) {
+	ids := uniqueIDs(nodeIDs)
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("%w: 代理节点参数无效", ErrInvalidInput)
+	}
+	if batch, ok := s.repository.(BatchNodeDeleter); ok {
+		deleted, err := batch.DeleteEgressNodes(ctx, ids)
 		if err != nil {
-			return updated, err
+			return 0, err
 		}
-		if value.Enabled == enabled {
-			updated++
-			continue
+		for _, id := range ids {
+			s.forgetClearance(id)
 		}
-		value.Enabled = enabled
-		if _, err := s.repository.UpdateEgressNode(ctx, value); err != nil {
-			return updated, err
-		}
-		updated++
+		s.invalidateOperationsConfig()
+		return deleted, nil
 	}
-	return updated, nil
-}
 
-// ClearErrorsBatch resets last error / failure / cooldown / health for selected nodes.
-func (s *Service) ClearErrorsBatch(ctx context.Context, ids []uint64) (int, error) {
-	cleared := 0
+	deleted := 0
 	for _, id := range ids {
-		if id == 0 {
+		if err := s.Delete(ctx, id); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+func (s *Service) PreviewUnhealthyCleanup(ctx context.Context) (UnhealthyCleanupPreview, error) {
+	if cleaner, ok := s.repository.(repository.EgressNodeUnhealthyCleaner); ok {
+		value, err := cleaner.PreviewUnhealthyEgressNodes(ctx)
+		return UnhealthyCleanupPreview{
+			Nodes: value.Nodes, BoundAccounts: value.BoundAccounts, SubscriptionManaged: value.SubscriptionManaged,
+		}, err
+	}
+	values, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return UnhealthyCleanupPreview{}, err
+	}
+	result := UnhealthyCleanupPreview{}
+	for _, value := range values {
+		if value.IPv4Probe.Status != domain.ProbeStatusUnhealthy || value.IPv6Probe.Status != domain.ProbeStatusUnhealthy {
 			continue
 		}
-		value, err := s.repository.GetEgressNode(ctx, id)
-		if errors.Is(err, repository.ErrNotFound) {
-			continue
+		result.Nodes++
+		result.BoundAccounts += int64(value.AssignedAccountCount)
+		if value.SourceID != 0 {
+			result.SubscriptionManaged++
 		}
+	}
+	return result, nil
+}
+
+func (s *Service) DeleteUnhealthy(ctx context.Context) (int, error) {
+	if cleaner, ok := s.repository.(repository.EgressNodeUnhealthyCleaner); ok {
+		ids, err := cleaner.DeleteUnhealthyEgressNodes(ctx)
 		if err != nil {
-			return cleared, err
+			return 0, err
 		}
-		value.LastError = ""
-		value.FailureCount = 0
-		value.CooldownUntil = nil
-		value.Health = 1
-		if _, err := s.repository.UpdateEgressNode(ctx, value); err != nil {
-			return cleared, err
+		for _, id := range ids {
+			s.forgetClearance(id)
 		}
-		cleared++
+		if len(ids) > 0 {
+			s.invalidateOperationsConfig()
+		}
+		return len(ids), nil
 	}
-	return cleared, nil
+	values, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return 0, err
+	}
+	ids := make([]uint64, 0)
+	for _, value := range values {
+		if value.IPv4Probe.Status == domain.ProbeStatusUnhealthy && value.IPv6Probe.Status == domain.ProbeStatusUnhealthy {
+			ids = append(ids, value.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return s.DeleteMany(ctx, ids)
 }
 
-func normalizeScopes(primary domain.Scope, scopes []domain.Scope) ([]domain.Scope, error) {
-	raw := scopes
-	if len(raw) == 0 && primary != "" {
-		raw = []domain.Scope{primary}
+func (s *Service) RefreshClearance(ctx context.Context, id uint64) error {
+	if _, err := s.repository.GetEgressNode(ctx, id); errors.Is(err, repository.ErrNotFound) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
 	}
-	out := make([]domain.Scope, 0, len(raw))
-	seen := make(map[domain.Scope]struct{}, len(raw))
-	for _, scope := range raw {
-		if !scope.IsValid() {
-			return nil, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console 或 grok_web_asset", ErrInvalidInput)
+	s.mu.RLock()
+	manager := s.clearance
+	s.mu.RUnlock()
+	if manager == nil {
+		return ErrClearanceUnavailable
+	}
+	return manager.RefreshClearance(ctx, id)
+}
+
+// AssignAccounts creates explicit many-to-one account bindings. A binding is
+// not a proxy-pool preference: runtime requests must use the selected node.
+func (s *Service) AssignAccounts(ctx context.Context, nodeID uint64, provider accountdomain.Provider, accountIDs []uint64, mode accountdomain.EgressAssignmentMode) (AssignmentResult, error) {
+	if s.accounts == nil {
+		return AssignmentResult{}, errors.New("账号出口绑定不可用")
+	}
+	if nodeID == 0 || !provider.IsValid() || !mode.IsValid() || len(accountIDs) == 0 {
+		return AssignmentResult{}, fmt.Errorf("%w: 账号出口绑定参数无效", ErrInvalidInput)
+	}
+	node, err := s.repository.GetEgressNode(ctx, nodeID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return AssignmentResult{}, ErrNotFound
+	}
+	if err != nil {
+		return AssignmentResult{}, err
+	}
+	if !node.Enabled || strings.TrimSpace(node.EncryptedProxyURL) == "" {
+		return AssignmentResult{}, fmt.Errorf("%w: 只能绑定启用且已配置代理地址的节点", ErrInvalidInput)
+	}
+	if !scopeSupportsProvider(node.Scope, provider) {
+		return AssignmentResult{}, fmt.Errorf("%w: 代理节点作用域与账号来源不兼容", ErrInvalidInput)
+	}
+	unique := uniqueIDs(accountIDs)
+	count, err := s.accounts.CountProviderAccountsByIDs(ctx, provider, unique)
+	if err != nil {
+		return AssignmentResult{}, err
+	}
+	if count != int64(len(unique)) {
+		return AssignmentResult{}, fmt.Errorf("%w: 包含不属于当前账号池的账号", ErrInvalidInput)
+	}
+	assigned, err := s.accounts.UpdateEgressBindings(ctx, provider, unique, &nodeID, mode, time.Now().UTC())
+	if err != nil {
+		return AssignmentResult{}, err
+	}
+	return AssignmentResult{Assigned: int(assigned)}, nil
+}
+
+// UnassignAccounts removes an explicit binding and restores scope pool routing.
+func (s *Service) UnassignAccounts(ctx context.Context, provider accountdomain.Provider, accountIDs []uint64) (AssignmentResult, error) {
+	if s.accounts == nil {
+		return AssignmentResult{}, errors.New("账号出口绑定不可用")
+	}
+	if !provider.IsValid() || len(accountIDs) == 0 {
+		return AssignmentResult{}, fmt.Errorf("%w: 账号出口解绑参数无效", ErrInvalidInput)
+	}
+	unique := uniqueIDs(accountIDs)
+	count, err := s.accounts.CountProviderAccountsByIDs(ctx, provider, unique)
+	if err != nil {
+		return AssignmentResult{}, err
+	}
+	if count != int64(len(unique)) {
+		return AssignmentResult{}, fmt.Errorf("%w: 包含不属于当前账号池的账号", ErrInvalidInput)
+	}
+	updated, err := s.accounts.UpdateEgressBindings(ctx, provider, unique, nil, "", time.Time{})
+	if err != nil {
+		return AssignmentResult{}, err
+	}
+	return AssignmentResult{Assigned: int(updated)}, nil
+}
+
+func scopeSupportsProvider(scope domain.Scope, provider accountdomain.Provider) bool {
+	switch provider {
+	case accountdomain.ProviderBuild:
+		return scope == domain.ScopeBuild
+	case accountdomain.ProviderWeb:
+		return scope == domain.ScopeWeb
+	case accountdomain.ProviderConsole:
+		return domain.SupportsScope(scope, domain.ScopeConsole)
+	default:
+		return false
+	}
+}
+
+func (s *Service) validateNodeBindingScope(ctx context.Context, nodeID uint64, scope domain.Scope) error {
+	if s.accounts == nil {
+		return nil
+	}
+	providers, err := s.accounts.ListEgressBindingProviders(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	return validateBindingProviders(scope, providers)
+}
+
+func (s *Service) validateSourceBindingScope(ctx context.Context, sourceID uint64, scope domain.Scope) error {
+	if s.accounts == nil {
+		return nil
+	}
+	providers, err := s.accounts.ListEgressSourceBindingProviders(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	return validateBindingProviders(scope, providers)
+}
+
+func validateBindingProviders(scope domain.Scope, providers []accountdomain.Provider) error {
+	for _, provider := range providers {
+		if !scopeSupportsProvider(scope, provider) {
+			return fmt.Errorf("%w: 当前节点仍绑定 %s 账号，不能改为 %s 作用域", ErrInvalidInput, provider, scope)
 		}
-		if _, ok := seen[scope]; ok {
+	}
+	return nil
+}
+
+func uniqueIDs(values []uint64) []uint64 {
+	seen := make(map[uint64]struct{}, len(values))
+	result := make([]uint64, 0, len(values))
+	for _, value := range values {
+		if value == 0 {
 			continue
 		}
-		seen[scope] = struct{}{}
-		out = append(out, scope)
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: 至少选择一个作用域", ErrInvalidInput)
-	}
-	return out, nil
+	return result
 }
 
-func scopesNeedBrowserIdentity(scopes []domain.Scope) bool {
-	for _, scope := range scopes {
-		if scope != domain.ScopeBuild {
-			return true
-		}
+func (s *Service) forgetClearance(id uint64) {
+	s.mu.RLock()
+	manager := s.clearance
+	s.mu.RUnlock()
+	if manager != nil {
+		manager.ForgetClearance(id)
 	}
-	return false
+}
+
+func (s *Service) forgetClearances(ids []uint64) {
+	s.mu.RLock()
+	manager := s.clearance
+	s.mu.RUnlock()
+	if manager == nil {
+		return
+	}
+	if batch, ok := manager.(BatchClearanceManager); ok {
+		batch.ForgetClearances(ids)
+		return
+	}
+	for _, id := range ids {
+		manager.ForgetClearance(id)
+	}
 }
 
 func (s *Service) applyInput(value domain.Node, input Input, create bool) (domain.Node, error) {
+	proxyPool := value.ProxyPool
+	if input.ProxyPool != nil {
+		proxyPool = *input.ProxyPool
+	}
+	configurationChanged := create || value.Scope != input.Scope || value.ProxyPool != proxyPool || (!value.Enabled && input.Enabled) || input.ClearProxyURL || input.ProxyURL != nil
 	name := strings.TrimSpace(input.Name)
 	if name == "" || len(name) > 160 {
 		return domain.Node{}, fmt.Errorf("%w: 名称必须在 1 到 160 个字符之间", ErrInvalidInput)
 	}
-	scopes, err := normalizeScopes(input.Scope, input.Scopes)
-	if err != nil {
-		return domain.Node{}, err
+	if !validListScope(input.Scope) || input.Scope == "" {
+		return domain.Node{}, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console、grok_web_asset 或 grok_console_asset", ErrInvalidInput)
 	}
-	primary := scopes[0]
-	value.Name, value.Scope, value.Scopes, value.Enabled = name, primary, scopes, input.Enabled
-	needsBrowser := scopesNeedBrowserIdentity(scopes)
-	if !needsBrowser {
-		// Build-only: always inherit Provider CLI User-Agent; no CF cookies.
-		value.UserAgent = ""
-		value.EncryptedCloudflareCookie = ""
-	} else {
-		// empty on create → provider default for UI; empty on update keeps existing unless cleared.
-		// "random"/"auto" → rotate pool per lease at runtime.
-		ua := normalizeStoredUserAgent(input.UserAgent)
-		if ua == "" {
-			if create {
-				s.mu.RLock()
-				uaScope := primary
-				for _, scope := range scopes {
-					if scope != domain.ScopeBuild {
-						uaScope = scope
-						break
-					}
-				}
-				ua = s.defaultUserAgent(uaScope)
-				s.mu.RUnlock()
-			} else {
-				// Keep existing value on update when the field is omitted/blank.
-				ua = value.UserAgent
-			}
+	value.Name, value.Scope, value.Enabled, value.ProxyPool = name, input.Scope, input.Enabled, proxyPool
+	if input.AccountCapacity != nil {
+		if *input.AccountCapacity < 0 || *input.AccountCapacity > 100000 {
+			return domain.Node{}, fmt.Errorf("%w: 每个代理的账号容量必须在 0 到 100000 之间", ErrInvalidInput)
 		}
-		value.UserAgent = ua
+		value.AccountCapacity = *input.AccountCapacity
+	}
+	if input.Scope == domain.ScopeBuild {
+		// Build 请求始终沿用 Provider 生成的 CLI User-Agent，出口节点不得覆盖协议身份。
+		value.UserAgent = ""
+	} else {
+		value.UserAgent = strings.TrimSpace(input.UserAgent)
+	}
+	if input.Scope != domain.ScopeBuild && value.UserAgent == "" {
+		s.mu.RLock()
+		value.UserAgent = s.browserUA
+		s.mu.RUnlock()
 	}
 	if len(value.UserAgent) > 512 {
 		return domain.Node{}, fmt.Errorf("%w: User-Agent 过长", ErrInvalidInput)
 	}
 	if input.ClearProxyURL {
 		value.EncryptedProxyURL = ""
+		value.ProxyPool = false
 	} else if input.ProxyURL != nil {
 		normalized, err := NormalizeProxyURL(*input.ProxyURL)
 		if err != nil {
 			return domain.Node{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 		}
-		if normalized != "" || create {
+		if normalized != "" {
 			value.EncryptedProxyURL, err = s.cipher.Encrypt(normalized)
 			if err != nil {
 				return domain.Node{}, err
 			}
 		}
 	}
-	if needsBrowser {
-		if input.ClearCookies {
-			value.EncryptedCloudflareCookie = ""
-		} else if input.CloudflareCookies != nil {
-			if len(*input.CloudflareCookies) > maxCloudflareCookieBytes {
-				return domain.Node{}, fmt.Errorf("%w: Cloudflare Cookie 不能超过 16 KiB", ErrInvalidInput)
-			}
-			cookies := SanitizeCloudflareCookies(*input.CloudflareCookies)
-			if cookies != "" || create {
-				var err error
-				value.EncryptedCloudflareCookie, err = s.cipher.Encrypt(cookies)
-				if err != nil {
-					return domain.Node{}, err
-				}
+	if value.ProxyPool && strings.TrimSpace(value.EncryptedProxyURL) == "" {
+		return domain.Node{}, fmt.Errorf("%w: 代理池模式需要配置代理地址", ErrInvalidInput)
+	}
+	if input.Scope == domain.ScopeBuild || input.Scope == domain.ScopeConsoleAsset {
+		value.EncryptedCloudflareCookie = ""
+	} else if input.ClearCookies {
+		value.EncryptedCloudflareCookie = ""
+	} else if input.CloudflareCookies != nil {
+		if len(*input.CloudflareCookies) > maxCloudflareCookieBytes {
+			return domain.Node{}, fmt.Errorf("%w: Cloudflare Cookie 不能超过 16 KiB", ErrInvalidInput)
+		}
+		cookies := SanitizeCloudflareCookies(*input.CloudflareCookies)
+		if cookies != "" || create {
+			var err error
+			value.EncryptedCloudflareCookie, err = s.cipher.Encrypt(cookies)
+			if err != nil {
+				return domain.Node{}, err
 			}
 		}
 	}
-	if create {
+	if configurationChanged {
 		value.Health = 1
+		value.FailureCount = 0
+		value.CooldownUntil = nil
+		value.LastError = ""
+		value.ProbeStatus = domain.ProbeStatusUnknown
+		value.LastProbedAt = nil
+		value.ProbeLatencyMS = 0
+		value.ExitIP = ""
+		value.ProbeError = ""
+		value.ProbeProvider = ""
+		value.IPv4Probe = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnknown}
+		value.IPv6Probe = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnknown}
 	}
+	// Any administrator edit invalidates freshness. Keep the binding fingerprint:
+	// managed mode may use the existing cookie as last-known-good only when the
+	// target and actual proxy still match the binding that produced it.
+	value.ClearanceRefreshedAt = nil
+	value.ClearanceFingerprint = ""
 	return value, nil
 }
 
-func (s *Service) defaultUserAgent(scope domain.Scope) string {
-	if scope == domain.ScopeConsole {
-		return s.consoleUA
-	}
-	return s.webUA
-}
-
-func isRandomUserAgent(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case RandomUserAgentToken, "auto", "randomize", "__random__":
-		return true
-	default:
-		return false
-	}
-}
-
-func normalizeStoredUserAgent(value string) string {
-	value = strings.TrimSpace(value)
-	if isRandomUserAgent(value) {
-		return RandomUserAgentToken
-	}
-	return value
-}
-
 func (s *Service) publicNode(value domain.Node) domain.PublicNode {
-	scopes := value.EffectiveScopes()
-	primary := value.Scope
-	if primary == "" && len(scopes) > 0 {
-		primary = scopes[0]
-	}
 	userAgent := value.UserAgent
-	if !scopesNeedBrowserIdentity(scopes) {
+	if value.Scope == domain.ScopeBuild {
 		userAgent = ""
 	}
-	proxyConfigured := value.EncryptedProxyURL != ""
-	protocol := ""
-	if proxyConfigured && s != nil && s.cipher != nil {
-		if plain, err := s.cipher.Decrypt(value.EncryptedProxyURL); err == nil {
-			protocol = ProxyProtocolLabel(plain)
-		}
+	accountBoundProxy := s.accountBoundProxy(value)
+	proxyPool := value.ProxyPool || accountBoundProxy
+	health, failureCount, cooldownUntil, lastError := value.Health, value.FailureCount, value.CooldownUntil, value.LastError
+	if proxyPool {
+		health, failureCount, cooldownUntil, lastError = 1, 0, nil, ""
 	}
-	// Expose stored mode to admin UI ("random" or fixed UA); do not expand random here.
-	displayUA := userAgent
-	if isRandomUserAgent(value.UserAgent) {
-		displayUA = RandomUserAgentToken
-	}
-	node := domain.PublicNode{
-		ID: value.ID, Name: value.Name, Scope: primary, Scopes: scopes, Enabled: value.Enabled,
-		ProxyConfigured: proxyConfigured, ProxyProtocol: protocol, UserAgent: displayUA, CookieConfigured: value.EncryptedCloudflareCookie != "",
-		Health: value.Health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: LocalizeEgressError(value.LastError),
-		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-	}
-	s.mu.RLock()
-	runtime := s.runtime
-	s.mu.RUnlock()
-	if runtime != nil {
-		success, failure, inflight, lastProbeAt, lastOK, lastMs, lastErr := runtime.RuntimeStats(value.ID)
-		node.SuccessCount = success
-		node.RequestCount = success + failure
-		node.Inflight = inflight
-		node.LastProbeAt = lastProbeAt
-		node.LastProbeOK = lastOK
-		node.LastProbeMs = lastMs
-		node.LastProbeError = lastErr
-		if node.RequestCount > 0 {
-			node.SuccessRate = float64(success) / float64(node.RequestCount)
-			node.FailureRate = float64(failure) / float64(node.RequestCount)
-		}
-	}
-	return node
-}
-
-// publicNode keeps tests that call the helper without a Service instance working.
-func publicNode(value domain.Node) domain.PublicNode {
-	return (&Service{}).publicNode(value)
-}
-
-// LocalizeEgressError maps stored English runtime error codes to Chinese for the admin UI.
-func LocalizeEgressError(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	lower := strings.ToLower(value)
-	switch {
-	case lower == "anti-bot rejection":
-		return "疑似反爬拒绝（403）"
-	case lower == "transport error":
-		return "传输/连通失败"
-	case strings.HasPrefix(lower, "upstream status "):
-		code := strings.TrimSpace(value[len("upstream status "):])
-		return "上游状态码 " + code
-	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "timeout"):
-		return "请求超时"
-	case strings.Contains(lower, "connection refused"):
-		return "连接被拒绝"
-	case strings.Contains(lower, "no such host"):
-		return "域名无法解析"
-	case strings.Contains(lower, "tls") && strings.Contains(lower, "handshake"):
-		return "TLS 握手失败"
-	default:
-		return value
+	return domain.PublicNode{
+		ID: value.ID, Name: value.Name, Scope: value.Scope, Enabled: value.Enabled,
+		ProxyConfigured: value.EncryptedProxyURL != "", UserAgent: userAgent, CookieConfigured: value.EncryptedCloudflareCookie != "",
+		ProxyPool:         proxyPool,
+		SourceID:          value.SourceID,
+		AccountCapacity:   value.AccountCapacity,
+		AccountBoundProxy: accountBoundProxy,
+		Health:            health, FailureCount: failureCount, CooldownUntil: cooldownUntil, LastError: lastError,
+		ProbeStatus: value.ProbeStatus, LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeProvider: value.ProbeProvider,
+		IPv4Probe:     value.IPv4Probe, IPv6Probe: value.IPv6Probe,
+		AssignedAccountCount: value.AssignedAccountCount,
+		CreatedAt:            value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
 
-// ProxyProtocolLabel returns a short safe protocol name for admin UI (no host/user/password).
-func ProxyProtocolLabel(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
+func (s *Service) accountBoundProxy(value domain.Node) bool {
+	if s == nil || s.cipher == nil || strings.TrimSpace(value.EncryptedProxyURL) == "" {
+		return false
 	}
-	if strings.HasPrefix(value, "{") {
-		return "sing-box"
-	}
-	lower := strings.ToLower(value)
-	for _, prefix := range []struct {
-		p string
-		n string
-	}{
-		{"vmess://", "vmess"},
-		{"ss://", "ss"},
-		{"ssr://", "ssr"},
-		{"vless://", "vless"},
-		{"trojan://", "trojan"},
-		{"hysteria2://", "hysteria2"},
-		{"hy2://", "hysteria2"},
-		{"hysteria://", "hysteria"},
-		{"hy://", "hysteria"},
-		{"tuic://", "tuic"},
-		{"anytls://", "anytls"},
-		{"wireguard://", "wireguard"},
-		{"wg://", "wireguard"},
-		{"shadowtls://", "shadowtls"},
-		{"ssh://", "ssh"},
-		{"socks5h://", "socks5h"},
-		{"socks5://", "socks5"},
-		{"socks4a://", "socks4a"},
-		{"socks4://", "socks4"},
-		{"https://", "https"},
-		{"http://", "http"},
-	} {
-		if strings.HasPrefix(lower, prefix.p) {
-			return prefix.n
-		}
-	}
-	if parsed, err := url.Parse(value); err == nil {
-		scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
-		if scheme != "" {
-			return scheme
-		}
-	}
-	return "proxy"
+	proxyURL, err := s.cipher.Decrypt(value.EncryptedProxyURL)
+	return err == nil && strings.Contains(proxyURL, ProxyAccountPlaceholder)
 }
 
 func NormalizeProxyURL(value string) (string, error) {
@@ -681,23 +842,6 @@ func NormalizeProxyURL(value string) (string, error) {
 	if len(value) > maxProxyURLBytes || strings.IndexFunc(value, func(character rune) bool { return character < 0x20 || character == 0x7f }) >= 0 {
 		return "", errors.New("代理地址过长或包含控制字符")
 	}
-	// sing-box outbound JSON (full options or single outbound object)
-	if strings.HasPrefix(value, "{") {
-		if !json.Valid([]byte(value)) {
-			return "", errors.New("代理 JSON 无效")
-		}
-		return value, nil
-	}
-	lower := strings.ToLower(value)
-	// Base64-style share links where url.Parse host may be empty.
-	for _, prefix := range []string{"vmess://", "ss://", "ssr://"} {
-		if strings.HasPrefix(lower, prefix) {
-			if strings.TrimSpace(value[len(prefix):]) == "" {
-				return "", errors.New("分享链接无效")
-			}
-			return value, nil
-		}
-	}
 	hasAccountPlaceholder := strings.Contains(value, ProxyAccountPlaceholder)
 	if strings.Count(value, ProxyAccountPlaceholder) > 1 {
 		return "", errors.New("代理地址最多包含一个 {account} 占位符")
@@ -707,35 +851,26 @@ func NormalizeProxyURL(value string) (string, error) {
 	}
 	parseValue := strings.ReplaceAll(value, ProxyAccountPlaceholder, proxyAccountSentinel)
 	parsed, err := url.Parse(parseValue)
-	if err != nil {
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
 		return "", errors.New("代理地址格式无效")
 	}
-	scheme := strings.ToLower(parsed.Scheme)
-	switch scheme {
+	switch strings.ToLower(parsed.Scheme) {
 	case "http", "https", "socks4", "socks4a", "socks5", "socks5h":
-		if parsed.Host == "" || parsed.Hostname() == "" {
-			return "", errors.New("代理地址格式无效")
-		}
-		if parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
-			return "", errors.New("代理地址不能包含路径、查询参数或片段")
-		}
-		if hasAccountPlaceholder {
-			if parsed.User == nil || !strings.Contains(parsed.User.Username(), proxyAccountSentinel) {
-				return "", errors.New("{account} 只能用于代理认证用户名")
-			}
-			return strings.ReplaceAll(parsed.String(), proxyAccountSentinel, ProxyAccountPlaceholder), nil
-		}
-		return parsed.String(), nil
-	case "vless", "trojan", "hysteria", "hysteria2", "hy", "hy2", "tuic", "anytls", "ssh", "wireguard", "wg", "shadowtls":
-		if parsed.Hostname() == "" {
-			return "", errors.New("代理地址格式无效")
-		}
-		// Keep original string so share-link query parameters survive.
-		return value, nil
 	default:
-		return "", errors.New("代理地址协议必须是 HTTP/SOCKS/SS/VMess/VLESS/Trojan/Hysteria/TUIC/AnyTLS/SSH/WireGuard 或 sing-box outbound JSON")
+		return "", errors.New("代理地址协议必须是 HTTP、HTTPS、SOCKS4 或 SOCKS5")
 	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return "", errors.New("代理地址不能包含路径、查询参数或片段")
+	}
+	if hasAccountPlaceholder {
+		if parsed.User == nil || !strings.Contains(parsed.User.Username(), proxyAccountSentinel) {
+			return "", errors.New("{account} 只能用于代理认证用户名")
+		}
+		return strings.ReplaceAll(parsed.String(), proxyAccountSentinel, ProxyAccountPlaceholder), nil
+	}
+	return parsed.String(), nil
 }
+
 func SanitizeCloudflareCookies(value string) string {
 	allowed := make([]string, 0, 4)
 	seen := make(map[string]struct{})
@@ -760,145 +895,4 @@ func SanitizeCloudflareCookies(value string) string {
 		allowed = append(allowed, lower+"="+cookieValue)
 	}
 	return strings.Join(allowed, "; ")
-}
-
-// RunFlareSolverrRefresh periodically refreshes Cloudflare clearance cookies for
-// enabled browser-scoped egress nodes via FlareSolverr (jiujiu532/grok2api style).
-func (s *Service) RunFlareSolverrRefresh(ctx context.Context) {
-	timer := time.NewTimer(15 * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-		cfg := s.flareConfig()
-		interval := cfg.RefreshInterval
-		if interval <= 0 {
-			interval = time.Hour
-		}
-		if cfg.Enabled && strings.TrimSpace(cfg.URL) != "" {
-			runCtx, cancel := context.WithTimeout(ctx, maxDuration(cfg.Timeout+30*time.Second, 2*time.Minute))
-			if err := s.RefreshClearanceAll(runCtx); err != nil && ctx.Err() == nil {
-				s.logger.Warn("flaresolverr_refresh_cycle_failed", "error", err)
-			}
-			cancel()
-		}
-		resetTimer(timer, interval)
-	}
-}
-
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func resetTimer(timer *time.Timer, d time.Duration) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(d)
-}
-
-// RefreshClearanceAll refreshes CF cookies for every enabled web/console egress node.
-func (s *Service) RefreshClearanceAll(ctx context.Context) error {
-	cfg := s.flareConfig()
-	if !cfg.Enabled || strings.TrimSpace(cfg.URL) == "" {
-		return nil
-	}
-	nodes, err := s.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	refreshed := 0
-	for _, node := range nodes {
-		if !node.Enabled || !scopesNeedBrowserIdentity(node.EffectiveScopes()) {
-			continue
-		}
-		if err := s.refreshNodeClearance(ctx, node, cfg); err != nil {
-			s.logger.Warn("flaresolverr_node_refresh_failed", "node_id", node.ID, "name", node.Name, "error", err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		refreshed++
-	}
-	if refreshed > 0 {
-		s.logger.Info("flaresolverr_refresh_completed", "refreshed", refreshed)
-	}
-	return firstErr
-}
-
-// RefreshClearanceNode refreshes one egress node via FlareSolverr and returns the public view.
-func (s *Service) RefreshClearanceNode(ctx context.Context, id uint64) (domain.PublicNode, error) {
-	cfg := s.flareConfig()
-	if !cfg.Enabled || strings.TrimSpace(cfg.URL) == "" {
-		return domain.PublicNode{}, fmt.Errorf("%w: 未启用 FlareSolverr 或未配置 URL", ErrInvalidInput)
-	}
-	node, err := s.repository.GetEgressNode(ctx, id)
-	if errors.Is(err, repository.ErrNotFound) {
-		return domain.PublicNode{}, ErrNotFound
-	}
-	if err != nil {
-		return domain.PublicNode{}, err
-	}
-	if !scopesNeedBrowserIdentity(node.EffectiveScopes()) {
-		return domain.PublicNode{}, fmt.Errorf("%w: 仅 Grok Web / Console 节点支持 Clearance 刷新", ErrInvalidInput)
-	}
-	if err := s.refreshNodeClearance(ctx, node, cfg); err != nil {
-		return domain.PublicNode{}, err
-	}
-	updated, err := s.repository.GetEgressNode(ctx, id)
-	if err != nil {
-		return domain.PublicNode{}, err
-	}
-	return s.publicNode(updated), nil
-}
-
-func (s *Service) refreshNodeClearance(ctx context.Context, node domain.Node, cfg FlareSolverrConfig) error {
-	proxyURL := ""
-	if node.EncryptedProxyURL != "" {
-		plain, err := s.cipher.Decrypt(node.EncryptedProxyURL)
-		if err != nil {
-			return fmt.Errorf("解密代理地址: %w", err)
-		}
-		// Placeholder accounts cannot be rendered without a credential; skip proxy for FS solve.
-		if !strings.Contains(plain, ProxyAccountPlaceholder) {
-			proxyURL = plain
-		}
-	}
-	result, err := flaresolverr.SolveClearance(ctx, cfg.URL, cfg.TargetURL, proxyURL, cfg.Timeout)
-	if err != nil {
-		return err
-	}
-	encrypted, err := s.cipher.Encrypt(result.Cookies)
-	if err != nil {
-		return err
-	}
-	node.EncryptedCloudflareCookie = encrypted
-	if ua := strings.TrimSpace(result.UserAgent); ua != "" && !isRandomUserAgent(node.UserAgent) {
-		// Keep admin "random" mode; otherwise adopt the UA FlareSolverr used for the challenge.
-		if strings.TrimSpace(node.UserAgent) == "" || node.UserAgent == s.defaultUserAgent(node.Scope) {
-			node.UserAgent = ua
-		}
-	}
-	// Clear prior CF-related failure state after a successful solve.
-	node.LastError = ""
-	node.FailureCount = 0
-	node.CooldownUntil = nil
-	if node.Health < 1 {
-		node.Health = 1
-	}
-	if _, err := s.repository.UpdateEgressNode(ctx, node); err != nil {
-		return err
-	}
-	return nil
 }

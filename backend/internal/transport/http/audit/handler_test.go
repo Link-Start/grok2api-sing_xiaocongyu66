@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,5 +79,87 @@ func TestAuditDetailReturnsCompleteTextAndBinaryBodies(t *testing.T) {
 	router.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/admin/v1/request-audits/999", nil))
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestAuditResponseDerivesOutputThroughput(t *testing.T) {
+	firstTokenMS := int64(250)
+	response := newAuditResponse(auditdomain.Record{StatusCode: http.StatusOK, Streaming: true, FirstTokenMS: &firstTokenMS, DurationMS: 1250, OutputTokens: 80})
+	if response.FirstTokenMS == nil || *response.FirstTokenMS != 250 || response.OutputTokensPerSecond == nil || *response.OutputTokensPerSecond != 80 {
+		t.Fatalf("response = %#v", response)
+	}
+
+	unmeasured := newAuditResponse(auditdomain.Record{DurationMS: 1250, OutputTokens: 80})
+	if unmeasured.OutputTokensPerSecond != nil {
+		t.Fatalf("unmeasured throughput = %v", *unmeasured.OutputTokensPerSecond)
+	}
+}
+
+func TestQualityGuardAuditListMarksOwnProbeWithoutExposingKeyIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-guard-audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAuditRepository(database)
+	now := time.Now().UTC()
+	if err := repository.CreateBatch(ctx, []auditdomain.Record{
+		{RequestID: "guard-probe", ClientKeyID: 7, ClientKeyName: "secret-guard-name", ModelRouteID: 1, Provider: "grok_build", StatusCode: 200, CreatedAt: now},
+		{RequestID: "user-request", ClientKeyID: 8, ClientKeyName: "secret-user-name", ModelRouteID: 1, Provider: "grok_build", StatusCode: 200, CreatedAt: now.Add(-time.Second)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := auditapp.NewService(repository, slog.Default(), 8, 4, time.Second)
+	router := gin.New()
+	NewQualityGuardHandler(service, 7).RegisterQualityGuard(router.Group(""))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/request-audits?pageSize=20", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"requestId":"guard-probe","qualityProbe":true`) || !strings.Contains(body, `"requestId":"user-request","qualityProbe":false`) {
+		t.Fatalf("probe markers missing: %s", body)
+	}
+	if strings.Contains(body, "clientKeyId") || strings.Contains(body, "clientKeyName") || strings.Contains(body, "secret-") {
+		t.Fatalf("client key identity leaked: %s", body)
+	}
+}
+
+func TestAuditResponseExplainsBillingWithoutChangingStoredTotal(t *testing.T) {
+	estimated := newAuditResponse(auditdomain.Record{
+		InputTokens: 100, CachedInputTokens: 20, OutputTokens: 50, ContextInputTokens: 100,
+		EstimatedCostInUSDTicks: 1_840_000, PricingModel: "grok-build-0.1", PricingVersion: auditdomain.OfficialPricingAsOf,
+	})
+	if estimated.Billing == nil || estimated.Billing.Source != "official" || estimated.Billing.Method != "official_rates" || estimated.Billing.TotalInUSDTicks != 1_840_000 || len(estimated.Billing.Components) != 3 {
+		t.Fatalf("estimated billing = %#v", estimated.Billing)
+	}
+	if estimated.Billing.Components[0].Kind != "uncached_input" || estimated.Billing.Components[1].Kind != "output" || estimated.Billing.Components[2].Kind != "cached_input" {
+		t.Fatalf("billing component order = %#v", estimated.Billing.Components)
+	}
+	var componentTotal int64
+	for _, component := range estimated.Billing.Components {
+		componentTotal += component.SubtotalInUSDTicks
+	}
+	if componentTotal != estimated.Billing.TotalInUSDTicks {
+		t.Fatalf("component total = %d, billing = %#v", componentTotal, estimated.Billing)
+	}
+
+	upstream := newAuditResponse(auditdomain.Record{CostInUSDTicks: 2_500_000})
+	if upstream.Billing == nil || upstream.Billing.Source != "upstream" || upstream.Billing.Method != "upstream_reported" || upstream.Billing.TotalInUSDTicks != 2_500_000 || len(upstream.Billing.Components) != 0 {
+		t.Fatalf("upstream billing = %#v", upstream.Billing)
+	}
+
+	historical := newAuditResponse(auditdomain.Record{
+		InputTokens: 100, CachedInputTokens: 20, OutputTokens: 50,
+		EstimatedCostInUSDTicks: 1_840_000, PricingModel: "grok-build-0.1", PricingVersion: "2026-07-11",
+	})
+	if historical.Billing == nil || historical.Billing.Method != "stored_estimate" || len(historical.Billing.Components) != 0 || historical.Billing.TotalInUSDTicks != 1_840_000 {
+		t.Fatalf("historical billing = %#v", historical.Billing)
 	}
 }

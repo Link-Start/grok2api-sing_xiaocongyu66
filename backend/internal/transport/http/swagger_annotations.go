@@ -39,6 +39,8 @@ type SwaggerImageGenerationRequest struct {
 	AspectRatio    string `json:"aspect_ratio,omitempty" example:"16:9"`
 	Resolution     string `json:"resolution,omitempty" example:"2k"`
 	ResponseFormat string `json:"response_format,omitempty" example:"url"`
+	Stream         bool   `json:"stream,omitempty" example:"false"`
+	PartialImages  int    `json:"partial_images,omitempty" example:"0"`
 }
 
 // SwaggerImageReference 表示图片 URL 输入。
@@ -52,8 +54,12 @@ type SwaggerImageEditRequest struct {
 	Prompt         string                `json:"prompt" example:"Change the background to black"`
 	Image          SwaggerImageReference `json:"image"`
 	N              int                   `json:"n" example:"1"`
+	Size           string                `json:"size,omitempty" example:"1024x1024"`
+	AspectRatio    string                `json:"aspect_ratio,omitempty" example:"1:1"`
 	Resolution     string                `json:"resolution,omitempty" example:"1k"`
 	ResponseFormat string                `json:"response_format,omitempty" example:"url"`
+	Stream         bool                  `json:"stream,omitempty" example:"false"`
+	PartialImages  int                   `json:"partial_images,omitempty" example:"0"`
 }
 
 // SwaggerVideoGenerationRequest 表示视频生成请求。
@@ -83,8 +89,7 @@ func swaggerHealth() {}
 func swaggerReady() {}
 
 // swaggerModels godoc
-// @Summary 获取模型列表
-// @Description 与管理端「模型列表」一致：返回已启用的 model_routes；对列表中已有上游的兼容别名（如 grok-4.20-multi-agent-xhigh）一并暴露。非固定写死清单。
+// @Summary 获取可用模型
 // @Tags Models
 // @Security BearerAuth
 // @Produce json

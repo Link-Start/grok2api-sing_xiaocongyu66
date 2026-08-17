@@ -15,6 +15,7 @@ Thumbs.db
 /config.local.yaml
 /config.*.local.yaml
 /docs/*
+/docs/rules/*
 /backend/docs/goal/
 *.har
 *.pcap
@@ -28,11 +29,14 @@ Thumbs.db
 # Go
 /.gocache/
 /.gocache-*/
-/.gotmp/
 /backend/grok2api
 /backend/coverage.out
 *.coverprofile
 *.test
+
+# Python
+__pycache__/
+*.py[cod]
 
 # Frontend
 /.pnpm-store/
@@ -45,3 +49,4 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+/Dockerfile.local

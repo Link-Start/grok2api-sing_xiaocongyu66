@@ -27,7 +27,7 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 		}
 		switch itemType {
 		case "message":
-			converted, err := normalizeMessageInput(item, param)
+			converted, err := c.normalizeMessageInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -41,7 +41,7 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "function_call_output":
-			converted, err := normalizeFunctionCallOutputInput(item, param)
+			converted, err := c.normalizeFunctionCallOutputInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -53,10 +53,8 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			rewritten = append(rewritten, converted)
 		case "file_search_call", "web_search_call", "image_generation_call", "code_interpreter_call",
 			"shell_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "mcp_call", "compaction":
-			// 这些类型已进入 Grok Build 0.2.103 的 Responses InputItem 契约。
-			// 仅清理 Codex 私有字段和 null，不能把原生调用降级成文本边界。
-			// 注意：type=compaction 的 encrypted_content 应已在 expandGatewayCompactionHistory
-			// 中展开；若仍到达此处，保持最小字段以免破坏密文。
+			// These types are part of the native Grok Build Responses InputItem contract.
+			// Remove only Codex-private fields and nulls; native calls must not degrade to text.
 			converted := sanitizeNativeHistoryInput(item, itemType)
 			c.changed = true
 			rewritten = append(rewritten, converted)
@@ -123,7 +121,7 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "custom_tool_call_output":
-			converted, err := normalizeFunctionCallOutputInput(item, param)
+			converted, err := c.normalizeCustomToolCallOutputInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -182,9 +180,6 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "compaction_trigger":
-			// Grok Build 0.2.103 remote compaction v2: trigger must be last and unique.
-			// Emulate via gateway-owned sampling (see forwardGatewayCompaction) instead of
-			// forwarding the trigger or a foreign compact blob to upstream.
 			if c.compactionRequested {
 				return nil, nil, nil, &responsesRequestError{Message: "compaction_trigger 只能出现一次", Param: param, Code: "invalid_parameter"}
 			}
@@ -194,8 +189,6 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.compactionRequested = true
 			c.changed = true
 			c.addWarning("remote_compaction_v2_emulated")
-			// Drop the trigger item; adapter runs prepareGatewayCompactionSample next.
-
 		case "additional_tools":
 			marker, additional, visible, err := c.normalizeAdditionalToolsInput(item, param)
 			if err != nil {
@@ -270,6 +263,11 @@ func sanitizeReasoningInput(item map[string]any) map[string]any {
 	// id、summary、content 和可选 encrypted_content。密文不是回放的前置条件。
 	converted := copyNonNullHistoryFields(item, "id", "summary", "content", "encrypted_content")
 	converted["type"] = "reasoning"
+	if encrypted, ok := converted["encrypted_content"].(string); ok && strings.TrimSpace(encrypted) != "" {
+		if _, exists := converted["summary"]; !exists {
+			converted["summary"] = []any{}
+		}
+	}
 	if !hasPortableReasoningContent(converted) {
 		return compatibilityBoundaryMessage("A prior model reasoning item was omitted because it has no portable content for Grok Build.")
 	}
@@ -288,8 +286,8 @@ func hasPortableReasoningContent(item map[string]any) bool {
 	return false
 }
 
-// sanitizeNativeHistoryInput 按 Grok Build 0.2.103 的原生 InputItem 字段重建历史，
-// 避免 Codex 扩展元数据干扰 Rust untagged enum 的反序列化。
+// sanitizeNativeHistoryInput rebuilds history from native Grok Build InputItem fields
+// so Codex extension metadata cannot interfere with Rust untagged enum deserialization.
 func sanitizeNativeHistoryInput(item map[string]any, itemType string) map[string]any {
 	var fields []string
 	switch itemType {
@@ -312,19 +310,7 @@ func sanitizeNativeHistoryInput(item map[string]any, itemType string) map[string
 	case "mcp_call":
 		fields = []string{"arguments", "id", "name", "server_label", "approval_request_id", "error", "output", "status"}
 	case "compaction":
-		// encrypted_content must remain byte-stable; only pass through string as-is.
 		fields = []string{"id", "encrypted_content"}
-	}
-	if itemType == "compaction" {
-		converted := map[string]any{"type": "compaction"}
-		if id := strings.TrimSpace(stringField(item, "id")); id != "" {
-			converted["id"] = id
-		}
-		if enc, ok := item["encrypted_content"].(string); ok && enc != "" {
-			// Do not re-encode via sanitizeHistoryJSONValue (could alter whitespace/escaping).
-			converted["encrypted_content"] = enc
-		}
-		return converted
 	}
 	converted := copyNonNullHistoryFields(item, fields...)
 	converted["type"] = itemType

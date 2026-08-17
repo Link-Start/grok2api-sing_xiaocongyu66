@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -22,11 +23,17 @@ type importDocument struct {
 }
 
 type importEntry struct {
-	Name              string `json:"name"`
-	SSOToken          string `json:"sso_token"`
-	Token             string `json:"token"`
-	Tier              string `json:"tier"`
-	CloudflareCookies string `json:"cloudflare_cookies"`
+	Name              string     `json:"name"`
+	Email             string     `json:"email,omitempty"`
+	UserID            string     `json:"user_id,omitempty"`
+	SSOToken          string     `json:"sso_token"`
+	Token             string     `json:"token"`
+	Tier              string     `json:"tier"`
+	CloudflareCookies string     `json:"cloudflare_cookies"`
+	NSFWEnabledAt     *time.Time `json:"nsfw_enabled_at,omitempty"`
+	TOSAcceptedAt     *time.Time `json:"tos_accepted_at,omitempty"`
+	TOSVersion        int        `json:"tos_version,omitempty"`
+	BirthDateSetAt    *time.Time `json:"birth_date_set_at,omitempty"`
 }
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
@@ -35,7 +42,8 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 	if trimmed == "" {
 		return nil, fmt.Errorf("账号文件中没有 Grok Web 账号")
 	}
-	if !strings.HasPrefix(trimmed, "{") {
+	// 「[」为 JSON 保留前缀：顶层裸数组走 JSON 解析，避免被当成纯文本 token 静默导入。
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
 		return parsePlainTextCredentials(trimmed)
 	}
 	entries, err := provider.DecodeCredentialJSONEntries[importEntry](data, string(account.ProviderWeb), maxImportAccounts)
@@ -72,7 +80,10 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 		}
 		result = append(result, provider.CredentialSeed{
 			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
-			Name: name, SourceKey: "sso:" + security.HashToken(token), AccessToken: token, CloudflareCookies: entry.CloudflareCookies,
+			Name: name, Email: strings.TrimSpace(entry.Email), UserID: strings.TrimSpace(entry.UserID),
+			SourceKey: "sso:" + security.HashToken(token), AccessToken: token, CloudflareCookies: entry.CloudflareCookies,
+			WebNSFWEnabledAt: entry.NSFWEnabledAt, WebTermsAcceptedAt: entry.TOSAcceptedAt,
+			WebTermsAcceptedVersion: entry.TOSVersion, WebBirthDateSetAt: entry.BirthDateSetAt,
 		})
 	}
 	return result, nil
@@ -111,7 +122,12 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	document := importDocument{Provider: string(account.ProviderWeb), Accounts: make([]importEntry, 0, len(values))}
 	for _, value := range values {
-		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, SSOToken: value.AccessToken, Tier: string(value.WebTier)})
+		document.Accounts = append(document.Accounts, importEntry{
+			Name: value.Name, Email: value.Email, UserID: value.UserID, SSOToken: value.AccessToken,
+			Tier: string(value.WebTier), CloudflareCookies: value.CloudflareCookies,
+			NSFWEnabledAt: value.WebNSFWEnabledAt, TOSAcceptedAt: value.WebTermsAcceptedAt,
+			TOSVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt,
+		})
 	}
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {

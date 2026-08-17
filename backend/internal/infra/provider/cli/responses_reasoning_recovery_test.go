@@ -61,8 +61,7 @@ func TestRecoverReasoningDecodeFailureRetriesSameUpstreamOnce(t *testing.T) {
 			if request.Header.Get("Idempotency-Key") != "original-id" {
 				t.Fatalf("first idempotency key = %q", request.Header.Get("Idempotency-Key"))
 			}
-			// After Messages→Responses normalize, summary may be omitted when empty.
-			if !strings.Contains(string(data), `"encrypted_content":"opaque"`) {
+			if !strings.Contains(string(data), `"encrypted_content":"opaque"`) || !strings.Contains(string(data), `"summary":[]`) {
 				t.Fatalf("first body = %s", data)
 			}
 			return jsonHTTPResponse(request, http.StatusBadRequest, `{"error":"Could not decrypt the provided encrypted_content. Ensure the value is unmodified."}`), nil
@@ -155,6 +154,7 @@ func TestRecoverReasoningDecodeFailureStaysOnXAIFallbackPlane(t *testing.T) {
 	response, err := adapter.ForwardResponse(t.Context(), provider.ResponseResourceRequest{
 		Credential: account.Credential{
 			ID: 1, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted,
+			BuildRouteMode: account.BuildRouteAuto, BuildSuperEntitled: true,
 		},
 		Method: http.MethodPost, Path: "/responses", Model: "grok-4.5",
 		Body: []byte(`{"model":"grok-4.5","input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"},{"role":"user","content":"continue"}]}`),
@@ -448,8 +448,8 @@ func newReasoningRecoveryTestAdapter(t *testing.T) (*Adapter, string) {
 	}
 	return NewAdapter(Config{
 		BaseURL: "https://build.test/v1", FallbackBaseURL: "https://xai.test/v1",
-		ClientVersion: "0.2.106", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
-		UserAgent: "grok-shell/0.2.106 (linux; x86_64)",
+		ClientVersion: "0.2.110", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+		UserAgent: "grok-shell/0.2.110 (linux; x86_64)",
 	}, cipher), encrypted
 }
 
@@ -462,10 +462,6 @@ func jsonHTTPResponse(request *http.Request, status int, body string) *http.Resp
 }
 
 type reasoningRecoveryFallbackMarker struct{}
-
-func (reasoningRecoveryFallbackMarker) CanUseBuildAPIFallback(context.Context, uint64) (bool, error) {
-	return true, nil
-}
 
 func (reasoningRecoveryFallbackMarker) MarkBuildAPIFallback(context.Context, uint64, bool) error {
 	return nil

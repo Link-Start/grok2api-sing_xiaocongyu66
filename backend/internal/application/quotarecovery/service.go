@@ -2,12 +2,10 @@ package quotarecovery
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"time"
 
-	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -19,10 +17,11 @@ const (
 	recoveryProbeTimeout   = 30 * time.Second
 	recoveryReconcileEvery = time.Minute
 	recoveryReconcileLimit = 1000
+	consoleProbeInterval   = 24 * time.Hour
 )
 
 type quotaSynchronizer interface {
-	RefreshQuotaMode(ctx context.Context, accountID uint64, mode string) (accountdomain.QuotaWindow, error)
+	ProbeQuotaMode(ctx context.Context, accountID uint64, mode string) (accountdomain.QuotaWindow, error)
 	ListDueQuotaWindows(ctx context.Context, now time.Time, limit int) ([]accountdomain.QuotaWindow, error)
 }
 
@@ -93,7 +92,7 @@ func (s *Service) runDue(ctx context.Context, now time.Time) {
 
 func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain.QuotaRecoveryEvent) {
 	probeCtx, cancel := context.WithTimeout(ctx, recoveryProbeTimeout)
-	window, probeErr := s.syncer.RefreshQuotaMode(probeCtx, value.AccountID, value.Mode)
+	window, probeErr := s.syncer.ProbeQuotaMode(probeCtx, value.AccountID, value.Mode)
 	cancel()
 	if probeErr == nil && window.Remaining > 0 {
 		if err := s.queue.AckQuotaRecovery(ctx, value); err != nil {
@@ -104,17 +103,18 @@ func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain
 	if ctx.Err() != nil {
 		return
 	}
-	// Deleted or permanently gone account: ack to remove the stale recovery task from the scheduler queue.
-	// Prevents the quota recovery scheduler from spinning on non-existent accounts after bulk deletes etc.
-	if errors.Is(probeErr, accountapp.ErrNotFound) {
-		if err := s.queue.AckQuotaRecovery(ctx, value); err != nil {
-			s.logger.Warn("quota_recovery_ack_failed", "account_id", value.AccountID, "mode", value.Mode, "error", err)
-		}
-		return
-	}
 	value.Attempts++
 	if probeErr == nil && window.ResetAt != nil && window.ResetAt.After(now) {
 		value.DueAt = *window.ResetAt
+	} else if probeErr == nil && value.Mode == "console" {
+		// Console usage currently exposes no reset timestamp. A healthy zero
+		// result is therefore rechecked after the fixed 24-hour prediction
+		// window; transport failures still use bounded exponential backoff.
+		value.DueAt = now.Add(consoleProbeInterval)
+	} else if probeErr == nil && window.WindowSeconds > 0 {
+		// Preserve Provider-specific upstream window semantics. In particular,
+		// Grok Web can report a duration without an absolute reset timestamp.
+		value.DueAt = now.Add(time.Duration(window.WindowSeconds) * time.Second)
 	} else {
 		value.DueAt = now.Add(s.backoff(value.Attempts))
 	}
@@ -124,17 +124,6 @@ func (s *Service) runOne(ctx context.Context, now time.Time, value accountdomain
 }
 
 func (s *Service) reconcileDue(ctx context.Context, now time.Time) {
-	// Prefer local console window restore (no upstream call) when the delayed
-	// rotation timer has elapsed. Falls back to RefreshQuotaMode for remote modes.
-	if resetter, ok := s.syncer.(interface {
-		ResetExpiredLocalQuotaWindows(context.Context, time.Time) (int, error)
-	}); ok {
-		if count, err := resetter.ResetExpiredLocalQuotaWindows(ctx, now); err != nil {
-			s.logger.Warn("console_quota_local_reset_failed", "error", err)
-		} else if count > 0 {
-			s.logger.Info("console_quota_local_reset", "count", count)
-		}
-	}
 	windows, err := s.syncer.ListDueQuotaWindows(ctx, now, recoveryReconcileLimit)
 	if err != nil {
 		s.logger.Warn("quota_recovery_reconcile_failed", "error", err)

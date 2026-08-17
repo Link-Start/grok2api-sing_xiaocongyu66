@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -55,14 +56,14 @@ func (s *Service) RecoverCriticalCredentials(ctx context.Context, expiresWithin 
 		if getErr != nil {
 			return getErr
 		}
-		if credential.RefreshPermanent {
+		if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
 			if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
 				return nil
 			}
 			return s.MarkReauthRequired(taskCtx, id, permanentRefreshExpiredReason)
 		}
 		// 临界凭据不受进程内强制刷新节流影响；分布式账号锁和旋转 Token 比对仍避免重复 OAuth。
-		_, refreshErr := s.ensureCredential(taskCtx, credential, true, true, false)
+		_, refreshErr := s.ensureCredential(taskCtx, credential, ensureCredentialOptions{force: true, bypassCooldown: true})
 		return refreshErr
 	})
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -108,9 +109,7 @@ func (s *Service) RunCredentialRefresh(ctx context.Context) {
 }
 
 func (s *Service) refreshDueCredentials(ctx context.Context) error {
-	// Schedule backfill is O(unscheduling rows); throttle so a large fleet does not
-	// re-scan on every timer tick. Startup RecoverCriticalCredentials still does a full reconcile.
-	if err := s.reconcileCredentialSchedulesThrottled(ctx); err != nil {
+	if _, err := s.ReconcileCredentialSchedules(ctx); err != nil {
 		return err
 	}
 	for {
@@ -121,14 +120,9 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 		if len(ids) == 0 {
 			return nil
 		}
-		// Partial batch failure must not abort the whole due-set: one bad token should
-		// not block refresh of the remaining accounts in the same tick.
 		_, failed, batchErr := s.runAccountBatch(ctx, "credential_auto_refresh", ids, s.refreshPool, nil, func(workCtx context.Context, id uint64) error {
 			taskCtx, cancel := context.WithTimeout(workCtx, credentialRefreshTimeout)
 			defer cancel()
-			if s.refreshSkipping(id, s.now()) {
-				return nil
-			}
 			credential, err := s.accounts.Get(taskCtx, id)
 			if err != nil {
 				return err
@@ -136,7 +130,7 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 			if !credential.Enabled || credential.AuthStatus != accountdomain.AuthStatusActive || s.providers == nil || !s.providers.SupportsCredentialRefresh(credential.Provider) || credential.EncryptedRefreshToken == "" {
 				return nil
 			}
-			if credential.RefreshPermanent {
+			if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
 				if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
 					return nil
 				}
@@ -145,37 +139,19 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 			if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(s.now()) {
 				return nil
 			}
-			_, err = s.ensureCredential(taskCtx, credential, true, false, true)
+			_, err = s.ensureCredential(taskCtx, credential, ensureCredentialOptions{force: true, respectSchedule: true})
 			return err
 		})
-		if batchErr != nil && !errors.Is(batchErr, context.Canceled) && !errors.Is(batchErr, context.DeadlineExceeded) {
-			s.logger.Warn("credential_auto_refresh_batch_error", "error", batchErr, "batch_size", len(ids), "failed", failed)
-		} else if failed > 0 {
-			s.logger.Warn("credential_auto_refresh_partial_failure", "failed", failed, "batch_size", len(ids))
+		if batchErr != nil {
+			return fmt.Errorf("自动刷新批次执行失败: %w", batchErr)
+		}
+		if failed > 0 {
+			return fmt.Errorf("自动刷新批次失败 %d/%d", failed, len(ids))
 		}
 		if len(ids) < credentialRefreshBatchSize {
 			return nil
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 	}
-}
-
-// reconcileCredentialSchedulesThrottled runs ReconcileCredentialSchedules at most once
-// per credentialScheduleReconcileEvery unless never run before.
-func (s *Service) reconcileCredentialSchedulesThrottled(ctx context.Context) error {
-	s.scheduleReconcileMu.Lock()
-	defer s.scheduleReconcileMu.Unlock()
-	now := s.now()
-	if !s.lastScheduleReconcile.IsZero() && now.Sub(s.lastScheduleReconcile) < credentialScheduleReconcileEvery {
-		return nil
-	}
-	if _, err := s.ReconcileCredentialSchedules(ctx); err != nil {
-		return err
-	}
-	s.lastScheduleReconcile = now
-	return nil
 }
 
 func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration, error) {

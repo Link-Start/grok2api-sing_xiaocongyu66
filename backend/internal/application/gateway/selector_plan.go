@@ -3,6 +3,7 @@ package gateway
 import (
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"time"
 
@@ -14,8 +15,9 @@ type candidateScore struct {
 	index           int
 	tier            int
 	preferFreeBuild bool
+	quotaKnown      bool
+	quotaAvailable  bool
 	billingFresh    bool
-	failureCount    int
 	inFlight        int
 	remaining       float64
 	lastSelected    time.Time
@@ -65,6 +67,15 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
 		return leftCandidate.ModelCapabilityKnown
 	}
+	// A synced remote window with remaining quota is a stronger routing signal
+	// than priority or tier. Unknown windows remain eligible as a fallback, but
+	// cannot displace an account whose requested mode is known to be available.
+	if leftScore.quotaAvailable != rightScore.quotaAvailable {
+		return leftScore.quotaAvailable
+	}
+	if leftScore.quotaKnown != rightScore.quotaKnown {
+		return leftScore.quotaKnown
+	}
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
 	}
@@ -73,10 +84,6 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	}
 	if left.Priority != right.Priority {
 		return left.Priority > right.Priority
-	}
-	// Optional: push recently-failed accounts to the back of the pool.
-	if leftScore.failureCount != rightScore.failureCount {
-		return leftScore.failureCount < rightScore.failureCount
 	}
 	if leftScore.billingFresh != rightScore.billingFresh {
 		return leftScore.billingFresh
@@ -98,7 +105,8 @@ func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingC
 	return s.planCandidateIndexes(ctx, values, nil, now, tierOrder)
 }
 
-// planCandidateIndexes plans over immutable snapshot indexes (nil = all values).
+// planCandidateIndexes 在不可变候选快照上按下标规划，避免过滤阶段复制完整账号结构。
+// indexes 为 nil 时表示使用 values 的全部元素。
 func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
 	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, nil, s.preferFreeBuildEnabled())
 }
@@ -157,62 +165,86 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		}
 	}
 
-	s.mu.Lock()
-	deprioritizeFailed := s.deprioritizeFailedAccounts
-	scores := make([]candidateScore, length)
+	s.selectionMu.RLock()
+	scores := make([]candidateScore, 0, length)
 	for position := range length {
 		index := position
 		if indexes != nil {
 			index = indexes[position]
 		}
 		candidate := values[index]
+		limit := candidate.Credential.MaxConcurrent
+		if limit <= 0 {
+			limit = account.DefaultMaxConcurrent
+		}
+		// 已知满载的账号不进入计划，避免高优先级满载账号逐个 claim 失败后
+		// 才轮到仍有容量的低优先级账号。
+		if inFlight[position] >= limit {
+			continue
+		}
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
-		if deprioritizeFailed {
-			score.failureCount = candidate.Credential.FailureCount
+		// 只有真实上游快照能够证明账号具备该模式额度。历史默认值和
+		// 本地预测值都属于未知能力，只保留为路由兜底。
+		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Source == account.QuotaSourceUpstream {
+			score.quotaKnown = true
+			score.quotaAvailable = candidate.QuotaWindow.Remaining > 0
 		}
-		// Prefer accounts with more local window quota (Web/Console); Billing remaining for Build.
-		if candidate.QuotaWindow != nil {
-			score.remaining = float64(candidate.QuotaWindow.Remaining)
-			if candidate.QuotaWindow.SyncedAt != nil {
-				score.billingFresh = now.Sub(*candidate.QuotaWindow.SyncedAt) <= 30*time.Minute
-			} else {
-				score.billingFresh = now.Sub(candidate.QuotaWindow.UpdatedAt) <= 30*time.Minute
-			}
-		} else if candidate.Billing != nil {
+		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
 		}
-		scores[position] = score
+		scores = append(scores, score)
 	}
-	s.mu.Unlock()
-
+	s.selectionMu.RUnlock()
 	plan := &candidatePlan{values: values, scores: scores}
 	heap.Init(plan)
 	return plan, nil
 }
 
+// loadConcurrencySnapshot 在极短窗口内合并相同候选池的并发快照读取。
+// 快照只参与排序，最终容量仍由原子 Acquire 校验，因此陈旧快照不会突破账号并发上限。
 func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (map[string]int, error) {
-	values := make(map[string]int, len(keys))
-	if batchReader, ok := s.concurrency.(repository.ConcurrencySnapshotReader); ok {
-		var err error
-		values, err = batchReader.CurrentMany(ctx, keys)
-		if err != nil {
-			return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+	cacheKey := concurrencySnapshotKey(keys)
+	load := func() (map[string]int, error) {
+		values := make(map[string]int, len(keys))
+		if batchReader, ok := s.concurrency.(repository.ConcurrencySnapshotReader); ok {
+			var err error
+			values, err = batchReader.CurrentMany(ctx, keys)
+			if err != nil {
+				return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
+			}
+		} else {
+			for _, key := range keys {
+				current, err := s.concurrency.Current(ctx, key)
+				if err != nil {
+					return nil, fmt.Errorf("读取账号并发租约: %w", err)
+				}
+				values[key] = current
+			}
 		}
 		return values, nil
 	}
-	for _, key := range keys {
-		current, err := s.concurrency.Current(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("读取账号并发租约: %w", err)
-		}
-		values[key] = current
+	// 仅测试中的手工 Selector 可能没有初始化缓存，保持最小兼容回退。
+	if s.concurrencySnapshots == nil {
+		return load()
 	}
-	return values, nil
+	return s.concurrencySnapshots.Load(ctx, cacheKey, time.Now(), load)
+}
+
+func concurrencySnapshotKey(keys []string) [32]byte {
+	hash := sha256.New()
+	separator := []byte{0}
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write(separator)
+	}
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result
 }
 
 func accountConcurrencyKey(accountID uint64) string {

@@ -5,12 +5,13 @@ import "time"
 type Operation string
 
 const (
-	OperationResponses Operation = "responses"
-	OperationChat      Operation = "chat"
-	OperationMessages  Operation = "messages"
-	OperationImage     Operation = "image"
-	OperationImageEdit Operation = "image_edit"
-	OperationVideo     Operation = "video"
+	OperationResponses  Operation = "responses"
+	OperationCompaction Operation = "compaction"
+	OperationChat       Operation = "chat"
+	OperationMessages   Operation = "messages"
+	OperationImage      Operation = "image"
+	OperationImageEdit  Operation = "image_edit"
+	OperationVideo      Operation = "video"
 )
 
 type UsageSource string
@@ -73,12 +74,6 @@ type Record struct {
 	ClientKeyName           string
 	ModelRouteID            uint64
 	ModelPublicID           string
-	// ClientModel is the model id from the client request when it differs from the
-	// resolved route public id (e.g. grok-4.5-high or multi-agent-xhigh aliases).
-	ClientModel             string
-	// ReasoningEffort is the effective thinking strength for this request
-	// (alias-forced or body reasoning.effort / reasoning_effort).
-	ReasoningEffort         string
 	ModelUpstreamModel      string
 	Provider                string
 	Operation               Operation
@@ -107,14 +102,11 @@ type Record struct {
 	NumServerSideToolsUsed  int64
 	ContextInputTokens      int64
 	ContextOutputTokens     int64
+	FirstTokenMS            *int64
 	DurationMS              int64
 	ErrorCode               string
 	AttemptCount            int
 	Attempts                []Attempt
-	// ClientType is a stable id (claude_code, codex, hermes, …); ClientUserAgent is truncated raw UA.
-	ClientType              string
-	ClientUserAgent         string
-	ClientIP                string
 	CreatedAt               time.Time
 }
 

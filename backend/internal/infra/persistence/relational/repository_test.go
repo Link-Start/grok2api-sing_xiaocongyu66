@@ -256,136 +256,6 @@ func TestAccountRepositoryDecrementsQuotaByAmountAtomically(t *testing.T) {
 	}
 }
 
-func TestAccountRepositorySummarizesWebPoolsAndConsoleQuota(t *testing.T) {
-	ctx := context.Background()
-	repo := NewAccountRepository(openTestDatabase(t))
-	now := time.Now().UTC()
-
-	createWeb := func(name string, tier account.WebTier) account.Credential {
-		value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
-			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
-			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := repo.SaveQuotaWindows(ctx, value.ID, tier, now, []account.QuotaWindow{{
-			AccountID: value.ID, Mode: "fast", Remaining: 10, Total: 30, UpdatedAt: now,
-		}}); err != nil {
-			t.Fatal(err)
-		}
-		return value
-	}
-	createWeb("web-basic", account.WebTierBasic)
-	createWeb("web-super", account.WebTierSuper)
-	createWeb("web-heavy", account.WebTierHeavy)
-
-	createConsole := func(name string, remaining int, rotating bool) {
-		credential, _, err := repo.UpsertByIdentity(ctx, account.Credential{
-			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
-			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive, Enabled: true,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var resetAt *time.Time
-		if rotating {
-			until := now.Add(time.Hour)
-			resetAt = &until
-		}
-		if err := repo.SaveQuotaWindows(ctx, credential.ID, "", now, []account.QuotaWindow{{
-			AccountID: credential.ID, Mode: "console", Remaining: remaining, Total: 20, WindowSeconds: 3600,
-			ResetAt: resetAt, Source: account.QuotaSourceDefault, UpdatedAt: now,
-		}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	createConsole("console-healthy", 18, false)
-	createConsole("console-rotating", 10, true)
-	createConsole("console-exhausted", 0, true)
-
-	pools, err := repo.SummarizeWebPools(ctx, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pools.Basic.Total != 1 || pools.Super.Total != 1 || pools.Heavy.Total != 1 {
-		t.Fatalf("web pools = %#v", pools)
-	}
-	consoleQuota, err := repo.SummarizeConsoleQuota(ctx, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if consoleQuota.Total != 3 || consoleQuota.Healthy != 1 || consoleQuota.Rotating != 1 || consoleQuota.Exhausted != 1 {
-		t.Fatalf("console quota = %#v", consoleQuota)
-	}
-	if consoleQuota.Remaining != 28 || consoleQuota.Capacity != 60 {
-		t.Fatalf("console remaining/capacity = %#v", consoleQuota)
-	}
-}
-
-func TestAccountRepositoryConsoleDelayedQuotaRotation(t *testing.T) {
-	ctx := context.Background()
-	repo := NewAccountRepository(openTestDatabase(t))
-	value, _, err := repo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "console-quota", SourceKey: "console-quota",
-		EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	if err := repo.SaveQuotaWindows(ctx, value.ID, "", now, []account.QuotaWindow{{
-		AccountID: value.ID, Mode: "console", Remaining: 20, Total: 20, WindowSeconds: 3600, Source: account.QuotaSourceDefault, UpdatedAt: now,
-	}}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Above the rotate threshold: remaining decreases, timer stays unset.
-	if updated, err := repo.DecrementQuotaWindowBy(ctx, value.ID, "console", 7, now); err != nil || !updated {
-		t.Fatalf("pre-threshold decrement updated=%v err=%v", updated, err)
-	}
-	windows, err := repo.GetQuotaWindows(ctx, []uint64{value.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(windows[value.ID]) != 1 || windows[value.ID][0].Remaining != 13 || windows[value.ID][0].ResetAt != nil {
-		t.Fatalf("pre-threshold window = %#v", windows[value.ID])
-	}
-
-	// Crossing the threshold starts the delayed recovery timer.
-	if updated, err := repo.DecrementQuotaWindowBy(ctx, value.ID, "console", 1, now); err != nil || !updated {
-		t.Fatalf("threshold decrement updated=%v err=%v", updated, err)
-	}
-	windows, err = repo.GetQuotaWindows(ctx, []uint64{value.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	window := windows[value.ID][0]
-	if window.Remaining != 12 || window.ResetAt == nil {
-		t.Fatalf("threshold window = %#v", window)
-	}
-	if delta := window.ResetAt.Sub(now); delta < 3599*time.Second || delta > 3601*time.Second {
-		t.Fatalf("reset_at delta = %s, want ~3600s", delta)
-	}
-
-	// After the timer elapses, the next decrement restores then consumes one unit.
-	expiredAt := window.ResetAt.Add(time.Second)
-	if err := repo.ExhaustQuotaWindow(ctx, value.ID, "console", window.ResetAt, now); err != nil {
-		t.Fatal(err)
-	}
-	// Force remaining=0 with past reset for the local-reset path via ResetExpiredLocalQuotaWindows.
-	if count, err := repo.ResetExpiredLocalQuotaWindows(ctx, expiredAt); err != nil || count != 1 {
-		t.Fatalf("local reset count=%d err=%v", count, err)
-	}
-	windows, err = repo.GetQuotaWindows(ctx, []uint64{value.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if windows[value.ID][0].Remaining != 20 || windows[value.ID][0].ResetAt != nil {
-		t.Fatalf("restored window = %#v", windows[value.ID][0])
-	}
-}
-
 func TestAccountRepositorySummarizesOperationalStates(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -465,6 +335,9 @@ func TestAccountRepositoryPersistsObservedBuildBillingFields(t *testing.T) {
 	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.UpdateObservedModel(context.Background(), credential.ID, "grok-4.5-build-free", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	if err := repo.SaveBilling(context.Background(), account.Billing{AccountID: credential.ID, IsUnifiedBillingUser: true, OnDemandEnabled: &onDemandEnabled, TopUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD", UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsagePeriodStart: "2026-07-12T00:00:00Z", UsagePeriodEnd: "2026-07-19T00:00:00Z", History: []account.BillingHistoryEntry{{Year: 2026, Month: 6}}, SyncedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -472,9 +345,36 @@ func TestAccountRepositoryPersistsObservedBuildBillingFields(t *testing.T) {
 	if err != nil || storedCredential.ObservedModel != "grok-4.5-build-free" || storedCredential.ObservedModelAt == nil {
 		t.Fatalf("credential = %#v, err = %v", storedCredential, err)
 	}
+	if !storedCredential.ObservedModelAt.Equal(now) {
+		t.Fatalf("unchanged observed model refreshed early at %v, want %v", storedCredential.ObservedModelAt, now)
+	}
 	billing, err := repo.GetBilling(context.Background(), credential.ID)
 	if err != nil || !billing.IsUnifiedBillingUser || billing.OnDemandEnabled == nil || *billing.OnDemandEnabled || billing.TopUpMethod != "TOP_UP_METHOD_SAVED_PAYMENT_METHOD" || billing.UsagePeriodType != "USAGE_PERIOD_TYPE_WEEKLY" || billing.UsagePeriodEnd != "2026-07-19T00:00:00Z" || len(billing.History) != 1 {
 		t.Fatalf("billing = %#v, err = %v", billing, err)
+	}
+}
+
+func TestAccountRepositoryRejectsStaleObservedModelWrite(t *testing.T) {
+	database := openTestDatabase(t)
+	repo := NewAccountRepository(database)
+	credential, _, err := repo.UpsertByIdentity(context.Background(), account.Credential{Provider: account.ProviderBuild, Name: "observed-order", SourceKey: "observed-order", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().UTC()
+	newer := older.Add(time.Minute)
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-newer", newer); err != nil || !updated {
+		t.Fatalf("newer observed model update = %v, err = %v", updated, err)
+	}
+	if updated, err := repo.UpdateObservedModelIfNewer(context.Background(), credential.ID, "grok-older", older); err != nil || updated {
+		t.Fatalf("stale observed model update = %v, err = %v", updated, err)
+	}
+	stored, err := repo.Get(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ObservedModel != "grok-newer" || stored.ObservedModelAt == nil || !stored.ObservedModelAt.Equal(newer) {
+		t.Fatalf("observed model after stale write = %q at %v", stored.ObservedModel, stored.ObservedModelAt)
 	}
 }
 
@@ -559,12 +459,24 @@ func TestFreshSchemaContract(t *testing.T) {
 			t.Fatalf("missing table for %T", model)
 		}
 	}
-	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
-	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "provider_accounts", []string{"provider", "source_key", "auth_status", "build_api_fallback", "build_route_mode", "build_super_entitled"}, []string{"oidc_client_id", "expires_at", "encrypted_access_token", "encrypted_refresh_token"})
+	assertTableColumns(t, database, "account_credentials", []string{"account_id", "auth_type", "client_id", "encrypted_primary", "encrypted_refresh", "expires_at", "refresh_due_at", "last_refresh_at", "refresh_failures", "last_refresh_error_status", "last_refresh_error", "last_refresh_error_message", "last_refresh_error_response", "refresh_permanent"}, nil)
+	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
-	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)
-	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "expires_at"}, []string{"parent_response_id", "model_route_id"})
+	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "first_token_ms"}, nil)
+	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "model_route_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id"})
+	assertTableColumns(t, database, "media_assets", []string{"expires_at"}, nil)
+	if !database.db.Migrator().HasIndex(&mediaAssetModel{}, "idx_media_assets_expires") {
+		t.Fatal("missing media asset expiry index")
+	}
+	var requestAuditSQL string
+	if err := database.db.Raw("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'request_audits'").Scan(&requestAuditSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(requestAuditSQL, "chk_request_audits_first_token_ms") {
+		t.Fatalf("first-token observability metadata must not require a table-level CHECK: %s", requestAuditSQL)
+	}
 
 	var expiresNotNull int
 	if err := database.db.Raw("SELECT `notnull` FROM pragma_table_info('account_credentials') WHERE name = 'expires_at'").Scan(&expiresNotNull).Error; err != nil {

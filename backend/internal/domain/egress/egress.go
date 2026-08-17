@@ -10,128 +10,156 @@ const (
 	ModePool   Mode = "pool"
 )
 
+const LastErrorTransport = "transport error"
+
 type Scope string
 
 const (
-	ScopeBuild    Scope = "grok_build"
-	ScopeWeb      Scope = "grok_web"
-	ScopeConsole  Scope = "grok_console"
-	ScopeWebAsset Scope = "grok_web_asset"
+	ScopeBuild        Scope = "grok_build"
+	ScopeWeb          Scope = "grok_web"
+	ScopeConsole      Scope = "grok_console"
+	ScopeWebAsset     Scope = "grok_web_asset"
+	ScopeConsoleAsset Scope = "grok_console_asset"
 )
 
-// AllScopes is the full set of assignable egress scopes.
-var AllScopes = []Scope{ScopeBuild, ScopeWeb, ScopeConsole, ScopeWebAsset}
+type Node struct {
+	ID                          uint64
+	Name                        string
+	Scope                       Scope
+	Enabled                     bool
+	ProxyPool                   bool
+	SourceID                    uint64
+	SourceKey                   string
+	AccountCapacity             int
+	EncryptedProxyURL           string
+	UserAgent                   string
+	EncryptedCloudflareCookie   string
+	ClearanceRefreshedAt        *time.Time
+	ClearanceFingerprint        string
+	ClearanceBindingFingerprint string
+	Health                      float64
+	FailureCount                int
+	CooldownUntil               *time.Time
+	LastError                   string
+	ProbeStatus                 ProbeStatus
+	LastProbedAt                *time.Time
+	ProbeLatencyMS              int
+	ExitIP                      string
+	ProbeError                  string
+	ProbeProvider               ProbeProvider
+	IPv4Probe                   ProbeFamilyResult
+	IPv6Probe                   ProbeFamilyResult
+	AssignedAccountCount        int
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
+}
 
-func (s Scope) IsValid() bool {
-	switch s {
-	case ScopeBuild, ScopeWeb, ScopeConsole, ScopeWebAsset:
+type PublicNode struct {
+	ID                   uint64
+	Name                 string
+	Scope                Scope
+	Enabled              bool
+	ProxyConfigured      bool
+	ProxyPool            bool
+	SourceID             uint64
+	AccountCapacity      int
+	UserAgent            string
+	CookieConfigured     bool
+	AccountBoundProxy    bool
+	Health               float64
+	FailureCount         int
+	CooldownUntil        *time.Time
+	LastError            string
+	ProbeStatus          ProbeStatus
+	LastProbedAt         *time.Time
+	ProbeLatencyMS       int
+	ExitIP               string
+	ProbeError           string
+	ProbeProvider        ProbeProvider
+	IPv4Probe            ProbeFamilyResult
+	IPv6Probe            ProbeFamilyResult
+	AssignedAccountCount int
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+type ProbeStatus string
+
+const (
+	ProbeStatusUnknown   ProbeStatus = "unknown"
+	ProbeStatusHealthy   ProbeStatus = "healthy"
+	ProbeStatusUnhealthy ProbeStatus = "unhealthy"
+)
+
+func (value ProbeStatus) IsValid() bool {
+	switch value {
+	case ProbeStatusUnknown, ProbeStatusHealthy, ProbeStatusUnhealthy:
 		return true
 	default:
 		return false
 	}
 }
 
-type Node struct {
-	ID   uint64
-	Name string
-	// Scope is the primary scope (first of Scopes) kept for sorting/index compatibility.
-	Scope Scope
-	// Scopes lists every provider this node may serve (multi-select). Empty means {Scope}.
-	Scopes                    []Scope
-	Enabled                   bool
-	EncryptedProxyURL         string
-	UserAgent                 string
-	EncryptedCloudflareCookie string
-	Health                    float64
-	FailureCount              int
-	CooldownUntil             *time.Time
-	LastError                 string
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
-}
-
-// MatchesScope reports whether the node is eligible for the given provider scope.
-func (n Node) MatchesScope(scope Scope) bool {
-	if scope == "" {
-		return true
-	}
-	for _, item := range n.EffectiveScopes() {
-		if item == scope {
-			return true
-		}
-	}
-	return false
-}
-
-// EffectiveScopes returns Scopes, or [Scope] when Scopes is empty.
-func (n Node) EffectiveScopes() []Scope {
-	if len(n.Scopes) > 0 {
-		return n.Scopes
-	}
-	if n.Scope != "" {
-		return []Scope{n.Scope}
-	}
-	return nil
-}
-
-type PublicNode struct {
-	ID              uint64
-	Name            string
-	Scope           Scope   // primary (first) scope
-	Scopes          []Scope // all assigned scopes
-	Enabled         bool
-	ProxyConfigured bool
-	// ProxyProtocol is a safe label (e.g. socks5, vmess, sing-box) without host/credentials.
-	ProxyProtocol    string
-	UserAgent        string
-	CookieConfigured bool
-	Health           float64
-	FailureCount     int
-	CooldownUntil    *time.Time
-	LastError        string
-	// Runtime request counters (in-memory; reset on process restart).
-	SuccessCount   int64
-	RequestCount   int64
-	SuccessRate    float64
-	FailureRate    float64
-	Inflight       int
-	LastProbeAt    *time.Time
-	LastProbeOK    *bool
-	LastProbeMs    int64
-	LastProbeError string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
-// Report summarizes pool-wide proxy usage for the admin UI.
-type Report struct {
-	TotalNodes   int
-	EnabledNodes int
-	ProxyNodes   int
-	HealthyNodes int
-	SuccessCount int64
-	FailureCount int64
-	RequestCount int64
-	SuccessRate  float64
-	FailureRate  float64
-	Nodes        []PublicNode
-}
-
-// ProbeResult is the outcome of a one-click connectivity test through a node.
+// ProbeResult contains only operational metadata. It never stores or exposes
+// proxy credentials.
 type ProbeResult struct {
-	NodeID    uint64
-	Name      string
-	Scope     Scope
-	OK        bool
-	LatencyMs int64
-	Status    int
+	Status    ProbeStatus
+	TestedAt  time.Time
+	LatencyMS int
+	ExitIP    string
 	Error     string
-	ProxyUsed bool
-	CheckedAt time.Time
+	Provider  ProbeProvider
+	IPv4      ProbeFamilyResult
+	IPv6      ProbeFamilyResult
 }
 
-// FallbackMode controls what happens when no primary egress node can be acquired.
-// Default is none so upgrades keep fail-closed behavior.
+// ProbeFamilyResult stores one address family's independent connectivity
+// result. A zero TestedAt represents a family that has not been tested yet.
+type ProbeFamilyResult struct {
+	Status    ProbeStatus
+	TestedAt  time.Time
+	LatencyMS int
+	ExitIP    string
+	Error     string
+}
+
+// SubscriptionSource stores a write-only remote proxy subscription. The URL
+// remains encrypted at rest and must never be returned by management APIs.
+type SubscriptionSource struct {
+	ID                     uint64
+	Name                   string
+	Scope                  Scope
+	Enabled                bool
+	EncryptedURL           string
+	RefreshIntervalSeconds int
+	DefaultAccountCapacity int
+	LastSyncedAt           *time.Time
+	NextSyncAt             *time.Time
+	LastSyncImported       int
+	LastSyncError          string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+type PublicSubscriptionSource struct {
+	ID                     uint64
+	Name                   string
+	Scope                  Scope
+	Enabled                bool
+	URLConfigured          bool
+	RefreshIntervalSeconds int
+	DefaultAccountCapacity int
+	LastSyncedAt           *time.Time
+	NextSyncAt             *time.Time
+	LastSyncImported       int
+	LastSyncError          string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// FallbackMode controls what happens when no primary egress node can be
+// acquired for a request scope. The default is deliberately none so upgrades
+// preserve the existing fail-closed behavior.
 type FallbackMode string
 
 const (
@@ -149,7 +177,8 @@ func (value FallbackMode) IsValid() bool {
 	}
 }
 
-// Normalized maps the zero value from pre-fallback rows to disabled mode.
+// Normalized maps the zero value left by pre-fallback database rows to the
+// conservative disabled mode.
 func (value FallbackMode) Normalized() FallbackMode {
 	if value == "" {
 		return FallbackModeNone
@@ -162,30 +191,57 @@ type FallbackConfig struct {
 	NodeID uint64
 }
 
-// OperationsConfig controls egress fallback (and optional ops intervals).
+type ProbeProvider string
+
+const (
+	ProbeProviderIPInfo     ProbeProvider = "ipinfo"
+	ProbeProviderCloudflare ProbeProvider = "cloudflare"
+)
+
+func (value ProbeProvider) IsValid() bool {
+	return value == ProbeProviderIPInfo || value == ProbeProviderCloudflare
+}
+
+func (value ProbeProvider) Normalized() ProbeProvider {
+	if !value.IsValid() {
+		return ProbeProviderCloudflare
+	}
+	return value
+}
+
+// OperationsConfig controls background probe, account assignment, and egress
+// fallback work. It defaults to a conservative disabled state for mutations
+// and fallback routing.
 type OperationsConfig struct {
+	ProbeProvider             ProbeProvider
 	ProbeIntervalSeconds      int
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
-	Fallbacks                 map[Scope]FallbackConfig
-	UpdatedAt                 time.Time
+	// EncryptedSubscriptionProxyURL is the optional proxy used only when
+	// fetching remote proxy subscription sources. It is write-only at rest.
+	EncryptedSubscriptionProxyURL string
+	Fallbacks                     map[Scope]FallbackConfig
+	UpdatedAt                     time.Time
 }
 
 func DefaultOperationsConfig() OperationsConfig {
 	return OperationsConfig{
+		ProbeProvider:             ProbeProviderCloudflare,
 		ProbeIntervalSeconds:      900,
 		AssignmentIntervalSeconds: 300,
 		Fallbacks: map[Scope]FallbackConfig{
-			ScopeBuild:    {Mode: FallbackModeNone},
-			ScopeWeb:      {Mode: FallbackModeNone},
-			ScopeConsole:  {Mode: FallbackModeNone},
-			ScopeWebAsset: {Mode: FallbackModeNone},
+			ScopeBuild:        {Mode: FallbackModeNone},
+			ScopeWeb:          {Mode: FallbackModeNone},
+			ScopeConsole:      {Mode: FallbackModeNone},
+			ScopeWebAsset:     {Mode: FallbackModeNone},
+			ScopeConsoleAsset: {Mode: FallbackModeNone},
 		},
 	}
 }
 
-// FallbackFor returns a canonical fallback for scope (safe with sparse maps).
+// FallbackFor always returns a canonical, safe fallback value. It accepts
+// sparse maps so older callers and historical records remain compatible.
 func (value OperationsConfig) FallbackFor(scope Scope) FallbackConfig {
 	fallback := value.Fallbacks[scope]
 	fallback.Mode = fallback.Mode.Normalized()
@@ -195,12 +251,20 @@ func (value OperationsConfig) FallbackFor(scope Scope) FallbackConfig {
 	return fallback
 }
 
-// SupportsScope reports whether a node primary scope can serve requestScope.
-// Local multi-scope nodes should prefer Node.MatchesScope; this mirrors upstream
-// single-scope compatibility (Console/WebAsset may reuse Web).
+// SupportsScope reports whether a node can serve requests for the supplied
+// scope. Console may intentionally reuse a Web browser proxy. Resource scopes
+// may reuse their provider's primary node so explicit account bindings remain
+// authoritative when no independently bound resource identity exists.
 func SupportsScope(nodeScope, requestScope Scope) bool {
 	if nodeScope == requestScope {
 		return true
 	}
-	return (requestScope == ScopeWebAsset || requestScope == ScopeConsole) && nodeScope == ScopeWeb
+	switch requestScope {
+	case ScopeWebAsset, ScopeConsole:
+		return nodeScope == ScopeWeb
+	case ScopeConsoleAsset:
+		return nodeScope == ScopeConsole || nodeScope == ScopeWeb
+	default:
+		return false
+	}
 }

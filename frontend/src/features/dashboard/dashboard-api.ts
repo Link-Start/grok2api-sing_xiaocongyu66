@@ -2,7 +2,24 @@ import { apiRequest } from "@/shared/api/client";
 import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 import type { PeriodValue } from "@/shared/lib/period";
 
-export type DashboardPeriod = PeriodValue | "custom";
+export type DashboardPeriod = PeriodValue;
+
+export type DashboardUsageDTO = {
+  requests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  tokens: number;
+  billedCostUsdTicks: number;
+  successRate: number;
+  averageFirstTokenMs?: number;
+  outputTokensPerSecond?: number;
+  firstTokenSamples?: number;
+  throughputSamples?: number;
+};
 
 export type DashboardDTO = {
   period: DashboardPeriod;
@@ -11,89 +28,52 @@ export type DashboardDTO = {
   resources: {
     activeAccounts: number;
     totalAccounts: number;
+    buildAccounts: number;
+    webAccounts: number;
+    consoleAccounts: number;
     enabledModels: number;
     totalModels: number;
-    activeClientKeys: number;
-    totalClientKeys: number;
-    allTimeRequests: number;
+	activeClientKeys: number;
+	totalClientKeys: number;
   };
-  usage: {
-    requests: number;
-    successfulRequests: number;
-    failedRequests: number;
-    inputTokens: number;
-    cachedInputTokens: number;
-    outputTokens: number;
-    reasoningTokens: number;
-    tokens: number;
-    billedCostUsdTicks: number;
-    successRate: number;
-  };
-  /** Site-wide rates for the selected period (raw counts if ≤2m, else avg/min; may be fractional). */
-  liveRates: { rpm: number; tpm: number; windowSeconds: number };
-  /** Totals for the same selected period as usage (API field name kept for compatibility). */
-  today: { requests: number; tokens: number; start: string; end: string };
-  series: Array<{ start: string; end: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number; models: Array<{ model: string; tokens: number; billedCostUsdTicks: number }> }>;
+  usage: DashboardUsageDTO;
+  series: Array<{ start: string; end: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number }>;
+  activity: Array<{ start: string; requests: number }>;
   topModels: Array<{ model: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number }>;
-  /** Downstream client breakdown for the selected period (e.g. codex:60). */
-  clients?: Array<{ client: string; label: string; count: number }>;
-  /** Live gateway concurrency (not period-scoped). */
-  connections?: {
-    active: number;
-    peak: number;
-    total: number;
-    clients?: Array<{ client: string; label: string; count: number }>;
-  };
+  providers: Array<{ provider: string; requests: number; successfulRequests: number; tokens: number }>;
 };
 
-const dashboardSeriesModel = hasShape({ model: isString, tokens: isNumber, billedCostUsdTicks: isNumber });
 const dashboardSeriesItem = hasShape({
   start: isString, end: isString, requests: isNumber, inputTokens: isNumber, cachedInputTokens: isNumber,
-  outputTokens: isNumber, reasoningTokens: isNumber, tokens: isNumber, billedCostUsdTicks: isNumber, models: isArrayOf(dashboardSeriesModel),
+  outputTokens: isNumber, reasoningTokens: isNumber, tokens: isNumber, billedCostUsdTicks: isNumber,
+});
+const dashboardUsage = hasShape({
+  requests: isNumber, successfulRequests: isNumber, failedRequests: isNumber, inputTokens: isNumber,
+  cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, tokens: isNumber,
+  billedCostUsdTicks: isNumber, successRate: isNumber, averageFirstTokenMs: isOptional(isNumber),
+  outputTokensPerSecond: isOptional(isNumber), firstTokenSamples: isOptional(isNumber), throughputSamples: isOptional(isNumber),
 });
 const dashboardModelItem = hasShape({
   model: isString, requests: isNumber, inputTokens: isNumber, cachedInputTokens: isNumber,
   outputTokens: isNumber, reasoningTokens: isNumber, tokens: isNumber, billedCostUsdTicks: isNumber,
 });
 const decodeDashboard = createObjectDecoder<DashboardDTO>("dashboard", {
-  period: isOneOf("24h", "7d", "30d", "90d", "custom"),
+  period: isOneOf("24h", "7d", "30d", "90d"),
   generatedAt: isString,
   range: hasShape({ start: isString, end: isString }),
   resources: hasShape({
-    activeAccounts: isNumber, totalAccounts: isNumber, enabledModels: isNumber, totalModels: isNumber,
-    activeClientKeys: isNumber, totalClientKeys: isNumber, allTimeRequests: isNumber,
+    activeAccounts: isNumber, totalAccounts: isNumber, buildAccounts: isNumber, webAccounts: isNumber, consoleAccounts: isNumber, enabledModels: isNumber, totalModels: isNumber,
+		activeClientKeys: isNumber, totalClientKeys: isNumber,
   }),
-  usage: hasShape({
-    requests: isNumber, successfulRequests: isNumber, failedRequests: isNumber, inputTokens: isNumber,
-    cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, tokens: isNumber,
-    billedCostUsdTicks: isNumber, successRate: isNumber,
-  }),
-  liveRates: hasShape({ rpm: isNumber, tpm: isNumber, windowSeconds: isNumber }),
-  today: hasShape({ requests: isNumber, tokens: isNumber, start: isString, end: isString }),
+  usage: dashboardUsage,
   series: isArrayOf(dashboardSeriesItem),
+  activity: isArrayOf(hasShape({ start: isString, requests: isNumber })),
   topModels: isArrayOf(dashboardModelItem),
-  clients: isOptional(isArrayOf(hasShape({ client: isString, label: isString, count: isNumber }))),
-  connections: isOptional(hasShape({
-    active: isNumber, peak: isNumber, total: isNumber,
-    clients: isOptional(isArrayOf(hasShape({ client: isString, label: isString, count: isNumber }))),
-  })),
+  providers: isArrayOf(hasShape({ provider: isString, requests: isNumber, successfulRequests: isNumber, tokens: isNumber })),
 });
 
-export type DashboardQuery = {
-  period: DashboardPeriod;
-  timezone: string;
-  refresh?: boolean;
-  /** RFC3339 or YYYY-MM-DD when period=custom */
-  start?: string;
-  end?: string;
-};
-
-export function getDashboard(input: DashboardQuery): Promise<DashboardDTO> {
-  const query = new URLSearchParams({ period: input.period, timezone: input.timezone });
-  if (input.refresh) query.set("refresh", "1");
-  if (input.period === "custom") {
-    if (input.start) query.set("start", input.start);
-    if (input.end) query.set("end", input.end);
-  }
+export function getDashboard(period: DashboardPeriod, timezone: string, refresh = false): Promise<DashboardDTO> {
+  const query = new URLSearchParams({ period, timezone });
+  if (refresh) query.set("refresh", "1");
   return apiRequest(`/api/admin/v1/dashboard?${query.toString()}`, {}, decodeDashboard);
 }

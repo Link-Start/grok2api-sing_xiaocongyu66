@@ -5,23 +5,33 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
-	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	_ "github.com/bdandy/go-socks4"
 	xproxy "golang.org/x/net/proxy"
 )
 
 // newBuildClient keeps Grok Build on the standard Go HTTP/TLS stack used by
-// the official CLI-facing transport. When a proxy URL is set, dials go through
-// an in-process sing-box outbound (no extra process, no local mixed inbound).
-// responseHeaderTimeout bounds wait for first response headers (not body).
-func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
-	if responseHeaderTimeout <= 0 {
-		responseHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
-	}
+// the official CLI-facing transport. Browser TLS impersonation is reserved for
+// Grok Web, where the browser fingerprint and User-Agent belong together.
+func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions(proxyURL, responseHeaderTimeout, false)
+}
+
+// newBuildEnvironmentClient preserves the process-wide Build direct
+// transport's HTTP_PROXY/HTTPS_PROXY behavior while giving the caller an
+// independent connection pool.
+func newBuildEnvironmentClient(responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions("", responseHeaderTimeout, true)
+}
+
+func newBuildClientWithOptions(proxyURL string, responseHeaderTimeout time.Duration, environmentProxy bool) (*http.Client, error) {
+	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
+		DialContext:           direct.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   128,
@@ -31,53 +41,33 @@ func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (reque
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
-	if strings.TrimSpace(proxyURL) == "" {
-		direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-		transport.DialContext = direct.DialContext
-		return &http.Client{
-			Transport: transport,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}, nil
+	if environmentProxy {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
-	dialer, err := openProxyDialer(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("创建 Grok Build 内置 sing-box 出口: %w", err)
+	if strings.TrimSpace(proxyURL) != "" {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("解析 Grok Build 出口代理: %w", err)
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https":
+			transport.Proxy = http.ProxyURL(parsed)
+		case "socks4", "socks4a", "socks5", "socks5h":
+			dialer, err := xproxy.FromURL(parsed, direct)
+			if err != nil {
+				return nil, fmt.Errorf("创建 Grok Build SOCKS 代理: %w", err)
+			}
+			transport.DialContext = dialContext(dialer)
+		default:
+			return nil, fmt.Errorf("Grok Build 不支持代理协议 %q", parsed.Scheme)
+		}
 	}
-	transport.DialContext = dialer.DialContext
-	return &closingClient{
-		Client: &http.Client{
-			Transport: transport,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
-		close: dialer.Close,
 	}, nil
-}
-
-// closingClient closes the embedded sing-box instance when idle connections are cleared.
-type closingClient struct {
-	*http.Client
-	close func()
-}
-
-func (c *closingClient) CloseIdleConnections() {
-	if c.Client != nil {
-		c.Client.CloseIdleConnections()
-	}
-	if c.close != nil {
-		c.close()
-		c.close = nil
-	}
-}
-
-func (c *closingClient) Do(request *http.Request) (*http.Response, error) {
-	if c == nil || c.Client == nil {
-		return nil, fmt.Errorf("出口客户端未初始化")
-	}
-	return c.Client.Do(request)
 }
 
 func dialContext(dialer xproxy.Dialer) func(context.Context, string, string) (net.Conn, error) {

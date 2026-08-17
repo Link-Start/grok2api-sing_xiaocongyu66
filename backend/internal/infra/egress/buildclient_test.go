@@ -10,16 +10,88 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
-func TestNewBuildClientUsesSingBoxDialerForEveryProxyFamily(t *testing.T) {
+func TestBuildClientUsesConfiguredResponseHeaderTimeout(t *testing.T) {
+	client, err := newBuildClient("", 7*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := client.Transport.(*http.Transport)
+	if transport.ResponseHeaderTimeout != 7*time.Minute {
+		t.Fatalf("response header timeout = %s", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestBuildEnvironmentClientPreservesEnvironmentProxyLookup(t *testing.T) {
+	direct, err := newBuildClient("", 7*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment, err := newBuildEnvironmentClient(7 * time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directTransport := direct.Transport.(*http.Transport)
+	environmentTransport := environment.Transport.(*http.Transport)
+	if directTransport.Proxy != nil {
+		t.Fatal("explicit Manager direct client unexpectedly uses environment proxy lookup")
+	}
+	if environmentTransport.Proxy == nil {
+		t.Fatal("isolated Build fallback client lost HTTP_PROXY/HTTPS_PROXY lookup")
+	}
+}
+
+func TestBuildClientResponseHeaderTimeoutDoesNotLimitResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(writer, "ok")
+	}))
+	defer server.Close()
+	client, err := newBuildClient("", 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+}
+
+func TestBuildClientClassifiesDelayedResponseHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := newBuildClient("", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Get(server.URL)
+	if !neterrorpkg.IsResponseHeaderTimeout(err) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestNewBuildClientUsesStandardTransportForEveryProxyFamily(t *testing.T) {
 	tests := []struct {
-		name     string
-		proxyURL string
+		name      string
+		proxyURL  string
+		httpProxy bool
 	}{
 		{name: "direct"},
-		{name: "http", proxyURL: "http://user:password@127.0.0.1:8080"},
-		{name: "https", proxyURL: "https://proxy.example:8443"},
+		{name: "http", proxyURL: "http://user:password@127.0.0.1:8080", httpProxy: true},
+		{name: "https", proxyURL: "https://proxy.example:8443", httpProxy: true},
 		{name: "socks4", proxyURL: "socks4://127.0.0.1:1080"},
 		{name: "socks4a", proxyURL: "socks4a://proxy.example:1080"},
 		{name: "socks5", proxyURL: "socks5://127.0.0.1:1080"},
@@ -31,14 +103,15 @@ func TestNewBuildClientUsesSingBoxDialerForEveryProxyFamily(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(client.CloseIdleConnections)
-			transport := clientTransport(t, client)
+			transport, ok := client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+			}
 			if transport.ForceAttemptHTTP2 != true || transport.DialContext == nil {
 				t.Fatalf("standard transport not fully configured: %#v", transport)
 			}
-			// All proxy schemes dial via in-process sing-box; never http.Transport.Proxy.
-			if transport.Proxy != nil {
-				t.Fatal("expected Proxy callback nil when using embedded sing-box dialer")
+			if (transport.Proxy != nil) != test.httpProxy {
+				t.Fatalf("http proxy callback configured=%v, want %v", transport.Proxy != nil, test.httpProxy)
 			}
 		})
 	}
@@ -52,7 +125,7 @@ func TestNewBuildClientRejectsUnsupportedProxyScheme(t *testing.T) {
 
 func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("User-Agent") != "grok-shell/0.2.101 (linux; x86_64)" {
+		if request.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
 			t.Errorf("User-Agent = %q", request.Header.Get("User-Agent"))
 		}
 		writer.Header().Set("Connection", "close")
@@ -77,13 +150,12 @@ func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(client.CloseIdleConnections)
 	request, err := http.NewRequest(http.MethodGet, "http://cli-chat-proxy.grok.test:"+upstreamPort+"/v1/models", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Close = true
-	request.Header.Set("User-Agent", "grok-shell/0.2.101 (linux; x86_64)")
+	request.Header.Set("User-Agent", "grok-shell/0.2.102 (linux; x86_64)")
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +170,7 @@ func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 		if host != "cli-chat-proxy.grok.test" {
 			t.Fatalf("SOCKS target host = %q", host)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("SOCKS proxy did not receive a target hostname")
 	}
 	select {
@@ -106,32 +178,8 @@ func TestBuildClientRoutesThroughSOCKS5HWithRemoteDNS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("SOCKS proxy did not finish")
-	}
-}
-
-func clientTransport(t *testing.T, client requestClient) *http.Transport {
-	t.Helper()
-	switch value := client.(type) {
-	case *http.Client:
-		transport, ok := value.Transport.(*http.Transport)
-		if !ok {
-			t.Fatalf("transport = %T", value.Transport)
-		}
-		return transport
-	case *closingClient:
-		if value.Client == nil {
-			t.Fatal("closing client missing inner client")
-		}
-		transport, ok := value.Client.Transport.(*http.Transport)
-		if !ok {
-			t.Fatalf("transport = %T", value.Client.Transport)
-		}
-		return transport
-	default:
-		t.Fatalf("client type = %T", client)
-		return nil
 	}
 }
 
@@ -224,16 +272,4 @@ func readSOCKS5Host(reader io.Reader, addressType byte) (string, error) {
 
 func isClosedNetworkError(err error) bool {
 	return err == nil || strings.Contains(strings.ToLower(err.Error()), "closed network connection")
-}
-
-func TestBuildClientUsesConfiguredResponseHeaderTimeout(t *testing.T) {
-	client, err := newBuildClient("", 7*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(client.CloseIdleConnections)
-	transport := clientTransport(t, client)
-	if transport.ResponseHeaderTimeout != 7*time.Minute {
-		t.Fatalf("response header timeout = %s", transport.ResponseHeaderTimeout)
-	}
 }

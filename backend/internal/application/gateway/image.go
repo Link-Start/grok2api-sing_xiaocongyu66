@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -27,6 +28,7 @@ type ImageGenerationInput struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	PartialImages  int
 }
 
 // ImageEditInput 表示图片编辑用例已经完成协议校验后的输入。
@@ -37,8 +39,12 @@ type ImageEditInput struct {
 	Prompt         string
 	ImageURLs      []string
 	Count          int
+	Size           string
+	AspectRatio    string
 	Resolution     string
 	ResponseFormat string
+	Streaming      bool
+	PartialImages  int
 }
 
 type imageProviderSupport func(accountdomain.Provider) bool
@@ -58,7 +64,7 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 		return adapter.GenerateImage(executionCtx, provider.ImageGenerationRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt, Count: input.Count,
 			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution,
-			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming,
+			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
 	}, input.Streaming, input.Resolution, input.Count, 0)
 }
@@ -75,9 +81,11 @@ func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result,
 		}
 		return adapter.EditImage(executionCtx, provider.ImageEditRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt,
-			ImageURLs: input.ImageURLs, Count: input.Count, Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			ImageURLs: input.ImageURLs, Count: input.Count, Size: input.Size, AspectRatio: input.AspectRatio,
+			Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
-	}, false, input.Resolution, input.Count, len(input.ImageURLs))
+	}, input.Streaming, input.Resolution, input.Count, len(input.ImageURLs))
 }
 
 func (s *Service) executeImage(
@@ -99,11 +107,7 @@ func (s *Service) executeImage(
 	eventID := newAuditEventID()
 	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
 	if err != nil {
-		if configured, confErr := s.models.GetConfiguredPublicIDCandidates(ctx, publicModel); confErr == nil && len(configured) > 0 {
-			routes = configured
-		} else {
-			return nil, ErrModelNotFound
-		}
+		return nil, ErrModelNotFound
 	}
 	route, err := s.selectMediaRoute(routes, key, capability, supports)
 	if err != nil {
@@ -117,6 +121,9 @@ func (s *Service) executeImage(
 	}
 	if operation == audit.OperationImageEdit {
 		auditBase.MediaInputImages = int64(max(0, inputImageCount))
+	}
+	if err := s.checkLedgerReady(); err != nil {
+		return nil, err
 	}
 	writeFailureAudit := func(statusCode int, errorCode string, credential *accountdomain.Credential) {
 		record := auditBase
@@ -159,20 +166,28 @@ func (s *Service) executeImage(
 		}
 	}()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
-	}
+	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
+	var selection *selectionSession
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
-	for attempt := 0; attempt < attempts; attempt++ {
-		lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
+	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+		if selection == nil {
+			selection, err = s.selector.beginSelectionSessionForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
+		}
+		if err == nil {
+			lease, err = selection.Acquire(ctx, excluded, false)
+		}
 		if err != nil {
-			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
+			errorCode := "upstream_unavailable"
+			var selectionFailure *SelectionUnavailableError
+			if errors.As(err, &selectionFailure) {
+				errorCode = selectionFailure.Code()
+			}
+			writeFailureAudit(http.StatusServiceUnavailable, errorCode, lastCredentialFailure)
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
@@ -185,9 +200,18 @@ func (s *Service) executeImage(
 			lease.Release()
 			continue
 		}
+		lease.markSelectorUpstreamStarted()
 		response, err = execute(ctx, route.Provider, credential, route.UpstreamModel)
 		if err != nil {
 			s.logger.Error("image_upstream_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", credential.ID, "error", err)
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = provider.ErrUnauthorized
+				lease.Release()
+				continue
+			}
 			if !provider.IsMediaPostProcessingError(err) {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
@@ -199,20 +223,33 @@ func (s *Service) executeImage(
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
 		}
-		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
+		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
 			_, _ = readRetryableBody(response.Body)
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			failedCredential := credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = provider.ErrUnauthorized
+			response = nil
 			lease.Release()
+			continue
+		}
+		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attemptPolicy.hasNext(attempt) {
+			_, _ = readRetryableBody(response.Body)
 			delete(excluded, credential.ID)
+			if selection != nil {
+				selection.RetryAccount(credential.ID)
+			}
+			lease.Release()
 			continue
 		}
 		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-			s.selector.MarkQuotaStateChanged(credential.Provider)
+			s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 			if reconcileErr != nil || !exhausted {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
-			if attempt+1 < attempts {
+			if attemptPolicy.hasNext(attempt) {
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()
 				continue
@@ -227,24 +264,21 @@ func (s *Service) executeImage(
 		}
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
 	}
-	if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
-		_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-		s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
-	}
 	effectiveQuotaMode := lease.QuotaMode
 	accountID := credential.ID
 	var once sync.Once
 	finalize := func(_ Usage, _ string, errorCode string) {
 		once.Do(func() {
+			successful := auditRequestSucceeded(response.StatusCode, errorCode)
+			lease.completeSelectorObservation(successful)
 			lease.Release()
-			persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
-			defer cancel()
+			budget := newFinalizationBudget(string(operation), string(route.Provider))
 			record := auditBase
 			record.AccountID, record.AccountName, record.StatusCode = &accountID, credential.Name, response.StatusCode
 			record.ErrorCode = errorCode
 			record.DurationMS, record.CreatedAt = time.Since(startedAt).Milliseconds(), time.Now().UTC()
 			applyAuditEgress(&record, egressTrace, route.Provider)
-			if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" {
+			if successful {
 				record.MediaOutputImages = int64(max(0, requestedCount))
 				var pricing audit.PricingResult
 				var priced bool
@@ -260,14 +294,16 @@ func (s *Service) executeImage(
 					record.PricingVersion = audit.OfficialPricingAsOf
 				}
 			}
-			if err := s.audits.Create(persistCtx, record); err != nil {
-				s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", requestID, "error", err)
-			}
 			quotaKind, _ := s.providers.QuotaKind(route.Provider)
-			if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" && quotaKind == provider.QuotaRemoteWindow && effectiveQuotaMode != "" {
+			if successful && quotaKind == provider.QuotaRemoteWindow && effectiveQuotaMode != "" {
 				if effectiveQuotaMode != "weekly" {
 					units := max(1, response.QuotaUnits)
-					updated, err := s.accounts.DecrementWebQuota(persistCtx, accountID, effectiveQuotaMode, units)
+					var updated bool
+					err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
+						var decrementErr error
+						updated, decrementErr = s.accounts.DecrementWebQuota(stageCtx, accountID, effectiveQuotaMode, units)
+						return decrementErr
+					})
 					if err != nil {
 						s.logger.Warn("web_quota_decrement_failed", "account_id", accountID, "mode", effectiveQuotaMode, "units", units, "error", err)
 					} else if updated {
@@ -275,6 +311,11 @@ func (s *Service) executeImage(
 					}
 				}
 				s.accounts.QueueQuotaRefresh(accountID, effectiveQuotaMode)
+			}
+			if err := budget.run("audit", finalizationAuditBudget, func(stageCtx context.Context) error {
+				return s.audits.Create(stageCtx, record)
+			}); err != nil {
+				s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", requestID, "error", err)
 			}
 		})
 	}

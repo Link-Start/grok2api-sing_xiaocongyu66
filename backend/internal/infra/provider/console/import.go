@@ -23,6 +23,8 @@ type importDocument struct {
 
 type importEntry struct {
 	Name              string `json:"name"`
+	Email             string `json:"email,omitempty"`
+	UserID            string `json:"user_id,omitempty"`
 	SSOToken          string `json:"sso_token"`
 	Token             string `json:"token"`
 	CloudflareCookies string `json:"cloudflare_cookies"`
@@ -34,7 +36,8 @@ func parseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
 	if trimmed == "" {
 		return nil, fmt.Errorf("账号文件中没有 Grok Console 账号")
 	}
-	if !strings.HasPrefix(trimmed, "{") {
+	// 「[」为 JSON 保留前缀：顶层裸数组走 JSON 解析，避免被当成纯文本 token 静默导入。
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
 		return parsePlainTextCredentials(trimmed)
 	}
 	entries, err := provider.DecodeCredentialJSONEntries[importEntry](data, string(account.ProviderConsole), maxImportAccounts)
@@ -63,6 +66,8 @@ func parseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
 			name = "Grok Console " + security.HashToken(token)[:8]
 		}
 		seed := credentialSeed(name, token)
+		seed.Email = strings.TrimSpace(entry.Email)
+		seed.UserID = strings.TrimSpace(entry.UserID)
 		seed.CloudflareCookies = entry.CloudflareCookies
 		result = append(result, seed)
 	}
@@ -106,7 +111,7 @@ func credentialSeed(name, token string) provider.CredentialSeed {
 func marshalCredentials(values []provider.CredentialSeed) ([]byte, error) {
 	document := importDocument{Provider: string(account.ProviderConsole), Accounts: make([]importEntry, 0, len(values))}
 	for _, value := range values {
-		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, SSOToken: value.AccessToken})
+		document.Accounts = append(document.Accounts, importEntry{Name: value.Name, Email: value.Email, UserID: value.UserID, SSOToken: value.AccessToken, CloudflareCookies: value.CloudflareCookies})
 	}
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {

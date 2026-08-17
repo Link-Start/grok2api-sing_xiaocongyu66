@@ -15,9 +15,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Handler struct{ service *auditapp.Service }
+type Handler struct {
+	service                 *auditapp.Service
+	qualityGuardClientKeyID uint64
+}
 
 func NewHandler(service *auditapp.Service) *Handler { return &Handler{service: service} }
+
+func NewQualityGuardHandler(service *auditapp.Service, clientKeyID uint64) *Handler {
+	return &Handler{service: service, qualityGuardClientKeyID: clientKeyID}
+}
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/request-audits", h.list)
@@ -25,50 +32,116 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/request-audits/:id", h.get)
 }
 
+// RegisterQualityGuard exposes only the audit cursor required by the sidecar.
+func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
+	router.GET("/request-audits", h.listQualityGuard)
+}
+
+type qualityGuardAuditResponse struct {
+	ID              uint64  `json:"id,string"`
+	RequestID       string  `json:"requestId"`
+	QualityProbe    bool    `json:"qualityProbe"`
+	Provider        string  `json:"provider"`
+	EgressNodeID    *uint64 `json:"egressNodeId,string,omitempty"`
+	EgressNodeName  string  `json:"egressNodeName,omitempty"`
+	StatusCode      int     `json:"statusCode"`
+	Streaming       bool    `json:"streaming"`
+	OutputTokens    int64   `json:"outputTokens"`
+	ReasoningTokens int64   `json:"reasoningTokens"`
+	FirstTokenMS    *int64  `json:"firstTokenMs,omitempty"`
+	DurationMS      int64   `json:"durationMs"`
+	ErrorCode       string  `json:"errorCode,omitempty"`
+}
+
+func (h *Handler) listQualityGuard(c *gin.Context) {
+	if h.qualityGuardClientKeyID == 0 {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
+		return
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "200"))
+	_, pageSize = repository.NormalizePage(1, pageSize, repository.DefaultCursorPageSize)
+	result, err := h.service.ListCursor(c.Request.Context(), c.Query("cursor"), pageSize, "", "24h", auditapp.ListFilter{})
+	if errors.Is(err, auditapp.ErrInvalidCursor) {
+		response.Error(c, http.StatusBadRequest, "invalidCursor", "审计游标无效")
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "auditListFailed", "读取审计记录失败")
+		return
+	}
+	items := make([]qualityGuardAuditResponse, 0, len(result.Items))
+	for _, value := range result.Items {
+		items = append(items, qualityGuardAuditResponse{
+			ID: value.ID, RequestID: value.RequestID, QualityProbe: value.ClientKeyID == h.qualityGuardClientKeyID,
+			Provider: value.Provider, EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName,
+			StatusCode: value.StatusCode, Streaming: value.Streaming, OutputTokens: value.OutputTokens,
+			ReasoningTokens: value.ReasoningTokens, FirstTokenMS: value.FirstTokenMS,
+			DurationMS: value.DurationMS, ErrorCode: value.ErrorCode,
+		})
+	}
+	response.Success(c, http.StatusOK, gin.H{"items": items, "pageSize": pageSize, "nextCursor": result.NextCursor, "hasMore": result.HasMore})
+}
+
 type auditResponse struct {
-	ID                      uint64    `json:"id,string"`
-	RequestID               string    `json:"requestId"`
-	ClientKeyID             uint64    `json:"clientKeyId,string"`
-	ClientKeyName           string    `json:"clientKeyName,omitempty"`
-	ModelRouteID            uint64    `json:"modelRouteId,string"`
-	ModelPublicID           string    `json:"modelPublicId,omitempty"`
-	ClientModel             string    `json:"clientModel,omitempty"`
-	ReasoningEffort         string    `json:"reasoningEffort,omitempty"`
-	ModelUpstreamModel      string    `json:"modelUpstreamModel,omitempty"`
-	Provider                string    `json:"provider"`
-	Operation               string    `json:"operation"`
-	UsageSource             string    `json:"usageSource"`
-	AccountID               *uint64   `json:"accountId,string,omitempty"`
-	AccountName             string    `json:"accountName,omitempty"`
-	EgressNodeID            *uint64   `json:"egressNodeId,string,omitempty"`
-	EgressNodeName          string    `json:"egressNodeName,omitempty"`
-	EgressScope             string    `json:"egressScope,omitempty"`
-	EgressMode              string    `json:"egressMode,omitempty"`
-	StatusCode              int       `json:"statusCode"`
-	Streaming               bool      `json:"streaming"`
-	MediaInputImages        int64     `json:"mediaInputImages"`
-	MediaOutputImages       int64     `json:"mediaOutputImages"`
-	MediaOutputSeconds      int64     `json:"mediaOutputSeconds"`
-	InputTokens             int64     `json:"inputTokens"`
-	CachedInputTokens       int64     `json:"cachedInputTokens"`
-	OutputTokens            int64     `json:"outputTokens"`
-	ReasoningTokens         int64     `json:"reasoningTokens"`
-	TotalTokens             int64     `json:"totalTokens"`
-	CostInUSDTicks          int64     `json:"costInUsdTicks"`
-	EstimatedCostInUSDTicks int64     `json:"estimatedCostInUsdTicks"`
-	PricingModel            string    `json:"pricingModel,omitempty"`
-	PricingVersion          string    `json:"pricingVersion,omitempty"`
-	NumSourcesUsed          int64     `json:"numSourcesUsed"`
-	NumServerSideToolsUsed  int64     `json:"numServerSideToolsUsed"`
-	ContextInputTokens      int64     `json:"contextInputTokens"`
-	ContextOutputTokens     int64     `json:"contextOutputTokens"`
-	DurationMS              int64     `json:"durationMs"`
-	ErrorCode               string    `json:"errorCode,omitempty"`
-	ClientType              string    `json:"clientType,omitempty"`
-	ClientUserAgent         string    `json:"clientUserAgent,omitempty"`
-	ClientIP                string    `json:"clientIp,omitempty"`
-	AttemptCount            int       `json:"attemptCount"`
-	CreatedAt               time.Time `json:"createdAt"`
+	ID                      uint64                    `json:"id,string"`
+	RequestID               string                    `json:"requestId"`
+	ClientKeyID             uint64                    `json:"clientKeyId,string"`
+	ClientKeyName           string                    `json:"clientKeyName,omitempty"`
+	ModelRouteID            uint64                    `json:"modelRouteId,string"`
+	ModelPublicID           string                    `json:"modelPublicId,omitempty"`
+	ModelUpstreamModel      string                    `json:"modelUpstreamModel,omitempty"`
+	Provider                string                    `json:"provider"`
+	Operation               string                    `json:"operation"`
+	UsageSource             string                    `json:"usageSource"`
+	AccountID               *uint64                   `json:"accountId,string,omitempty"`
+	AccountName             string                    `json:"accountName,omitempty"`
+	EgressNodeID            *uint64                   `json:"egressNodeId,string,omitempty"`
+	EgressNodeName          string                    `json:"egressNodeName,omitempty"`
+	EgressScope             string                    `json:"egressScope,omitempty"`
+	EgressMode              string                    `json:"egressMode,omitempty"`
+	StatusCode              int                       `json:"statusCode"`
+	Streaming               bool                      `json:"streaming"`
+	MediaInputImages        int64                     `json:"mediaInputImages"`
+	MediaOutputImages       int64                     `json:"mediaOutputImages"`
+	MediaOutputSeconds      int64                     `json:"mediaOutputSeconds"`
+	InputTokens             int64                     `json:"inputTokens"`
+	CachedInputTokens       int64                     `json:"cachedInputTokens"`
+	OutputTokens            int64                     `json:"outputTokens"`
+	ReasoningTokens         int64                     `json:"reasoningTokens"`
+	TotalTokens             int64                     `json:"totalTokens"`
+	CostInUSDTicks          int64                     `json:"costInUsdTicks"`
+	EstimatedCostInUSDTicks int64                     `json:"estimatedCostInUsdTicks"`
+	PricingModel            string                    `json:"pricingModel,omitempty"`
+	PricingVersion          string                    `json:"pricingVersion,omitempty"`
+	Billing                 *billingBreakdownResponse `json:"billing,omitempty"`
+	NumSourcesUsed          int64                     `json:"numSourcesUsed"`
+	NumServerSideToolsUsed  int64                     `json:"numServerSideToolsUsed"`
+	ContextInputTokens      int64                     `json:"contextInputTokens"`
+	ContextOutputTokens     int64                     `json:"contextOutputTokens"`
+	FirstTokenMS            *int64                    `json:"firstTokenMs,omitempty"`
+	OutputTokensPerSecond   *float64                  `json:"outputTokensPerSecond,omitempty"`
+	DurationMS              int64                     `json:"durationMs"`
+	ErrorCode               string                    `json:"errorCode,omitempty"`
+	AttemptCount            int                       `json:"attemptCount"`
+	CreatedAt               time.Time                 `json:"createdAt"`
+}
+
+type billingBreakdownResponse struct {
+	Source          string                     `json:"source"`
+	Method          string                     `json:"method"`
+	Model           string                     `json:"model,omitempty"`
+	Version         string                     `json:"version,omitempty"`
+	Tier            string                     `json:"tier,omitempty"`
+	Components      []billingComponentResponse `json:"components"`
+	TotalInUSDTicks int64                      `json:"totalInUsdTicks"`
+}
+
+type billingComponentResponse struct {
+	Kind                string `json:"kind"`
+	Unit                string `json:"unit"`
+	Quantity            int64  `json:"quantity"`
+	UnitPriceInUSDTicks int64  `json:"unitPriceInUsdTicks"`
+	SubtotalInUSDTicks  int64  `json:"subtotalInUsdTicks"`
 }
 
 type auditAttemptResponse struct {
@@ -110,15 +183,7 @@ func (h *Handler) list(c *gin.Context) {
 	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 	values, total, err := h.service.List(c.Request.Context(), page, pageSize)
 	if err != nil {
 		response.Error(c, http.StatusInternalServerError, "auditListFailed", "读取审计记录失败")
@@ -133,6 +198,7 @@ func (h *Handler) list(c *gin.Context) {
 
 func (h *Handler) listCursor(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "50"))
+	_, pageSize = repository.NormalizePage(1, pageSize, repository.DefaultCursorPageSize)
 	result, err := h.service.ListCursor(c.Request.Context(), c.Query("cursor"), pageSize, c.Query("search"), c.Query("period"), newListFilter(c))
 	if errors.Is(err, auditapp.ErrInvalidCursor) {
 		response.Error(c, http.StatusBadRequest, "invalidCursor", err.Error())
@@ -278,8 +344,7 @@ func newListFilter(c *gin.Context) auditapp.ListFilter {
 func newAuditResponse(value auditdomain.Record) auditResponse {
 	return auditResponse{
 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
-		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ClientModel: value.ClientModel,
-		ReasoningEffort: value.ReasoningEffort, ModelUpstreamModel: value.ModelUpstreamModel,
+		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
 		AccountID: value.AccountID, AccountName: value.AccountName,
 		EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName, EgressScope: value.EgressScope, EgressMode: string(value.EgressMode),
@@ -288,8 +353,60 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 		InputTokens: value.InputTokens, CachedInputTokens: value.CachedInputTokens, OutputTokens: value.OutputTokens,
 		ReasoningTokens: value.ReasoningTokens, TotalTokens: value.TotalTokens, CostInUSDTicks: value.CostInUSDTicks,
 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
+		Billing:        newBillingBreakdown(value),
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
-		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, DurationMS: value.DurationMS,
-		ErrorCode: value.ErrorCode, ClientType: value.ClientType, ClientUserAgent: value.ClientUserAgent, ClientIP: value.ClientIP, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
+		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens,
+		FirstTokenMS: value.FirstTokenMS, OutputTokensPerSecond: auditOutputTokensPerSecond(value), DurationMS: value.DurationMS,
+		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
 	}
+}
+
+func newBillingBreakdown(value auditdomain.Record) *billingBreakdownResponse {
+	if value.CostInUSDTicks > 0 {
+		return &billingBreakdownResponse{
+			Source: "upstream", Method: "upstream_reported", Components: []billingComponentResponse{}, TotalInUSDTicks: value.CostInUSDTicks,
+		}
+	}
+	if value.PricingModel == "" {
+		return nil
+	}
+	breakdown := &billingBreakdownResponse{
+		Source: "official", Method: "stored_estimate", Model: value.PricingModel, Version: value.PricingVersion,
+		Components: []billingComponentResponse{}, TotalInUSDTicks: value.EstimatedCostInUSDTicks,
+	}
+	if value.PricingVersion != auditdomain.OfficialPricingAsOf {
+		return breakdown
+	}
+	pricing, ok := auditdomain.ReconstructOfficialCost(
+		value.PricingModel,
+		value.InputTokens,
+		value.CachedInputTokens,
+		value.OutputTokens,
+		value.ContextInputTokens,
+		value.MediaInputImages,
+		value.MediaOutputImages,
+		value.MediaOutputSeconds,
+	)
+	if !ok || pricing.CostInUSDTicks != value.EstimatedCostInUSDTicks {
+		return breakdown
+	}
+	breakdown.Method = "official_rates"
+	breakdown.Model = pricing.Model
+	breakdown.Tier = string(pricing.Tier)
+	breakdown.Components = make([]billingComponentResponse, 0, len(pricing.Components))
+	for _, component := range pricing.Components {
+		breakdown.Components = append(breakdown.Components, billingComponentResponse{
+			Kind: string(component.Kind), Unit: string(component.Unit), Quantity: component.Quantity,
+			UnitPriceInUSDTicks: component.UnitPriceInUSDTicks, SubtotalInUSDTicks: component.CostInUSDTicks,
+		})
+	}
+	return breakdown
+}
+
+func auditOutputTokensPerSecond(value auditdomain.Record) *float64 {
+	if !value.Streaming || value.StatusCode < 200 || value.StatusCode >= 300 || value.ErrorCode != "" || value.FirstTokenMS == nil || value.OutputTokens <= 0 || value.DurationMS <= *value.FirstTokenMS {
+		return nil
+	}
+	throughput := float64(value.OutputTokens) * 1000 / float64(value.DurationMS-*value.FirstTokenMS)
+	return &throughput
 }

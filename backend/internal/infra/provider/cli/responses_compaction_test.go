@@ -9,9 +9,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
@@ -31,8 +33,11 @@ func TestGatewayCompactionLifecycle(t *testing.T) {
 	if !strings.HasPrefix(continuation, "This session is being continued") || strings.Contains(continuation, "<summary>") || !strings.Contains(continuation, "Summary:\n1. Primary") {
 		t.Fatalf("continuation = %q", continuation)
 	}
-	// Compact responses are portable assistant text only (no type=compaction blobs).
-	stream, contentType, err := buildGatewayCompactionResponse(sample.response, continuation, "grok-4.5", true)
+	blob, err := codec.encode("session-1", continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, contentType, err := buildGatewayCompactionResponse(sample.response, blob, "grok-4.5", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,105 +49,86 @@ func TestGatewayCompactionLifecycle(t *testing.T) {
 	if contentType != "text/event-stream" {
 		t.Fatalf("content type = %q", contentType)
 	}
-	if strings.Contains(string(stream), `"type":"compaction"`) || strings.Contains(string(stream), "encrypted_content") {
-		t.Fatalf("must not emit compact blobs to clients: %s", stream)
-	}
-	if !strings.Contains(string(stream), `"type":"message"`) || !strings.Contains(string(stream), "This session is being continued") {
-		t.Fatalf("expected portable summary message: %s", stream)
-	}
-	// Legacy inbound compact blobs (from older gateway or native Grok) still scrub cleanly.
-	legacyBlob, err := codec.encode("session-1", continuation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expanded, foreign, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(legacyBlob)+`}]} `), codec, "session-1")
+	blob = compactionBlobFromSSE(t, stream)
+	expanded, foreign, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(blob)+`}]} `), codec, "session-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if foreign != 0 || !strings.Contains(string(expanded), "This session is being continued") || strings.Contains(string(expanded), `"type":"compaction"`) || !strings.Contains(string(expanded), `"role":"user"`) {
 		t.Fatalf("expanded = %s, foreign = %d", expanded, foreign)
 	}
-	mismatched, foreignMiss, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(legacyBlob)+`}]}`), codec, "other-session")
-	if err != nil || foreignMiss != 1 || strings.Contains(string(mismatched), `"type":"compaction"`) || !strings.Contains(string(mismatched), "cannot be decoded") {
-		t.Fatalf("session mismatch expand = %s foreign=%d err=%v", mismatched, foreignMiss, err)
+	mismatched, unusable, err := expandGatewayCompactionHistory([]byte(`{"input":[{"type":"compaction","encrypted_content":`+mustJSONString(blob)+`}]} `), codec, "other-session")
+	if err != nil || unusable != 1 || strings.Contains(string(mismatched), blob) || !strings.Contains(string(mismatched), "could not be decoded") {
+		t.Fatalf("session mismatch fallback = %s, unusable = %d, err = %v", mismatched, unusable, err)
 	}
 }
 
-func TestScrubUpstreamCompactionBlobsRemovesNativeState(t *testing.T) {
-	body := []byte(`{"model":"grok-4.5","input":[{"type":"compaction","encrypted_content":"native-grok-blob-with-enough-length-to-look-opaque-xxxxxxxx"},{"type":"message","role":"user","content":"hi"}]}`)
-	out, n := scrubUpstreamCompactionBlobs(body)
-	if n != 1 || strings.Contains(string(out), `"type":"compaction"`) || !strings.Contains(string(out), "cannot be decoded") {
-		t.Fatalf("scrub = %s n=%d", out, n)
+func TestGatewayCompactionHTTPFailureHonorsRetryVetoAndRateLimitMetadata(t *testing.T) {
+	body := `{"code":"resource-exhausted","error":"Too many requests for team 00000000-0000-0000-0000-000000000013 and model grok-4.5. Requests per Second (actual/limit): 2/2."}`
+	response, transient, err := gatewayCompactionHTTPFailure(&http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Header: http.Header{
+			"X-Should-Retry": {"false"},
+			"Retry-After":    {"17"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}, "https://build.test/v1/responses", false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if transient {
+		t.Fatal("x-should-retry:false must suppress same-account compaction retries")
+	}
+	if response.RateLimit == nil || response.RateLimit.TeamID != "00000000-0000-0000-0000-000000000013" || response.RateLimit.Model != "grok-4.5" || response.RateLimit.RetryAfter != 17*time.Second {
+		t.Fatalf("rate limit = %#v", response.RateLimit)
 	}
 }
 
-func TestScrubUpstreamCompactionBlobsRemovesNestedContentParts(t *testing.T) {
-	// Some clients nest compact state under message content; top-level-only scrub misses this.
-	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"compaction","encrypted_content":"native-nested-blob-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]}]}`)
-	out, n := scrubUpstreamCompactionBlobs(body)
-	if n < 1 || strings.Contains(string(out), `"type":"compaction"`) || strings.Contains(string(out), "native-nested-blob") {
-		t.Fatalf("nested scrub = %s n=%d", out, n)
+func TestGatewayCompactionRetryVetoStopsSameAccountRetries(t *testing.T) {
+	adapter, encrypted := newCompactionTestAdapter(t)
+	var attempts atomic.Int32
+	body := `{"code":"subscription:free-usage-exhausted","error":"You have used all your free usage"}`
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		response := sseResponse(http.StatusTooManyRequests, body, request)
+		response.Header.Set("X-Should-Retry", "false")
+		return response, nil
+	})
+	request := compactionProviderRequest(encrypted)
+	response, err := adapter.forwardGatewayCompactionWithPolicy(t.Context(), request, "access-token", request.Body, "", 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if attempts.Load() != 1 || response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("attempts=%d status=%d", attempts.Load(), response.StatusCode)
 	}
 }
 
-func TestScrubDoesNotStripReasoningEncryptedContent(t *testing.T) {
-	body := []byte(`{"input":[{"type":"reasoning","encrypted_content":"sig-that-is-long-enough-to-look-opaque-but-is-reasoning-not-compact"}]}`)
-	out, n := scrubUpstreamCompactionBlobs(body)
-	if n != 0 || !strings.Contains(string(out), `"type":"reasoning"`) || !strings.Contains(string(out), "sig-that-is-long") {
-		t.Fatalf("reasoning must survive scrub = %s n=%d", out, n)
+func TestGatewayCompactionResponseNormalizesPartialUsage(t *testing.T) {
+	response := map[string]any{
+		"id":    "resp_usage",
+		"usage": map[string]any{"input_tokens": float64(7), "output_tokens": float64(5)},
 	}
-}
-
-func TestResolveGatewayPreviousResponseExpandsSummary(t *testing.T) {
-	recall := newGatewayCompactRecall()
-	summary := "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" + strings.Repeat("summary-body-", 40)
-	recall.remember("resp_gateway_compact_1", "session", summary)
-	body := []byte(`{"model":"grok-4.5","previous_response_id":"resp_gateway_compact_1","input":[{"type":"message","role":"user","content":"continue"}]}`)
-	out, ok := resolveGatewayPreviousResponse(body, recall)
-	if !ok {
-		t.Fatal("expected previous_response rewrite")
+	encoded, _, err := buildGatewayCompactionResponse(response, "opaque", "grok-4.5", true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(string(out), "previous_response_id") {
-		t.Fatalf("previous_response_id leaked: %s", out)
+	var completed map[string]any
+	for _, line := range strings.Split(string(encoded), "\n") {
+		if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, `"type":"response.completed"`) {
+			continue
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &completed); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if !strings.Contains(string(out), "This session is being continued") || !strings.Contains(string(out), "continue") {
-		t.Fatalf("expanded body = %s", out)
-	}
-}
-
-func TestIsCompactionBlobDecodeError(t *testing.T) {
-	if !isCompactionBlobDecodeError([]byte(`{"error":{"code":"invalid-argument","message":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}}`)) {
-		t.Fatal("expected detect")
-	}
-	if isCompactionBlobDecodeError([]byte(`{"error":{"message":"model not found"}}`)) {
-		t.Fatal("false positive")
-	}
-}
-
-func TestSanitizeBodyAfterCompactionDecodeErrorStripsOpaqueAndPrevious(t *testing.T) {
-	blob := "native-grok-compact-blob-" + strings.Repeat("x", 80)
-	body := []byte(`{
-		"model":"grok-4.5",
-		"previous_response_id":"resp_gateway_compact",
-		"input":[
-			{"type":"compaction","encrypted_content":"` + blob + `"},
-			{"type":"message","role":"user","content":"continue please"},
-			{"type":"reasoning","encrypted_content":"sig-keep-this-reasoning-cipher-abcdefghijklmnop"}
-		]
-	}`)
-	out, stats := sanitizeBodyAfterCompactionDecodeError(body, nil)
-	if stats["changed"] != true {
-		t.Fatalf("expected body change, stats=%#v", stats)
-	}
-	if strings.Contains(string(out), "previous_response_id") || strings.Contains(string(out), `"type":"compaction"`) || strings.Contains(string(out), blob) {
-		t.Fatalf("compact state leaked: %s", out)
-	}
-	if !strings.Contains(string(out), "continue please") {
-		t.Fatalf("user message dropped: %s", out)
-	}
-	// Reasoning cipher must survive (multi-turn); only compact-like payloads are stripped.
-	if !strings.Contains(string(out), "sig-keep-this-reasoning-cipher") {
-		t.Fatalf("reasoning encrypted_content should be kept: %s", out)
+	responseValue, _ := completed["response"].(map[string]any)
+	usage, _ := responseValue["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(7) || usage["output_tokens"] != float64(5) || usage["total_tokens"] != float64(12) {
+		t.Fatalf("usage = %#v", usage)
 	}
 }
 
@@ -159,7 +145,7 @@ func TestCleanGatewayCompactionSummaryMatchesGrokBuildScratchpadRules(t *testing
 	}
 }
 
-func TestPrepareGatewayCompactionSampleMatchesGrokBuild0103(t *testing.T) {
+func TestPrepareGatewayCompactionSampleMatchesGrokBuild02106(t *testing.T) {
 	prepared, err := prepareGatewayCompactionSample([]byte(`{
 		"model":"grok-4.5","stream":true,"store":true,"instructions":"client instructions",
 		"previous_response_id":"resp_old","max_output_tokens":200,
@@ -173,7 +159,7 @@ func TestPrepareGatewayCompactionSampleMatchesGrokBuild0103(t *testing.T) {
 	if json.Unmarshal(prepared, &payload) != nil {
 		t.Fatalf("payload = %s", prepared)
 	}
-	if payload["stream"] != true || payload["store"] != false || payload["instructions"] != nil || payload["temperature"] != float64(1) || payload["tool_choice"] != "none" {
+	if payload["stream"] != true || payload["store"] != false || payload["instructions"] != nil || payload["temperature"] != float64(1) || payload["tool_choice"] != "auto" {
 		t.Fatalf("sample controls = %#v", payload)
 	}
 	if _, exists := payload["previous_response_id"]; exists {
@@ -242,7 +228,7 @@ func TestForwardResponseEmulatesRemoteCompactionV2(t *testing.T) {
 		if json.Unmarshal(data, &payload) != nil {
 			t.Fatalf("payload = %s", data)
 		}
-		if payload["stream"] != true || payload["store"] != false || payload["instructions"] != nil || payload["tool_choice"] != "none" {
+		if payload["stream"] != true || payload["store"] != false || payload["instructions"] != nil || payload["tool_choice"] != "auto" {
 			t.Fatalf("sample flags = %#v", payload)
 		}
 		if _, exists := payload["prompt_cache_key"]; exists {
@@ -263,12 +249,114 @@ func TestForwardResponseEmulatesRemoteCompactionV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Header.Get("Content-Type") != "text/event-stream" || strings.Contains(string(data), `"type":"compaction"`) || !strings.Contains(string(data), `"type":"message"`) || !strings.Contains(string(data), "response.completed") {
+	if response.Header.Get("Content-Type") != "text/event-stream" || !strings.Contains(string(data), `"type":"compaction"`) || !strings.Contains(string(data), "response.completed") {
 		t.Fatalf("response = %s, headers = %#v", data, response.Header)
 	}
-	warnings := response.Header.Get("X-Grok2API-Compatibility-Warnings")
-	if !strings.Contains(warnings, "remote_compaction_v2_emulated") || !strings.Contains(warnings, "remote_compaction_v2_text_only") {
-		t.Fatalf("warnings = %q", warnings)
+	if !strings.Contains(response.Header.Get("X-Grok2API-Compatibility-Warnings"), "remote_compaction_v2_emulated") {
+		t.Fatalf("warnings = %q", response.Header.Get("X-Grok2API-Compatibility-Warnings"))
+	}
+}
+
+// TestGatewayCompactionLifecycleWithMillionTokenScaleHistory 验证超长历史压缩后，
+// 下一轮只会向上游发送解密出的摘要和新消息，不会重新发送原始历史或 opaque blob。
+func TestGatewayCompactionLifecycleWithMillionTokenScaleHistory(t *testing.T) {
+	adapter, encrypted := newCompactionTestAdapter(t)
+	// “x ”在常见 BPE 编码中接近一个 token；此处保守构造超过 1M token 量级的历史文本。
+	history := strings.Repeat("x ", 2<<20)
+	summary := healthyCompactionSummary()
+	continuation := gatewayCompactionContinuation(summary)
+	encodedSummary, err := json.Marshal(continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		call := calls.Add(1)
+		data, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		switch call {
+		case 1:
+			if len(data) < 4<<20 || strings.Contains(string(data), "compaction_trigger") {
+				t.Fatalf("压缩采样未携带完整超长历史：size=%d", len(data))
+			}
+			return sseResponse(http.StatusOK, compactionSampleSSE("resp_million", summary), request), nil
+		case 2:
+			if len(data) >= 4096 || strings.Contains(string(data), `"type":"compaction"`) || strings.Contains(string(data), `"encrypted_content"`) || !strings.Contains(string(data), string(encodedSummary)) || !strings.Contains(string(data), "压缩后继续执行") {
+				t.Fatalf("压缩回放泄漏原始状态：size=%d", len(data))
+			}
+			return jsonHTTPResponse(request, http.StatusOK, `{"id":"resp_continue","status":"completed","output":[]}`), nil
+		default:
+			t.Fatalf("unexpected call %d", call)
+			return nil, nil
+		}
+	})
+
+	initialBody, err := json.Marshal(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": history},
+			map[string]any{"type": "compaction_trigger"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compacted, err := adapter.ForwardResponse(t.Context(), provider.ResponseResourceRequest{
+		Credential:     account.Credential{ID: 1, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+		Method:         http.MethodPost,
+		Path:           "/responses",
+		Model:          "grok-4.5",
+		PromptCacheKey: "million-token-session",
+		Body:           initialBody,
+		NormalizeBody:  true,
+		Operation:      conversation.OperationResponses,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactedBody, readErr := io.ReadAll(compacted.Body)
+	_ = compacted.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var compactedPayload struct {
+		Output []struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+		} `json:"output"`
+	}
+	if json.Unmarshal(compactedBody, &compactedPayload) != nil || len(compactedPayload.Output) != 1 || compactedPayload.Output[0].Type != "compaction" || compactedPayload.Output[0].EncryptedContent == "" {
+		t.Fatalf("压缩响应无有效 blob：%s", compactedBody)
+	}
+
+	continuedBody, err := json.Marshal(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{"type": "compaction", "encrypted_content": compactedPayload.Output[0].EncryptedContent},
+			map[string]any{"type": "message", "role": "user", "content": "压缩后继续执行"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	continued, err := adapter.ForwardResponse(t.Context(), provider.ResponseResourceRequest{
+		Credential:     account.Credential{ID: 1, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+		Method:         http.MethodPost,
+		Path:           "/responses",
+		Model:          "grok-4.5",
+		PromptCacheKey: "million-token-session",
+		Body:           continuedBody,
+		NormalizeBody:  true,
+		Operation:      conversation.OperationResponses,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer continued.Body.Close()
+	if calls.Load() != 2 || continued.StatusCode != http.StatusOK {
+		t.Fatalf("calls=%d status=%d", calls.Load(), continued.StatusCode)
 	}
 }
 
@@ -322,8 +410,7 @@ data: {"type":"error","code":"503","message":"temporarily unavailable"}
 	}
 }
 
-func TestCompactionWithoutCodecStillReturnsTextOnlySummary(t *testing.T) {
-	// Compact responses no longer need the g2a_compact encoder; codec may be nil.
+func TestCompactionPostProcessingFailureDoesNotRetryAnotherAccount(t *testing.T) {
 	adapter, encrypted := newCompactionTestAdapter(t)
 	adapter.compaction = nil
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -334,12 +421,8 @@ func TestCompactionWithoutCodecStillReturnsTextOnlySummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusOK || strings.Contains(string(data), `"type":"compaction"`) || !strings.Contains(string(data), `"type":"message"`) {
-		t.Fatalf("status = %d body = %s headers = %#v", response.StatusCode, data, response.Header)
+	if response.StatusCode != http.StatusBadGateway || response.Header.Get("X-Should-Retry") != "false" {
+		t.Fatalf("status = %d, headers = %#v", response.StatusCode, response.Header)
 	}
 }
 
@@ -354,8 +437,8 @@ func newCompactionTestAdapter(t *testing.T) (*Adapter, string) {
 		t.Fatal(err)
 	}
 	adapter := NewAdapter(Config{
-		BaseURL: "https://build.test/v1", ClientVersion: "0.2.103",
-		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", UserAgent: "grok-shell/0.2.103 (linux; x86_64)",
+		BaseURL: "https://build.test/v1", ClientVersion: "0.2.110",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", UserAgent: "grok-shell/0.2.110 (linux; x86_64)",
 	}, cipher)
 	return adapter, encrypted
 }

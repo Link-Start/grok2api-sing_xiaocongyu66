@@ -1,14 +1,13 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
-	"github.com/chenyme/grok2api/backend/internal/infra/runtime/connections"
-	"github.com/chenyme/grok2api/backend/internal/pkg/clientid"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
 	"github.com/gin-gonic/gin"
 )
@@ -40,92 +39,35 @@ func AdminAuth(service *adminauth.Service) gin.HandlerFunc {
 	}
 }
 
-// ClientAuth 校验下游 API Key，并在请求结束时释放并发租约。
-func ClientAuth(service *clientkeyapp.Service, extraAPIKeyHeaders ...string) gin.HandlerFunc {
-	return ClientAuthWithConnections(service, nil, extraAPIKeyHeaders...)
+// QualityGuardAuth accepts only the process-scoped token shared with the
+// quality-guard sidecar. It is intentionally separate from administrator JWTs.
+func QualityGuardAuth(expected string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, ok := bearerToken(c.GetHeader("Authorization"))
+		if !ok || len(raw) != len(expected) || subtle.ConstantTimeCompare([]byte(raw), []byte(expected)) != 1 {
+			response.Error(c, http.StatusUnauthorized, "qualityGuardUnauthorized", "质量守护内部认证失败")
+			return
+		}
+		c.Next()
+	}
 }
 
-// ClientAuthWithConnections 在鉴权成功后计入全站与按客户端的实时连接（仪表盘用）。
-// extraAPIKeyHeaders 为可选的自定义鉴权头名（配置项 auth.apiKeyHeaders），例如 congyu_15fc。
-// 解析顺序：Authorization Bearer → X-API-Key → 自定义头（配置顺序）。
-func ClientAuthWithConnections(service *clientkeyapp.Service, tracker connections.Tracker, extraAPIKeyHeaders ...string) gin.HandlerFunc {
-	headers := normalizeAPIKeyHeaders(extraAPIKeyHeaders)
+// ClientAuth 校验下游 API Key，并在请求结束时释放并发租约。
+func ClientAuth(service *clientkeyapp.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		raw := extractClientAPIKey(c, headers)
+		raw, ok := bearerToken(c.GetHeader("Authorization"))
+		if !ok {
+			raw = strings.TrimSpace(c.GetHeader("X-API-Key"))
+		}
 		value, release, err := service.Authenticate(c.Request.Context(), raw)
 		if err != nil {
 			writeOpenAIError(c, clientErrorStatus(err), clientErrorCode(err), clientErrorMessage(err))
 			return
 		}
 		defer release()
-		if tracker != nil {
-			end := tracker.Begin(detectRequestClient(c))
-			defer end()
-		}
 		c.Set(ClientKey, value)
 		c.Next()
 	}
-}
-
-// extractClientAPIKey reads the client API key from standard and optional custom headers.
-func extractClientAPIKey(c *gin.Context, extraHeaders []string) string {
-	if raw, ok := bearerToken(c.GetHeader("Authorization")); ok {
-		return raw
-	}
-	if raw := strings.TrimSpace(c.GetHeader("X-API-Key")); raw != "" {
-		return raw
-	}
-	for _, name := range extraHeaders {
-		if raw := strings.TrimSpace(c.GetHeader(name)); raw != "" {
-			// Allow "Bearer <key>" even on custom headers for client convenience.
-			if token, ok := bearerToken(raw); ok {
-				return token
-			}
-			return raw
-		}
-	}
-	return ""
-}
-
-func normalizeAPIKeyHeaders(headers []string) []string {
-	if len(headers) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(headers))
-	seen := make(map[string]struct{}, len(headers))
-	for _, raw := range headers {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		lower := strings.ToLower(name)
-		if lower == "authorization" || lower == "x-api-key" {
-			continue
-		}
-		if _, ok := seen[lower]; ok {
-			continue
-		}
-		seen[lower] = struct{}{}
-		out = append(out, name)
-	}
-	return out
-}
-
-// detectRequestClient classifies the caller for live connection stats (same rules as audits).
-func detectRequestClient(c *gin.Context) string {
-	userAgent := strings.TrimSpace(c.Request.UserAgent())
-	headers := map[string]string{}
-	for _, name := range []string{
-		"x-claude-code-session-id", "x-codex-window-id", "x-codex-session-id",
-		"x-grok-conv-id", "x-grok-conversation-id",
-		"originator", "x-app", "anthropic-version", "anthropic-beta",
-		"x-stainless-lang", "x-stainless-package-version",
-	} {
-		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
-			headers[strings.ToLower(name)] = value
-		}
-	}
-	return clientid.Detect(userAgent, headers)
 }
 
 func bearerToken(header string) (string, bool) {
@@ -171,7 +113,7 @@ func clientErrorMessage(err error) string {
 }
 
 func writeOpenAIError(c *gin.Context, status int, code, message string) {
-	if isAnthropicMessagesPath(c.Request.URL.Path) {
+	if c.Request.URL.Path == "/v1/messages" {
 		errorType := "authentication_error"
 		if status == http.StatusTooManyRequests {
 			errorType = "rate_limit_error"
@@ -182,9 +124,4 @@ func writeOpenAIError(c *gin.Context, status int, code, message string) {
 		return
 	}
 	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"message": message, "type": "invalid_request_error", "code": code, "param": nil}})
-}
-
-func isAnthropicMessagesPath(path string) bool {
-	path = strings.TrimSpace(path)
-	return path == "/Anthropic/messages" || path == "/anthropic/messages" || path == "/v1/messages"
 }

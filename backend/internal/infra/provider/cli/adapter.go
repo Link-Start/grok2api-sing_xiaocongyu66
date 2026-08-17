@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -40,7 +41,12 @@ type Config struct {
 	ResponseHeaderTimeout time.Duration
 }
 
-// Adapter 实现 Grok Build CLI Responses、模型、Billing 与 OAuth 协议。
+const (
+	subscriptionTierTimeout = 10 * time.Second
+	buildControlTimeout     = 30 * time.Second
+)
+
+// Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
 type Adapter struct {
 	cfgMu          sync.RWMutex
 	cfg            Config
@@ -51,27 +57,32 @@ type Adapter struct {
 	agentID        string
 	modelsMu       sync.Mutex
 	modelsETags    map[uint64]string
-	replay         *reasoningreplay.ReasoningReplay
-	compaction     *gatewayCompactionCodec
-	compactRecall  *gatewayCompactRecall
 	fallbackMarker FallbackMarker
 	uploadIssuer   VideoUploadIssuer
+	replay         *reasoningreplay.ReasoningReplay
+	compaction     *gatewayCompactionCodec
+	logger         *slog.Logger
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	cfg.ResponseHeaderTimeout = normalizeBuildResponseHeaderTimeout(cfg.ResponseHeaderTimeout)
 	transport := newBuildDirectTransport(cfg.ResponseHeaderTimeout)
 	httpClient := &http.Client{Transport: transport}
-	// 官方 CLI 使用持久化机器身份。网关不采集机器指纹，改为每个后端
-	// 进程生成一个随机 UUID，在进程生命周期内作为统一 Agent 身份。
+	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
+	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
 	agentID := uuid.NewString()
 	adapter := &Adapter{
 		cfg: cfg, http: httpClient, cipher: cipher, base: transport,
-		agentID: agentID, modelsETags: make(map[uint64]string),
-		compaction: newGatewayCompactionCodec(cipher), compactRecall: newGatewayCompactRecall(),
+		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
 	}
 	adapter.oauth = newOAuthClient(httpClient, func() string { return adapter.config().ClientVersion })
 	return adapter
+}
+
+func (a *Adapter) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		a.logger = logger
+	}
 }
 
 func (a *Adapter) SetEgress(manager *infraegress.Manager) {
@@ -80,29 +91,65 @@ func (a *Adapter) SetEgress(manager *infraegress.Manager) {
 	}
 }
 
-// SetReasoningReplay 注入服务端推理回放缓存（可选）。客户端不回传 thinking
-// signature 时，由网关代持上一轮 encrypted items 以加速多轮。
+// SetReasoningReplay injects the optional server-side reasoning replay cache.
 func (a *Adapter) SetReasoningReplay(replay *reasoningreplay.ReasoningReplay) {
 	a.replay = replay
 }
 
 func (a *Adapter) Provider() account.Provider { return account.ProviderBuild }
 
-func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response) bool {
-	if a.replay == nil || !a.replay.Enabled() || resp == nil {
-		return false
+// CredentialMetadata extracts only non-sensitive risk flags from a Build access token.
+// bot_flag_source or its short alias bfs must be JSON number 1 or 2; other values, malformed
+// tokens, and decryption failures are not marked. bot_flag_source is preferred when both are set.
+func (a *Adapter) CredentialMetadata(credential account.Credential) provider.CredentialMetadata {
+	if credential.Provider != account.ProviderBuild || a.cipher == nil || credential.EncryptedAccessToken == "" {
+		return provider.CredentialMetadata{}
 	}
-	if request.Method != http.MethodPost || strings.TrimSpace(request.PromptCacheKey) == "" {
-		return false
+	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return provider.CredentialMetadata{}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false
+	claims := decodeJWTClaims(accessToken)
+	if claims == nil {
+		return provider.CredentialMetadata{}
 	}
-	return true
+	source := buildBotFlagSourceFromClaims(claims)
+	return provider.CredentialMetadata{
+		BuildBotFlagInspected: true,
+		BuildBotFlagged:       source != 0,
+		BuildBotFlagSource:    source,
+	}
 }
 
-func isCompactPath(path string) bool {
-	return strings.Contains(strings.ToLower(path), "compact")
+// buildBotFlagSourceFromClaims returns the bot-risk source from JWT claims.
+// Accepts bot_flag_source or bfs; only JSON numbers 1 and 2 count (string "1"/"2" do not).
+// Prefer bot_flag_source when it is 1 or 2; otherwise fall back to bfs.
+func buildBotFlagSourceFromClaims(claims map[string]any) int {
+	if claims == nil {
+		return 0
+	}
+	if source := botFlagSourceClaim(claims, "bot_flag_source"); source != 0 {
+		return source
+	}
+	return botFlagSourceClaim(claims, "bfs")
+}
+
+func botFlagSourceClaim(claims map[string]any, key string) int {
+	value, ok := claims[key].(float64)
+	if !ok {
+		return 0
+	}
+	switch value {
+	case 1, 2:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+// buildBotFlaggedFromClaims reports whether JWT claims mark a Build account as bot-risked.
+func buildBotFlaggedFromClaims(claims map[string]any) bool {
+	return buildBotFlagSourceFromClaims(claims) != 0
 }
 
 func (a *Adapter) UpdateConfig(cfg Config) {
@@ -169,35 +216,23 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	body := request.Body
 	var toolCompatibility *responsesToolCompatibility
 	var conversationOptions conversation.ResponseOptions
+	cacheRoute := buildPromptCacheRoute{}
 	compactionRequested := false
-	foreignCompactions := 0
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
-			if err == nil {
-				// Chat/Messages convert into Responses-shaped bodies that may still carry
-				// type=compaction items from multi-backend clients.
-				var n int
-				body, n, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
-				foreignCompactions += n
-				if rewritten, ok := resolveGatewayPreviousResponse(body, a.compactRecall); ok {
-					body = rewritten
-				}
-			}
 		} else {
-			// Expand gateway-owned compaction blobs; never forward foreign/native Grok
-			// account-scoped blobs (upstream: "Could not decode the compaction blob").
-			var n int
-			body, n, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
-			foreignCompactions += n
-			if rewritten, ok := resolveGatewayPreviousResponse(body, a.compactRecall); ok {
-				body = rewritten
+			var foreignCompactions int
+			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			if err != nil {
+				return invalidResponsesResponse(err), nil
 			}
-			if err == nil {
-				body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
-			}
+			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
 			if toolCompatibility != nil {
 				compactionRequested = toolCompatibility.compactionRequested
+				if foreignCompactions > 0 {
+					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
 			}
 		}
 		if err != nil {
@@ -206,7 +241,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			return invalidResponsesResponse(err), nil
 		}
-		body, err = normalizeBuildReasoningEffort(body)
+		body, err = normalizeBuildRequest(body, request.Model)
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
@@ -214,13 +249,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			return invalidResponsesResponse(err), nil
 		}
 	}
-	// Native POST /responses/compact returns account-scoped Grok blobs that break
-	// after pool failover. Always emulate via gateway-owned sampling instead.
-	if !compactionRequested && isCompactPath(request.Path) && request.Method == http.MethodPost {
-		compactionRequested = true
-		if toolCompatibility != nil {
-			toolCompatibility.addWarning("remote_compaction_v2_emulated")
-		}
+	if request.Operation == conversation.OperationMessages && conversationOptions.AnthropicWebSearch {
+		request.ReasoningReplayKey = ""
 	}
 	if compactionRequested {
 		body, err = prepareGatewayCompactionSample(body)
@@ -230,6 +260,15 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	}
 	if len(body) > 0 && request.Method == http.MethodPost {
 		if !compactionRequested {
+			allowClientTools := request.AllowClientToolCacheRoute || (account.RoutingCandidate{Credential: request.Credential, Billing: request.Billing}).IsKnownFreeBuild()
+			body, cacheRoute, err = prepareBuildPromptCacheRoute(body, request.Operation, request.Model, request.PromptCacheKey, allowClientTools)
+			if err != nil {
+				err = fmt.Errorf("准备 Build prompt cache 路由: %w", err)
+				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+					return invalidConversationResponse(request.Operation, err), nil
+				}
+				return invalidResponsesResponse(err), nil
+			}
 			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
 			if err != nil {
 				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
@@ -239,40 +278,6 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				return invalidResponsesResponse(err), nil
 			}
 		}
-		// 服务端推理回放：在 prompt_cache_key 写入后、出站前注入上一轮 encrypted items。
-		if a.replay != nil && request.PromptCacheKey != "" && !isCompactPath(request.Path) && !compactionRequested {
-			body = a.replay.Apply(ctx, request.Model, request.PromptCacheKey, body)
-		}
-		// Last-mile: deep-scrub compact state before the first upstream call.
-		// Also strip opaque compact-like payloads and previous_response_id when
-		// any compact residue was found — multi-account pools cannot decode
-		// account-scoped compact blobs, so fail-open to portable text history.
-		if !compactionRequested {
-			var scrubbed int
-			body, scrubbed = scrubUpstreamCompactionBlobs(body)
-			if scrubbed > 0 {
-				foreignCompactions += scrubbed
-			}
-			if cleaned, n := stripOpaqueCompactPayloads(body); n > 0 {
-				body = cleaned
-				foreignCompactions += n
-				scrubbed += n
-			}
-			if scrubbed > 0 {
-				if stripped, ok := stripPreviousResponseID(body); ok {
-					body = stripped
-				}
-				slog.Warn("compaction_blob_scrubbed",
-					"removed", scrubbed,
-					"path", request.Path,
-					"prompt_cache_key_set", strings.TrimSpace(request.PromptCacheKey) != "",
-					"stage", "pre_request",
-				)
-			}
-		}
-	}
-	if foreignCompactions > 0 && toolCompatibility != nil {
-		toolCompatibility.addWarning("foreign_compaction_omitted")
 	}
 	if compactionRequested {
 		warnings := ""
@@ -281,95 +286,107 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
-	base := a.apiBaseForOperation(ctx, request.Credential, request.Method, request.Path)
-	// Absolute last defense inside the HTTP sender as well.
-	if scrubbedBody, n := scrubUpstreamCompactionBlobs(body); n > 0 {
-		body = scrubbedBody
-		foreignCompactions += n
-		if stripped, ok := stripPreviousResponseID(body); ok {
-			body = stripped
-		}
-		slog.Warn("compaction_blob_scrubbed", "removed", n, "path", request.Path, "stage", "do_request")
-	}
-	if cleaned, n := stripOpaqueCompactPayloads(body); n > 0 {
-		body = cleaned
-		foreignCompactions += n
-		if stripped, ok := stripPreviousResponseID(body); ok {
-			body = stripped
-		}
-		slog.Warn("compaction_blob_scrubbed", "removed", n, "path", request.Path, "stage", "do_request_opaque")
-	}
+	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source/bfs in {1,2} default to XAI.
+	primaryBase := a.primaryBaseURL()
+	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
+	// Cache affinity and reasoning replay use separate identities. Replay is also bound to the actual account and upstream plane,
+	// preventing opaque reasoning issued for one account or Build plane from reaching another scope.
+	replayBaseBody := body
+	body, replayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, base)
 	resp, reqURL, err := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if err != nil {
 		return nil, err
 	}
-	// Shared recovery for compaction-blob / encrypted_content decode 400s
-	// (upstream v3.0.5+ reasoning recovery). Pre-request scrub remains above;
-	// post-response recovery owns retries so session-reset is not short-circuited
-	// by a second same-session POST that still carries opaque state.
 	if err := normalizeGzipResponse(resp); err != nil {
 		return nil, err
 	}
-	replayKey := strings.TrimSpace(request.PromptCacheKey)
 	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
-
-	// 未标记账号：仅可回退操作在主地址明确 403 时用等价请求探测 XAI。
-	if a.shouldProbeXAIInferenceFallback(ctx, request.Credential, request.Method, request.Path, resp.StatusCode) {
+	var recoveredPrimaryFailure *provider.DiagnosticResponse
+	// Only eligible operations probe XAI with an equivalent request after the Build primary explicitly returns 403.
+	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
+		// Buffer the primary 403 body and replay it unchanged if fallback fails; never issue a second primary POST.
 		primaryBody, primaryTruncated, readErr := provider.ReadDiagnosticBody(resp.Body)
 		_ = resp.Body.Close()
 		if readErr != nil {
 			return nil, readErr
 		}
 		primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
-		fallbackBase := a.fallbackBaseURL()
-		if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
-			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, body, fallbackBase)
-			fallbackRecovery := reasoningRecoveryOutcome{}
-			if fallbackErr == nil {
-				if err := normalizeGzipResponse(fallbackResp); err != nil {
-					_ = fallbackResp.Body.Close()
-					fallbackErr = err
-				}
-			}
-			if fallbackErr == nil {
-				fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, fallbackBase, replayKey, fallbackResp, fallbackURL)
-			}
-			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
-				cred := request.Credential
-				a.activateBuildAPIFallback(ctx, &cred)
-				resp, reqURL = fallbackResp, fallbackURL
-				reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
-			} else {
+		if shouldSkipXAIFallback(primaryBody) {
+			resp = primaryResp
+		} else {
+			fallbackBase := a.fallbackBaseURL()
+			if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
+				fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+				fallbackCtx := infraegress.WithPhysicalCallStage(ctx, "plane_fallback")
+				fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(fallbackCtx, request, accessToken, fallbackBody, fallbackBase)
 				if fallbackErr == nil {
-					_ = fallbackResp.Body.Close()
+					fallbackErr = normalizeGzipResponse(fallbackResp)
 				}
+				fallbackRecovery := reasoningRecoveryOutcome{}
+				if fallbackErr == nil {
+					fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
+				}
+				if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
+					recoveredPrimaryFailure = bufferedFailureDiagnostic(primaryResp, primaryBody, primaryTruncated)
+					a.activateBuildAPIFallback(ctx, &request.Credential)
+					resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
+					reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
+				} else {
+					if fallbackErr == nil {
+						_ = fallbackResp.Body.Close()
+					}
+					// Preserve the original primary 403 URL and buffered body without requesting the primary again.
+					resp = primaryResp
+				}
+			} else {
 				resp = primaryResp
 			}
-		} else {
-			resp = primaryResp
 		}
 	}
-	if err := normalizeGzipResponse(resp); err != nil {
-		return nil, err
+	var rateLimit *provider.RateLimitMetadata
+	var rateLimitDiagnostic *provider.DiagnosticResponse
+	if resp.StatusCode == http.StatusTooManyRequests {
+		body, truncated, readErr := provider.ReadDiagnosticBody(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		rateLimit = provider.RateLimitFromResponse(resp.StatusCode, resp.Header, body)
+		if truncated {
+			rateLimitDiagnostic = &provider.DiagnosticResponse{
+				StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(),
+				Body: append([]byte(nil), body...), BodyTruncated: true,
+			}
+		}
 	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
-	// 在协议转换前捕获上游 Responses 形态，写入/清理推理回放缓存。
-	if a.shouldCaptureReplay(request, resp) {
-		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, request.PromptCacheKey, request.Streaming, isCompactPath(request.Path))
+	// Capture or clear reasoning replay in the upstream Responses shape before protocol conversion.
+	if a.shouldCaptureReplay(request, resp, replayKey) {
+		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, replayKey, request.Streaming, isCompactPath(request.Path))
 	}
-	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
+	// Replay must read the raw upstream output. Hide xAI native search subcalls from downstream clients
+	// only after capture wrapping has completed.
+	if isHTTPSuccess(resp.StatusCode) {
+		if err := filterBuildPromptCacheResponse(resp, request.Streaming, cacheRoute); err != nil {
+			return nil, err
+		}
+	}
+	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses || request.Operation == conversation.OperationCompaction
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
 	reasoningRecovery.appendWarnings(resp.Header)
-	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if responsesOperation && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Content-Type", "text/event-stream")
-		} else {
+		} else if toolCompatibility != nil {
 			data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCompatibleResponseBytes+1))
 			_ = resp.Body.Close()
 			if readErr != nil {
@@ -410,25 +427,140 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			var diagnostic *provider.DiagnosticResponse
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated}
+				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated || rateLimitDiagnostic != nil}
 			}
 			converted, convertErr := conversation.ConvertResponseJSONWithOptions(data, request.Operation, conversationOptions)
 			if convertErr != nil {
 				if diagnostic == nil {
 					return nil, convertErr
 				}
-				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, ModelCatalogChanged: modelCatalogChanged}, nil
+				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(converted))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
 			resp.Header.Set("Content-Type", "application/json")
-			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, ModelCatalogChanged: modelCatalogChanged}, nil
+			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 		}
 	}
-	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, ModelCatalogChanged: modelCatalogChanged}, nil
+	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: rateLimitDiagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
-// invalidResponsesResponse 将本地协议校验错误转换为标准 OpenAI 错误响应，避免触发上游账号重试。
+func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response, replayKey string) bool {
+	if a.replay == nil || !a.replay.Enabled() || resp == nil {
+		return false
+	}
+	if request.Method != http.MethodPost || strings.TrimSpace(replayKey) == "" {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	return true
+}
+
+func (a *Adapter) applyReasoningReplay(ctx context.Context, request provider.ResponseResourceRequest, body []byte, base string) ([]byte, string) {
+	if a.replay == nil || !a.replay.Enabled() || request.Method != http.MethodPost {
+		return body, ""
+	}
+	key := a.scopedReasoningReplayKey(request, base)
+	if key == "" {
+		return body, ""
+	}
+	if isCompactPath(request.Path) {
+		// compact does not inject history, but a successful request still clears old replay in the same scope.
+		return body, key
+	}
+	return a.replay.Apply(ctx, request.Model, key, body), key
+}
+
+func (a *Adapter) scopedReasoningReplayKey(request provider.ResponseResourceRequest, base string) string {
+	seed := strings.TrimSpace(request.ReasoningReplayKey)
+	if seed == "" || request.Credential.ID == 0 {
+		return ""
+	}
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:reasoning-replay:v2:%s:%d:%s", seed, request.Credential.ID, plane)))
+	return hex.EncodeToString(digest[:])
+}
+
+func isCompactPath(path string) bool {
+	return strings.Contains(strings.ToLower(path), "compact")
+}
+
+func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (*http.Response, string, error) {
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	if request.ForcedEgressNodeID != 0 {
+		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
+	}
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	requestCtx = infraegress.WithPhysicalCallPlane(requestCtx, plane)
+	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
+		return nil, "", err
+	}
+	applyGrokTurnIndexHeader(req, request.GrokTurnIndex)
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if request.Streaming {
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Accept-Encoding", "identity")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	if request.IdempotencyID != "" {
+		req.Header.Set("Idempotency-Key", request.IdempotencyID)
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	return resp, req.URL.String(), nil
+}
+
+// applyGrokTurnIndexHeader forwards a real client turn only when the request has a stable Grok session.
+func applyGrokTurnIndexHeader(request *http.Request, value string) {
+	if request.Header.Get("x-grok-session-id") == "" {
+		return
+	}
+	if turnIndex := normalizeGrokTurnIndex(value); turnIndex != "" {
+		request.Header.Set("x-grok-turn-idx", turnIndex)
+	}
+}
+
+// normalizeGrokTurnIndex accepts only non-negative decimal u64 values generated by an official client.
+// Empty or invalid values are omitted; the gateway never fabricates turns from history, tool loops, or compaction.
+func normalizeGrokTurnIndex(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 20 {
+		return ""
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return ""
+	}
+	return value
+}
+
+// invalidResponsesResponse converts local protocol validation errors to a standard OpenAI error response,
+// avoiding an upstream account retry.
 func invalidResponsesResponse(err error) *provider.Response {
 	code := "invalid_request"
 	param := ""
@@ -465,49 +597,136 @@ func invalidConversationResponse(operation string, err error) *provider.Response
 }
 
 func (a *Adapter) ListModels(ctx context.Context, credential account.Credential) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, a.url("/models"), nil)
+	// Always request the model catalog from the Build primary; do not preemptively switch to XAI because 1.5 or Super entitlement is absent.
+	// NormalizeAccountModelCapabilities fills session-contract capabilities such
+	// as Composer and paid video entitlement locally.
+	models, status, err := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
 	if err != nil {
 		return nil, err
 	}
+	if models != nil {
+		return models, nil
+	}
+	return nil, fmt.Errorf("上游模型接口返回 %d", status)
+}
+
+// NormalizeAccountModelCapabilities normalizes capabilities that the OAuth
+// session contract exposes independently of the account's sparse /models list.
+// Composer is available to Build OAuth sessions even though the live catalog can
+// return only grok-4.5. Super always includes video 1.5; Free and Unknown remove
+// video 1.5 exactly. BuildAPIFallback is ignored.
+func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
+	super := account.IsBuildSuper(credential, billing)
+	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
+	result := make([]string, 0, len(models)+2)
+	seen := make(map[string]struct{}, len(models)+2)
+	hasVideo15 := false
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, exists := seen[model]; exists {
+			continue
+		}
+		if model == buildVideoModel {
+			if !super {
+				continue
+			}
+			hasVideo15 = true
+		}
+		seen[model] = struct{}{}
+		result = append(result, model)
+	}
+	if super && !hasVideo15 {
+		result = append(result, buildVideoModel)
+	}
+	if composer {
+		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
+			result = append(result, modeldomain.GrokComposer25Fast)
+		}
+	}
+	return result
+}
+
+type buildModelCatalogEntry struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	ModelID string `json:"modelId"`
+	Hidden  bool   `json:"hidden"`
+	Meta    struct {
+		Model   string `json:"model"`
+		ModelID string `json:"modelId"`
+		Hidden  bool   `json:"hidden"`
+	} `json:"_meta"`
+}
+
+// modelIdentifier keeps the legacy top-level id authoritative and uses the
+// additional official Grok Build shapes only as fallbacks. This makes catalog
+// parsing additive: existing route IDs never change merely because model or
+// modelId metadata appears alongside id.
+func (e buildModelCatalogEntry) modelIdentifier() string {
+	if e.Hidden || e.Meta.Hidden {
+		return ""
+	}
+	return firstNonEmpty(e.ID, e.Model, e.ModelID, e.Meta.Model, e.Meta.ModelID)
+}
+
+func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credential, accessToken, base string) ([]string, int, error) {
+	requestCtx := infraegress.WithCredential(ctx, credential)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, a.urlWithBase(base, "/models"), nil)
+	if err != nil {
+		return nil, 0, err
+	}
 	if err := a.applyHeaders(req, credential, accessToken, "", "", false); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := normalizeGzipResponse(resp); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游模型接口返回 %d", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	models := make([]string, 0, len(payload.Data))
-	for _, item := range payload.Data {
-		if item.ID != "" {
-			models = append(models, item.ID)
+	seen := make(map[string]struct{}, len(payload.Data))
+	for _, raw := range payload.Data {
+		var item buildModelCatalogEntry
+		if json.Unmarshal(raw, &item) != nil {
+			continue
 		}
+		identifier := item.modelIdentifier()
+		if identifier == "" {
+			continue
+		}
+		if _, exists := seen[identifier]; exists {
+			continue
+		}
+		seen[identifier] = struct{}{}
+		models = append(models, identifier)
 	}
 	a.recordModelsETag(credential.ID, resp.Header.Get("ETag"))
-	return models, nil
+	return models, resp.StatusCode, nil
 }
 
 func (a *Adapter) recordModelsETag(accountID uint64, etag string) {
@@ -535,14 +754,16 @@ func (a *Adapter) modelCatalogChanged(accountID uint64, etag string) bool {
 	}
 	current := a.modelsETags[accountID]
 	if current == "" {
-		// 进程重启后内存中没有目录基线。让 Gateway 补一次账号级
-		// /models 同步；同步成功后 recordModelsETag 会建立基线。
+		// After a process restart there is no in-memory catalog baseline. Let the Gateway perform one account-level
+		// /models sync; recordModelsETag establishes the baseline after success.
 		return true
 	}
 	return current != etag
 }
 
 func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential) (account.Billing, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
 	if err != nil {
 		return account.Billing{}, err
@@ -551,20 +772,32 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 	if err != nil {
 		return account.Billing{}, err
 	}
+	// A weekly quota at 0% usage cannot distinguish Free from a newly activated paid plan.
+	// The official CLI uses /user?include=subscription for the live subscription tier, then falls back to the JWT tier.
+	if tier, tierErr := a.getSubscriptionTier(ctx, credential, accessToken); tierErr == nil && tier != "" {
+		billing.PlanName = tier
+	} else if billing.PlanCode == "" && billing.PlanName == "" {
+		billing.PlanName = subscriptionTierFromJWT(accessToken)
+	}
 	billing.AccountID = credential.ID
 	billing.SyncedAt = time.Now().UTC()
 	return billing, nil
 }
 
 func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Credential) (provider.RefreshedCredential, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	refreshToken, err := a.cipher.Decrypt(credential.EncryptedRefreshToken)
 	if err != nil {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: true, Cause: err}
+		// Decryption failures are usually temporary or mismatched local encryption keys and are recoverable;
+		// do not mark them permanent, or manual/batch refresh will never retry after the key is fixed.
+		// True permanent OAuth failures such as invalid_grant are returned by oauth.refresh with Permanent=true.
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Message: "Stored refresh credential could not be decrypted", Permanent: false, Cause: err}
 	}
 	if strings.TrimSpace(refreshToken) == "" {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Message: "Refresh token is missing", Permanent: true}
 	}
-	refreshCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	refreshCtx := infraegress.WithCredential(ctx, credential)
 	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
@@ -581,10 +814,14 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 }
 
 func (a *Adapter) StartDeviceAuthorization(ctx context.Context) (provider.DeviceAuthorization, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	return a.oauth.startDevice(ctx)
 }
 
 func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string) (provider.CredentialSeed, error) {
+	ctx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
 	tokens, err := a.oauth.pollDevice(ctx, deviceCode)
 	if err != nil {
 		return provider.CredentialSeed{}, err
@@ -613,9 +850,8 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 
 	if trace {
 		requestID := uuid.NewString()
-		// Only set x-grok-conv-id / session-id when a stable session exists.
-		// Never mint a random UUID per request: it breaks xAI session affinity
-		// and keeps cached_tokens at zero across multi-turn sticky sessions.
+		// Set x-grok-conv-id and session-id only when a stable session exists.
+		// Never generate a random UUID per request; it breaks xAI session affinity and keeps cached_tokens at zero.
 		sessionID, err := grokSessionID(promptCacheKey)
 		if err != nil {
 			return err
@@ -627,8 +863,8 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 			req.Header.Set("x-grok-conv-id", sessionID)
 		}
 		req.Header.Set("x-grok-req-id", requestID)
-		// 网关无法从无状态 API 请求可靠恢复 CLI prompt index；该字段在
-		// 官方协议中可选，因此不伪造 x-grok-turn-idx。
+		// The gateway cannot reliably recover the CLI prompt index from a stateless API request.
+		// The field is optional in the official protocol, so do not fabricate x-grok-turn-idx.
 		if credential.UserID != "" {
 			req.Header.Set("x-grok-user-id", credential.UserID)
 		}
@@ -734,7 +970,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	if query != "" {
 		endpoint += "?" + query
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return account.Billing{}, err
@@ -760,10 +996,31 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	return parseBilling(body)
 }
 
-func truncateForLog(value string, max int) string {
-	value = strings.TrimSpace(value)
-	if max <= 0 || len(value) <= max {
-		return value
+func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
+	endpoint := a.url("/user") + "?include=subscription"
+	requestCtx, cancel := context.WithTimeout(infraegress.WithCredential(ctx, credential), subscriptionTierTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
 	}
-	return value[:max] + "…"
+	if err := a.applyHeaders(req, credential, accessToken, "", "", false); err != nil {
+		return "", err
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	if err := normalizeGzipResponse(resp); err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("上游订阅接口返回 %d", resp.StatusCode)
+	}
+	return parseSubscriptionTier(body)
 }

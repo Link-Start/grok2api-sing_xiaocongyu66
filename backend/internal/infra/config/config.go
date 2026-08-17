@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,24 +20,35 @@ import (
 )
 
 const (
-	// StatsigModeLocal signs x-statsig-id in-process (pure Go, no remote signer).
-	StatsigModeLocal              = "local"
+	DatabaseURLEnv                = "GROK2API_DATABASE_URL"
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
+	ClearanceModeManual           = "manual"
+	ClearanceModeFlareSolverr     = "flaresolverr"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
-	RecommendedBuildClientVersion = "0.2.111"
+	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
+	RecommendedBuildClientVersion = "0.2.119"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
 
-	maxServerBodyBytes    = 256 << 20
-	maxRequestTimeout     = 24 * time.Hour
-	maxReadTimeout        = time.Hour
-	maxRoutingTTL         = 30 * 24 * time.Hour
-	maxRoutingCooldown    = 24 * time.Hour
-	minAuditFlushInterval = 10 * time.Millisecond
-	maxAuditFlushInterval = time.Minute
-	maxAuditBufferSize    = 262144
-	maxAuditBatchSize     = 4096
+	maxServerBodyBytes     = 256 << 20
+	maxRequestTimeout      = 24 * time.Hour
+	maxReadTimeout         = time.Hour
+	maxRoutingTTL          = 30 * 24 * time.Hour
+	maxRoutingCooldown     = 24 * time.Hour
+	maxRoutingCapacityWait = 30 * time.Second
+	maxRoutingAttempts     = 65535
+	minAuditFlushInterval  = 10 * time.Millisecond
+	maxAuditFlushInterval  = time.Minute
+	maxAuditBufferSize     = 262144
+	maxAuditBatchSize      = 4096
+	minAuditCommitDelay    = time.Millisecond
+	maxAuditCommitDelay    = 50 * time.Millisecond
+	maxDeploymentReplicas  = 1024
 )
+
+const unlimitedRoutingAttempts = -1
+
+var buildForbiddenCodePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // Config 表示后端运行配置。
 type Config struct {
@@ -44,6 +56,7 @@ type Config struct {
 	Frontend          FrontendConfig          `yaml:"frontend"`
 	Database          DatabaseConfig          `yaml:"database"`
 	RuntimeStore      RuntimeStoreConfig      `yaml:"runtimeStore"`
+	Deployment        DeploymentConfig        `yaml:"deployment"`
 	Auth              AuthConfig              `yaml:"auth"`
 	Secrets           Secrets                 `yaml:"secrets"`
 	BootstrapAdmin    BootstrapAdminConfig    `yaml:"bootstrapAdmin"`
@@ -52,7 +65,10 @@ type Config struct {
 	Media             MediaConfig             `yaml:"media"`
 	Routing           RoutingConfig           `yaml:"routing"`
 	Audit             AuditConfig             `yaml:"audit"`
+	QualityGuard      QualityGuardConfig      `yaml:"qualityGuard"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
+	Accounts          AccountsConfig          `yaml:"-"`
+	DBBuffer          DBBufferConfig          `yaml:"dbBuffer"`
 }
 
 type ServerConfig struct {
@@ -62,15 +78,6 @@ type ServerConfig struct {
 	ReadTimeout           Duration `yaml:"readTimeout"`
 	RequestTimeout        Duration `yaml:"requestTimeout"`
 	SwaggerEnabled        bool     `yaml:"swaggerEnabled"`
-	// TrustedProxies lists reverse-proxy CIDRs/IPs trusted for X-Forwarded-For / X-Real-IP.
-	// Empty means ClientIP uses the direct remote address only (no client-supplied spoofing).
-	// When the app sits behind nginx/caddy/LB on a private network, set those hop CIDRs
-	// (e.g. 10.0.0.0/8) so audit logs show the real client IP instead of the proxy's 10.x address.
-	TrustedProxies []string `yaml:"trustedProxies"`
-	// TrustedPlatform selects a CDN/edge client-IP header when present (takes priority over XFF).
-	// Values: "" (default), "cloudflare" (CF-Connecting-IP), "flyio" (Fly-Client-IP),
-	// or any custom header name such as "True-Client-IP" / "X-Client-IP".
-	TrustedPlatform string `yaml:"trustedPlatform"`
 }
 
 type FrontendConfig struct {
@@ -112,6 +119,13 @@ type RuntimeStoreConfig struct {
 	Redis  RedisRuntimeConfig `yaml:"redis"`
 }
 
+type DeploymentConfig struct {
+	Replicas    int    `yaml:"replicas"`
+	InstanceID  string `yaml:"instanceID"`
+	ClusterID   string `yaml:"clusterID"`
+	SharedMedia bool   `yaml:"sharedMedia"`
+}
+
 type RedisRuntimeConfig struct {
 	Address   string `yaml:"address"`
 	Username  string `yaml:"username"`
@@ -125,68 +139,53 @@ type AuthConfig struct {
 	AccessTokenTTL  Duration `yaml:"accessTokenTTL"`
 	RefreshTokenTTL Duration `yaml:"refreshTokenTTL"`
 	SecureCookies   bool     `yaml:"secureCookies"`
-	// APIKeyHeaders lists extra HTTP headers that may carry the client API key value
-	// (e.g. "congyu_15fc"). Authorization: Bearer and X-API-Key are always accepted.
-	APIKeyHeaders []string `yaml:"apiKeyHeaders"`
 }
 
 type ProviderConfig struct {
-	ProactiveUpstreamSync ProactiveUpstreamSyncConfig `yaml:"proactiveUpstreamSync"`
-	Build                 BuildProviderConfig         `yaml:"build"`
-	Web                   WebProviderConfig           `yaml:"web"`
-	Console               ConsoleProviderConfig       `yaml:"console"`
+	Build   BuildProviderConfig   `yaml:"build"`
+	Web     WebProviderConfig     `yaml:"web"`
+	Console ConsoleProviderConfig `yaml:"console"`
 }
 
 type BuildProviderConfig struct {
-	BaseURL string `yaml:"baseURL"`
-	// FallbackBaseURL is the XAI API root used when a Super Build account is
-	// marked for automatic inference fallback (default https://api.x.ai/v1).
-	FallbackBaseURL  string `yaml:"fallbackBaseURL"`
-	ClientVersion    string `yaml:"clientVersion"`
-	ClientIdentifier string `yaml:"clientIdentifier"`
-	TokenAuth        string `yaml:"tokenAuth"`
-	UserAgent        string `yaml:"userAgent"`
-	// ResponseHeaderTimeout is runtime-only (yaml:"-"); persisted via admin settings.
-	// Controls wait for first response headers from Build (not full body download).
+	BaseURL               string   `yaml:"baseURL"`
+	FallbackBaseURL       string   `yaml:"fallbackBaseURL"`
+	ClientVersion         string   `yaml:"clientVersion"`
+	ClientIdentifier      string   `yaml:"clientIdentifier"`
+	TokenAuth             string   `yaml:"tokenAuth"`
+	UserAgent             string   `yaml:"userAgent"`
 	ResponseHeaderTimeout Duration `yaml:"-"`
+	StreamIdleTimeout     Duration `yaml:"-"`
 }
 
 // DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
 const DefaultBuildFallbackBaseURL = "https://api.x.ai/v1"
-
-// NormalizeBuildFallbackBaseURL 在旧配置缺字段时填入默认 XAI 备用地址。
-func NormalizeBuildFallbackBaseURL(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return DefaultBuildFallbackBaseURL
-	}
-	return strings.TrimSpace(value)
-}
 
 type WebProviderConfig struct {
 	BaseURL             string   `yaml:"baseURL"`
 	StatsigMode         string   `yaml:"-"`
 	StatsigManualValue  string   `yaml:"-"`
 	StatsigSignerURL    string   `yaml:"-"`
+	ClearanceMode       string   `yaml:"-"`
+	FlareSolverrURL     string   `yaml:"-"`
+	ClearanceTimeout    Duration `yaml:"-"`
+	ClearanceRefresh    Duration `yaml:"-"`
 	QuotaTimeout        Duration `yaml:"quotaTimeout"`
 	ChatTimeout         Duration `yaml:"chatTimeout"`
+	StreamIdleTimeout   Duration `yaml:"-"`
 	ImageTimeout        Duration `yaml:"imageTimeout"`
 	VideoTimeout        Duration `yaml:"videoTimeout"`
 	MediaConcurrency    int      `yaml:"mediaConcurrency"`
 	AllowNSFW           bool     `yaml:"allowNSFW"`
 	RecoveryBackoffBase Duration `yaml:"recoveryBackoffBase"`
 	RecoveryBackoffMax  Duration `yaml:"recoveryBackoffMax"`
-	// FlareSolverr (optional): auto-solve Cloudflare challenges for Web/Console egress nodes.
-	FlareSolverrEnabled         bool     `yaml:"flareSolverrEnabled"`
-	FlareSolverrURL             string   `yaml:"flareSolverrURL"`
-	FlareSolverrTargetURL       string   `yaml:"flareSolverrTargetURL"`
-	FlareSolverrTimeout         Duration `yaml:"flareSolverrTimeout"`
-	FlareSolverrRefreshInterval Duration `yaml:"flareSolverrRefreshInterval"`
 }
 
 type ConsoleProviderConfig struct {
-	BaseURL     string   `yaml:"baseURL"`
-	UserAgent   string   `yaml:"userAgent"`
-	ChatTimeout Duration `yaml:"chatTimeout"`
+	BaseURL           string   `yaml:"baseURL"`
+	LegacyUserAgent   string   `yaml:"userAgent"` // Deprecated: 仅用于兼容旧配置文件，不参与请求。
+	ChatTimeout       Duration `yaml:"chatTimeout"`
+	StreamIdleTimeout Duration `yaml:"-"`
 }
 
 // BatchConfig 定义可热加载的账号批量任务并发上限。
@@ -199,109 +198,122 @@ type BatchConfig struct {
 	// DBBuffer enables optional buffering for bulk DB-heavy operations (e.g. account conversion,
 	// batch updates). Data is pulled from main DB into the buffer (Redis or local SQLite),
 	// processed there to reduce main DB load, then batched back to main DB.
-	// Driver: "none" (default), "redis", "sqlite".
 	DBBuffer DBBufferConfig `yaml:"dbBuffer"`
 }
 
 type DBBufferConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Driver  string `yaml:"driver"` // "redis" or "sqlite"
-	Path    string `yaml:"path"`   // for sqlite buffer file, e.g. "./data/bulk-buffer.db"
+	Path    string `yaml:"path"`
 }
 
+// PromptCacheAffinityConfig controls prompt-cache affinity stabilization.
+type PromptCacheAffinityConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	Fingerprint bool     `yaml:"fingerprint"`
+	Expire      bool     `yaml:"expire"`
+	TTL         Duration `yaml:"ttl"`
+}
+
+// DefaultRetryStatusCodes: 403 is intentionally excluded so permanent bans do not cascade across the pool.
+var DefaultRetryStatusCodes = []int{402, 429, 503}
+
 type MediaConfig struct {
-	// Driver selects object storage: "local" or "r2" (Cloudflare R2 / S3-compatible).
 	Driver                  string           `yaml:"driver"`
 	MaxImageBytes           int64            `yaml:"-"`
 	MaxTotalBytes           int64            `yaml:"-"`
 	CleanupThresholdPercent int              `yaml:"-"`
 	CleanupInterval         Duration         `yaml:"-"`
 	Local                   LocalMediaConfig `yaml:"local"`
-	R2                      R2MediaConfig    `yaml:"r2"`
 }
 
 type LocalMediaConfig struct {
 	Path string `yaml:"path"`
 }
 
-// R2MediaConfig is Cloudflare R2 (S3 API) storage for generated images.
-type R2MediaConfig struct {
-	// Endpoint e.g. https://<accountid>.r2.cloudflarestorage.com
-	Endpoint        string `yaml:"endpoint"`
-	AccessKeyID     string `yaml:"accessKeyId"`
-	SecretAccessKey string `yaml:"secretAccessKey"`
-	Bucket          string `yaml:"bucket"`
-	// Region is accepted by the SDK; R2 uses "auto".
-	Region string `yaml:"region"`
-	// Prefix is an optional key prefix inside the bucket (e.g. grok2api).
-	Prefix string `yaml:"prefix"`
-	// PublicBaseURL optional custom domain for objects (informational; gateway still proxies reads).
-	PublicBaseURL string `yaml:"publicBaseURL"`
-}
-
-type ProactiveUpstreamSyncConfig struct {
-	Billing                   bool `yaml:"billing"`
-	WebQuota                  bool `yaml:"webQuota"`
-	ModelCatalogCatchup       bool `yaml:"modelCatalogCatchup"`
-	AllowManualBillingRefresh bool `yaml:"allowManualBillingRefresh"`
-	AllowManualQuotaRefresh   bool `yaml:"allowManualQuotaRefresh"`
-}
-
-type PromptCacheAffinityConfig struct {
-	// Enabled master switch (default true).
-	Enabled bool `yaml:"enabled"`
-	// Fingerprint derives ids from IP/User-Agent/client key when no session header is present.
-	Fingerprint bool `yaml:"fingerprint"`
-	// Expire enables TTL on fingerprint mappings; false keeps mappings until manual clear.
-	Expire bool `yaml:"expire"`
-	// TTL is the mapping lifetime when Expire is true (default 24h).
-	TTL Duration `yaml:"ttl"`
-}
-
-// DefaultRetryStatusCodes: 403 is intentionally excluded so permanent bans do not cascade across the pool.
-// Web egress anti-bot 403 is still handled separately via RetryForbiddenAsEgress.
-var DefaultRetryStatusCodes = []int{402, 429, 503}
-
 type RoutingConfig struct {
-	StickyTTL    Duration `yaml:"stickyTTL"`
-	CooldownBase Duration `yaml:"cooldownBase"`
-	CooldownMax  Duration `yaml:"cooldownMax"`
-	CapacityWait Duration `yaml:"capacityWait"`
-	MaxAttempts  int      `yaml:"maxAttempts"`
+	StickyTTL       Duration `yaml:"stickyTTL"`
+	CooldownBase    Duration `yaml:"cooldownBase"`
+	CooldownMax     Duration `yaml:"cooldownMax"`
+	CapacityWait    Duration `yaml:"capacityWait"`
+	MaxAttempts     int      `yaml:"maxAttempts"`
+	PreferFreeBuild bool     `yaml:"preferFreeBuild"`
+	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
+	MarkBuildChatDeniedAsReauth bool     `yaml:"markBuildChatDeniedAsReauth"`
+	AccountIsolatedConnections  bool     `yaml:"accountIsolatedConnections"`
+	SegmentedSelectorEnabled    bool     `yaml:"segmentedSelectorEnabled"`
+	SegmentedMinCandidates      int      `yaml:"segmentedSelectorMinCandidates"`
+	SegmentedWindowSize         int      `yaml:"segmentedSelectorWindowSize"`
+	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
+	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
+	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
 	// RetryStatusCodes lists exact upstream HTTP codes that trigger account failover.
 	// Empty falls back to DefaultRetryStatusCodes after load/validate normalization.
 	RetryStatusCodes []int `yaml:"retryStatusCodes"`
 	// RetryServerErrors retries any status >= 500 when true (default).
 	RetryServerErrors bool `yaml:"retryServerErrors"`
-	// DeprioritizeFailedAccounts ranks accounts with higher failure_count last for
-	// request routing and slow quota-sync queues. Switchable; default true.
+	// DeprioritizeFailedAccounts ranks accounts with higher failure_count last.
 	DeprioritizeFailedAccounts bool `yaml:"deprioritizeFailedAccounts"`
-	// PreferFreeBuild prefers known free Build accounts when scoring (optional).
-	PreferFreeBuild bool `yaml:"preferFreeBuild"`
-	// SegmentedSelectorEnabled enables windowed large-pool selection for high concurrency.
-	SegmentedSelectorEnabled bool `yaml:"segmentedSelectorEnabled"`
-	// SegmentedMinCandidates is the pool size threshold before segmented mode activates.
-	SegmentedMinCandidates int `yaml:"segmentedSelectorMinCandidates"`
-	// SegmentedWindowSize is how many candidates each segmented window evaluates.
-	SegmentedWindowSize int `yaml:"segmentedSelectorWindowSize"`
 	// PromptCacheAffinity stabilizes x-grok-conv-id for upstream prompt-cache hits.
 	PromptCacheAffinity PromptCacheAffinityConfig `yaml:"promptCacheAffinity"`
-	// ReasoningReplay holds previous-turn encrypted reasoning for multi-turn Build
-	// when clients omit thinking signatures (upstream CLIProxyAPI-compatible).
-	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
-	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
-	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
 }
 
 type AuditConfig struct {
-	BufferSize    int      `yaml:"bufferSize"`
-	BatchSize     int      `yaml:"batchSize"`
-	FlushInterval Duration `yaml:"flushInterval"`
+	BufferSize                  int      `yaml:"bufferSize"`
+	BatchSize                   int      `yaml:"batchSize"`
+	FlushInterval               Duration `yaml:"flushInterval"`
+	CommitDelay                 Duration `yaml:"commitDelay"`
+	LedgerMode                  string   `yaml:"ledgerMode"`
+	LedgerFailureThreshold      int      `yaml:"ledgerFailureThreshold"`
+	LedgerUnhealthyGrace        Duration `yaml:"ledgerUnhealthyGrace"`
+	LedgerQueueHighWatermarkPct int      `yaml:"ledgerQueueHighWatermarkPercent"`
+}
+
+// QualityGuardConfig defines the optional egress-quality sidecar policy.
+// Docker Compose controls whether the sidecar process is started; Enabled is a
+// separate server-side authorization gate for its internal API.
+type QualityGuardConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// DeprecatedClientKeyID is accepted only so configurations created by the
+	// short-lived manual-ID preview continue to load. It is ignored.
+	DeprecatedClientKeyID   uint64   `yaml:"clientKeyID"`
+	Model                   string   `yaml:"model"`
+	NodeIDs                 []uint64 `yaml:"nodeIDs"`
+	Mode                    string   `yaml:"mode"`
+	ActiveInterval          Duration `yaml:"activeInterval"`
+	PassivePollInterval     Duration `yaml:"passivePollInterval"`
+	SoftTPS                 float64  `yaml:"softTPS"`
+	HardTPS                 float64  `yaml:"hardTPS"`
+	ConsecutiveSoft         int      `yaml:"consecutiveSoft"`
+	ConsecutiveErrors       int      `yaml:"consecutiveErrors"`
+	QuarantineDuration      Duration `yaml:"quarantineDuration"`
+	NoAccountBackoff        Duration `yaml:"noAccountBackoff"`
+	MinimumHealthyNodes     int      `yaml:"minimumHealthyNodes"`
+	MaxOutputTokens         int      `yaml:"maxOutputTokens"`
+	FailClosed              bool     `yaml:"failClosed"`
+	MinimumGenerationWindow Duration `yaml:"minimumGenerationWindow"`
+	RotationURL             string   `yaml:"rotationURL"`
+	RotationToken           string   `yaml:"rotationToken"`
+	RotationTimeout         Duration `yaml:"rotationTimeout"`
+	RotatableNodeIDs        []uint64 `yaml:"rotatableNodeIDs"`
 }
 
 type ClientKeyDefaultsConfig struct {
 	RPMLimit      int `yaml:"rpmLimit"`
 	MaxConcurrent int `yaml:"maxConcurrent"`
+}
+
+// AccountsConfig 定义可热加载的账号池维护策略；默认全部关闭。
+type AccountsConfig struct {
+	MarkBuildForbiddenReauth  bool
+	BuildForbiddenReauthCodes []string
+	// ExcludeBuildBotFlaggedFromScheduling removes Build accounts with bot_flag_source/bfs in {1,2}
+	// from scheduling only. Linked Web/Console accounts are unaffected.
+	ExcludeBuildBotFlaggedFromScheduling bool
+	AutoCleanReauthEnabled               bool
+	AutoCleanReauthInterval              Duration
+	AutoCleanReauthMinAge                Duration
+	AutoCleanIncludeDisabled             bool
 }
 
 type Secrets struct {
@@ -371,41 +383,45 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
-	NormalizeRoutingRetry(&cfg)
-	NormalizeLegacyStatsig(&cfg)
+	if err := applyEnvironmentOverrides(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-// DefaultLocalStatsigSignerURL is retained only for migration of historical configs.
-// New installs default to StatsigModeLocal (in-process pure-Go signing).
-const DefaultLocalStatsigSignerURL = "http://127.0.0.1:8788/sign"
+// applyEnvironmentOverrides applies typed, application-owned environment
+// overrides after YAML and before CLI overrides. Empty values are ignored so
+// Compose can pass an optional variable without changing existing deployments.
+func applyEnvironmentOverrides(cfg *Config) error {
+	value := strings.TrimSpace(os.Getenv(DatabaseURLEnv))
+	if value == "" {
+		return nil
+	}
+	dsn, err := validatePostgresEnvironmentURL(value)
+	if err != nil {
+		return err
+	}
+	cfg.Database.Driver = "postgres"
+	cfg.Database.Postgres.DSN = dsn
+	return nil
+}
 
-// NormalizeLegacyStatsig migrates empty / third-party / placeholder signer setups to local
-// pure-Go signing so upgrades boot without a remote Statsig service.
-func NormalizeLegacyStatsig(cfg *Config) {
-	if cfg == nil {
-		return
+func validatePostgresEnvironmentURL(value string) (string, error) {
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "postgresql+asyncpg://") {
+		return "", fmt.Errorf("%s 不支持 SQLAlchemy asyncpg URL；请将 postgresql+asyncpg:// 改为 postgresql://", DatabaseURLEnv)
 	}
-	mode := strings.TrimSpace(cfg.Provider.Web.StatsigMode)
-	if mode == "" {
-		cfg.Provider.Web.StatsigMode = StatsigModeLocal
-		cfg.Provider.Web.StatsigSignerURL = ""
-		return
+	if !strings.HasPrefix(lower, "postgres://") && !strings.HasPrefix(lower, "postgresql://") {
+		return "", fmt.Errorf("%s 必须使用 postgres:// 或 postgresql:// URL（连接信息已隐藏）", DatabaseURLEnv)
 	}
-	if mode != StatsigModeURL {
-		return
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme == "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s 不是有效的 PostgreSQL URL（连接信息已隐藏）", DatabaseURLEnv)
 	}
-	signer := strings.TrimSpace(cfg.Provider.Web.StatsigSignerURL)
-	// Placeholder or banned third-party defaults → pure-Go local signing.
-	if signer == "" ||
-		strings.EqualFold(signer, DefaultStatsigSignerURL) ||
-		strings.EqualFold(signer, DefaultLocalStatsigSignerURL) {
-		cfg.Provider.Web.StatsigMode = StatsigModeLocal
-		cfg.Provider.Web.StatsigSignerURL = ""
-	}
+	return value, nil
 }
 
 func resolveRelativePaths(cfg *Config, configPath string) error {
@@ -431,55 +447,7 @@ func resolveRelativePaths(cfg *Config, configPath string) error {
 	return nil
 }
 
-// NormalizeRoutingRetry fills defaults and deduplicates retry status codes.
-func NormalizeRoutingRetry(cfg *Config) {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.Routing.RetryStatusCodes) == 0 {
-		cfg.Routing.RetryStatusCodes = append([]int(nil), DefaultRetryStatusCodes...)
-		return
-	}
-	seen := make(map[int]struct{}, len(cfg.Routing.RetryStatusCodes))
-	normalized := make([]int, 0, len(cfg.Routing.RetryStatusCodes))
-	for _, code := range cfg.Routing.RetryStatusCodes {
-		if _, ok := seen[code]; ok {
-			continue
-		}
-		seen[code] = struct{}{}
-		normalized = append(normalized, code)
-	}
-	cfg.Routing.RetryStatusCodes = normalized
-}
-
-// IsRetryableStatus reports whether an upstream status should trigger account failover.
-func IsRetryableStatus(status int, codes []int, retryServerErrors bool) bool {
-	if retryServerErrors && status >= 500 {
-		return true
-	}
-	if len(codes) == 0 {
-		codes = DefaultRetryStatusCodes
-	}
-	for _, code := range codes {
-		if status == code {
-			return true
-		}
-	}
-	return false
-}
-
-func validateRetryStatusCodes(codes []int) error {
-	if len(codes) == 0 {
-		return nil
-	}
-	for _, code := range codes {
-		if code < 100 || code > 599 {
-			return errors.New("routing.retryStatusCodes 必须是 100-599 的 HTTP 状态码")
-		}
-	}
-	return nil
-}
-
+// Validate 校验启动所需的安全配置和运行边界。
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Server.Listen) == "" {
 		return errors.New("server.listen 不能为空")
@@ -540,28 +508,31 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("runtimeStore.driver 必须是 memory 或 redis")
 	}
-	switch strings.ToLower(strings.TrimSpace(c.Media.Driver)) {
-	case "", "local":
-		c.Media.Driver = "local"
-		if strings.TrimSpace(c.Media.Local.Path) == "" {
-			return errors.New("media.local.path 不能为空")
+	if c.Deployment.Replicas < 1 || c.Deployment.Replicas > maxDeploymentReplicas {
+		return fmt.Errorf("deployment.replicas 必须在 1 到 %d 之间", maxDeploymentReplicas)
+	}
+	if c.Deployment.Replicas > 1 {
+		if c.Database.Driver != "postgres" {
+			return errors.New("多实例部署必须使用 PostgreSQL")
 		}
-	case "r2":
-		c.Media.Driver = "r2"
-		if strings.TrimSpace(c.Media.R2.Endpoint) == "" || strings.TrimSpace(c.Media.R2.AccessKeyID) == "" ||
-			strings.TrimSpace(c.Media.R2.SecretAccessKey) == "" || strings.TrimSpace(c.Media.R2.Bucket) == "" {
-			return errors.New("media.driver=r2 时必须配置 endpoint、accessKeyId、secretAccessKey、bucket")
+		if c.RuntimeStore.Driver != "redis" {
+			return errors.New("多实例部署必须使用 Redis 运行态存储")
 		}
-		if _, err := url.ParseRequestURI(strings.TrimSpace(c.Media.R2.Endpoint)); err != nil {
-			return errors.New("media.r2.endpoint 必须是有效 URL")
+		if strings.TrimSpace(c.Deployment.InstanceID) == "" {
+			return errors.New("多实例部署必须配置 deployment.instanceID")
 		}
-		if pub := strings.TrimSpace(c.Media.R2.PublicBaseURL); pub != "" {
-			if _, err := url.ParseRequestURI(pub); err != nil {
-				return errors.New("media.r2.publicBaseURL 必须是有效 URL")
-			}
+		if strings.TrimSpace(c.Deployment.ClusterID) == "" {
+			return errors.New("多实例部署必须配置 deployment.clusterID")
 		}
-	default:
-		return errors.New("media.driver 仅支持 local 或 r2")
+		if !c.Deployment.SharedMedia {
+			return errors.New("多实例部署必须确认 deployment.sharedMedia=true 并挂载共享媒体目录")
+		}
+	}
+	if c.Media.Driver != "local" {
+		return errors.New("media.driver 当前仅支持 local")
+	}
+	if strings.TrimSpace(c.Media.Local.Path) == "" {
+		return errors.New("media.local.path 不能为空")
 	}
 	if c.Media.MaxImageBytes < 1<<20 || c.Media.MaxImageBytes > 32<<20 {
 		return errors.New("media.maxImageBytes 必须在 1 MiB 到 32 MiB 之间")
@@ -590,48 +561,64 @@ func (c Config) Validate() error {
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
 		return errors.New("JWT 有效期必须大于零")
 	}
-	providerURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Build.BaseURL))
-	if err != nil || providerURL.Scheme == "" || providerURL.Host == "" {
-		return errors.New("provider.build.baseURL 必须是有效 URL")
+	if err := validateAPIBaseURL("provider.build.baseURL", c.Provider.Build.BaseURL, false); err != nil {
+		return err
+	}
+	fallbackBase := strings.TrimSpace(c.Provider.Build.FallbackBaseURL)
+	if fallbackBase == "" {
+		fallbackBase = DefaultBuildFallbackBaseURL
+	}
+	if err := validateAPIBaseURL("provider.build.fallbackBaseURL", fallbackBase, true); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.Provider.Build.ClientVersion) == "" || strings.TrimSpace(c.Provider.Build.ClientIdentifier) == "" || strings.TrimSpace(c.Provider.Build.TokenAuth) == "" || strings.TrimSpace(c.Provider.Build.UserAgent) == "" {
 		return errors.New("provider.build 客户端标识不能为空")
 	}
-	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout <= 0 {
-		c.Provider.Build.ResponseHeaderTimeout = Duration(settingsdomain.DefaultBuildResponseHeaderTimeout)
-	} else if timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
-		return fmt.Errorf("provider.build.responseHeaderTimeout 必须在 %s 到 %s 之间", settingsdomain.MinBuildResponseHeaderTimeout, settingsdomain.MaxBuildResponseHeaderTimeout)
+	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
+		return errors.New("Grok Build 响应头超时必须在 30 秒到 30 分钟之间")
+	}
+	if idle := c.Provider.Build.StreamIdleTimeout.Value(); idle < settingsdomain.MinBuildStreamIdleTimeout || idle > settingsdomain.MaxBuildStreamIdleTimeout {
+		return errors.New("Grok Build 流式空闲超时必须在 30 秒到 10 分钟之间")
 	}
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
 	}
 	switch c.Provider.Web.StatsigMode {
-	case StatsigModeLocal:
-		// Pure-Go in-process signer; no remote endpoint or manual value required.
 	case StatsigModeManual:
 		if !validStatsigID(c.Provider.Web.StatsigManualValue) {
 			return errors.New("provider.web 手动 x-statsig-id 格式无效")
 		}
 	case StatsigModeURL:
-		signer := strings.TrimSpace(c.Provider.Web.StatsigSignerURL)
-		if signer == "" {
-			return errors.New("provider.web.statsigSignerURL 不能为空（url 模式须显式配置自建或受信签名服务）")
-		}
-		if strings.EqualFold(signer, DefaultStatsigSignerURL) {
-			return fmt.Errorf("provider.web.statsigSignerURL 不能使用内置第三方默认地址 %s，请使用 local 模式或自建签名服务", DefaultStatsigSignerURL)
-		}
-		if err := signerurl.Validate(signer); err != nil {
+		if err := signerurl.Validate(c.Provider.Web.StatsigSignerURL); err != nil {
 			return fmt.Errorf("provider.web Statsig 签名 URL 无效: %w", err)
 		}
 	default:
-		return errors.New("provider.web Statsig 模式必须是 local、manual 或 url")
+		return errors.New("provider.web Statsig 模式必须是 manual 或 url")
+	}
+	switch c.Provider.Web.ClearanceMode {
+	case ClearanceModeManual:
+	case ClearanceModeFlareSolverr:
+		if err := validateFlareSolverrURL(c.Provider.Web.FlareSolverrURL); err != nil {
+			return fmt.Errorf("provider.web FlareSolverr URL 无效: %w", err)
+		}
+	default:
+		return errors.New("provider.web Clearance 模式必须是 manual 或 flaresolverr")
+	}
+	if c.Provider.Web.ClearanceTimeout.Value() < 10*time.Second || c.Provider.Web.ClearanceTimeout.Value() > 5*time.Minute {
+		return errors.New("provider.web Clearance 超时必须在 10 秒到 5 分钟之间")
+	}
+	if c.Provider.Web.ClearanceRefresh.Value() < time.Minute || c.Provider.Web.ClearanceRefresh.Value() > 24*time.Hour {
+		return errors.New("provider.web Clearance 刷新间隔必须在 1 分钟到 24 小时之间")
 	}
 	if c.Provider.Web.QuotaTimeout.Value() < time.Second || c.Provider.Web.QuotaTimeout.Value() > 2*time.Minute ||
 		c.Provider.Web.ChatTimeout.Value() < 5*time.Second || c.Provider.Web.ChatTimeout.Value() > 30*time.Minute ||
 		c.Provider.Web.ImageTimeout.Value() < 5*time.Second || c.Provider.Web.ImageTimeout.Value() > 30*time.Minute ||
 		c.Provider.Web.VideoTimeout.Value() < time.Minute || c.Provider.Web.VideoTimeout.Value() > 2*time.Hour {
 		return errors.New("provider.web 上游超时配置无效")
+	}
+	if idle := c.Provider.Web.StreamIdleTimeout.Value(); idle < settingsdomain.MinProviderStreamIdleTimeout || idle > settingsdomain.MaxProviderStreamIdleTimeout {
+		return errors.New("Grok Web 流式空闲超时必须在 30 秒到 10 分钟之间")
 	}
 	if c.Provider.Web.MediaConcurrency < 1 || c.Provider.Web.MediaConcurrency > 64 {
 		return errors.New("provider.web 媒体并发必须在 1 到 64 之间")
@@ -640,11 +627,11 @@ func (c Config) Validate() error {
 	if err != nil || consoleURL.Scheme != "https" || consoleURL.Host == "" || consoleURL.User != nil {
 		return errors.New("provider.console.baseURL 必须是无凭据的 HTTPS URL")
 	}
-	if userAgent := strings.TrimSpace(c.Provider.Console.UserAgent); len(userAgent) < 1 || len(userAgent) > 512 {
-		return errors.New("provider.console.userAgent 长度必须在 1 到 512 个字符之间")
-	}
 	if c.Provider.Console.ChatTimeout.Value() < 5*time.Second || c.Provider.Console.ChatTimeout.Value() > 30*time.Minute {
 		return errors.New("provider.console.chatTimeout 必须在 5 秒到 30 分钟之间")
+	}
+	if idle := c.Provider.Console.StreamIdleTimeout.Value(); idle < settingsdomain.MinProviderStreamIdleTimeout || idle > settingsdomain.MaxProviderStreamIdleTimeout {
+		return errors.New("Grok Console 流式空闲超时必须在 30 秒到 10 分钟之间")
 	}
 	if c.Batch.ImportConcurrency < 1 || c.Batch.ImportConcurrency > 50 ||
 		c.Batch.ConversionConcurrency < 1 || c.Batch.ConversionConcurrency > 50 ||
@@ -652,45 +639,19 @@ func (c Config) Validate() error {
 		c.Batch.RefreshConcurrency < 1 || c.Batch.RefreshConcurrency > 50 {
 		return errors.New("批量任务并发必须在 1 到 50 之间")
 	}
-	if c.Batch.DBBuffer.Enabled {
-		d := strings.ToLower(strings.TrimSpace(c.Batch.DBBuffer.Driver))
-		if d != "redis" && d != "sqlite" {
-			return errors.New("batch.dbBuffer.driver 必须是 redis 或 sqlite")
-		}
-		if d == "sqlite" && strings.TrimSpace(c.Batch.DBBuffer.Path) == "" {
-			return errors.New("batch.dbBuffer.path 开启 sqlite buffer 时不能为空")
-		}
-	}
 	if c.Batch.RandomDelay.Value() < 0 || c.Batch.RandomDelay.Value() > 5*time.Second {
 		return errors.New("批量任务随机延迟必须在 0 到 5 秒之间")
 	}
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
-	if c.Provider.Web.FlareSolverrEnabled {
-		if strings.TrimSpace(c.Provider.Web.FlareSolverrURL) == "" {
-			return errors.New("provider.web.flareSolverrURL 启用 FlareSolverr 时不能为空")
-		}
-		if u, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.FlareSolverrURL)); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return errors.New("provider.web.flareSolverrURL 必须是有效的 HTTP(S) URL")
-		}
-	}
-	if c.Provider.Web.FlareSolverrTimeout.Value() < 0 || c.Provider.Web.FlareSolverrTimeout.Value() > 5*time.Minute {
-		return errors.New("provider.web.flareSolverrTimeout 必须在 0 到 5 分钟之间")
-	}
-	if c.Provider.Web.FlareSolverrRefreshInterval.Value() < 0 || c.Provider.Web.FlareSolverrRefreshInterval.Value() > 24*time.Hour {
-		return errors.New("provider.web.flareSolverrRefreshInterval 必须在 0 到 24 小时之间")
-	}
-	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
-		return fmt.Errorf("routing 参数无效")
+	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts {
+		return errors.New("routing 配置无效")
 	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
-		return errors.New("routing.segmentedSelector 参数不合法（minCandidates 100..1e6，windowSize 8..256 且不超过 minCandidates）")
-	}
-	if c.Routing.PromptCacheAffinity.TTL.Value() < 0 || c.Routing.PromptCacheAffinity.TTL.Value() > 30*24*time.Hour {
-		return errors.New("routing 配置无效")
+		return errors.New("routing segmented selector 配置无效")
 	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
@@ -701,65 +662,139 @@ func (c Config) Validate() error {
 	if c.Audit.BufferSize < 1 || c.Audit.BufferSize > maxAuditBufferSize || c.Audit.BatchSize < 1 || c.Audit.BatchSize > maxAuditBatchSize || c.Audit.BatchSize > c.Audit.BufferSize || c.Audit.FlushInterval.Value() < minAuditFlushInterval || c.Audit.FlushInterval.Value() > maxAuditFlushInterval {
 		return errors.New("audit 队列和批量写入配置无效")
 	}
+	if c.Audit.CommitDelay.Value() < minAuditCommitDelay || c.Audit.CommitDelay.Value() > maxAuditCommitDelay {
+		return errors.New("audit.commitDelay 必须在 1ms 到 50ms 之间")
+	}
+	if c.Audit.LedgerMode != "observe" && c.Audit.LedgerMode != "enforce" {
+		return errors.New("audit.ledgerMode 必须是 observe 或 enforce")
+	}
+	if c.Audit.LedgerFailureThreshold < 1 || c.Audit.LedgerFailureThreshold > 100 {
+		return errors.New("audit.ledgerFailureThreshold 必须在 1 到 100 之间")
+	}
+	if c.Audit.LedgerUnhealthyGrace.Value() < time.Second || c.Audit.LedgerUnhealthyGrace.Value() > 10*time.Minute {
+		return errors.New("audit.ledgerUnhealthyGrace 必须在 1 秒到 10 分钟之间")
+	}
+	if c.Audit.LedgerQueueHighWatermarkPct < 50 || c.Audit.LedgerQueueHighWatermarkPct > 100 {
+		return errors.New("audit.ledgerQueueHighWatermarkPercent 必须在 50 到 100 之间")
+	}
+	if err := validateQualityGuardConfig(c.QualityGuard); err != nil {
+		return err
+	}
 	if c.ClientKeyDefaults.RPMLimit < 1 || c.ClientKeyDefaults.RPMLimit > clientkeydomain.MaxRPMLimit || c.ClientKeyDefaults.MaxConcurrent < 1 || c.ClientKeyDefaults.MaxConcurrent > clientkeydomain.MaxConcurrent {
 		return errors.New("clientKeyDefaults 超出允许范围")
 	}
-	if err := validateAPIKeyHeaders(c.Auth.APIKeyHeaders); err != nil {
-		return err
+	if c.Accounts.AutoCleanReauthInterval.Value() < time.Minute || c.Accounts.AutoCleanReauthInterval.Value() > time.Hour {
+		return errors.New("accounts.autoCleanReauthInterval 必须在 1 分钟到 1 小时之间")
+	}
+	if c.Accounts.AutoCleanReauthMinAge.Value() < time.Minute || c.Accounts.AutoCleanReauthMinAge.Value() > 30*24*time.Hour {
+		return errors.New("accounts.autoCleanReauthMinAge 必须在 1 分钟到 30 天之间")
+	}
+	if len(c.Accounts.BuildForbiddenReauthCodes) > 32 {
+		return errors.New("accounts.buildForbiddenReauthCodes 最多支持 32 个错误码")
+	}
+	for _, code := range c.Accounts.BuildForbiddenReauthCodes {
+		if !buildForbiddenCodePattern.MatchString(strings.TrimSpace(code)) {
+			return errors.New("accounts.buildForbiddenReauthCodes 包含无效错误码")
+		}
+	}
+	if len(c.Accounts.BuildForbiddenReauthCodes) == 0 {
+		return errors.New("accounts.buildForbiddenReauthCodes 至少需要一个错误码")
 	}
 	return nil
 }
 
-// validateAPIKeyHeaders checks optional custom client-key header names.
-// Built-in Authorization / X-API-Key need not be listed.
-func validateAPIKeyHeaders(headers []string) error {
-	if len(headers) > 16 {
-		return errors.New("auth.apiKeyHeaders 最多 16 个")
+func validateQualityGuardConfig(value QualityGuardConfig) error {
+	if !value.Enabled {
+		return nil
 	}
-	seen := make(map[string]struct{}, len(headers))
-	for _, raw := range headers {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			return errors.New("auth.apiKeyHeaders 不能包含空名称")
+	if !validUniquePositiveIDs(value.NodeIDs) || !validUniquePositiveIDs(value.RotatableNodeIDs) {
+		return errors.New("qualityGuard.nodeIDs 和 rotatableNodeIDs 必须是唯一的正整数")
+	}
+	if strings.TrimSpace(value.Model) == "" {
+		return errors.New("qualityGuard.model 不能为空")
+	}
+	if value.Mode != "active" && value.Mode != "passive" && value.Mode != "hybrid" {
+		return errors.New("qualityGuard.mode 必须是 active、passive 或 hybrid")
+	}
+	if value.ActiveInterval.Value() < time.Minute || value.ActiveInterval.Value() > 24*time.Hour {
+		return errors.New("qualityGuard.activeInterval 必须在 1 分钟到 24 小时之间")
+	}
+	if value.PassivePollInterval.Value() < time.Second || value.PassivePollInterval.Value() > 5*time.Minute {
+		return errors.New("qualityGuard.passivePollInterval 必须在 1 秒到 5 分钟之间")
+	}
+	if value.SoftTPS < 1 || value.HardTPS <= value.SoftTPS || value.HardTPS > 10000 {
+		return errors.New("qualityGuard TPS 阈值无效")
+	}
+	if value.ConsecutiveSoft < 1 || value.ConsecutiveSoft > 20 || value.ConsecutiveErrors < 1 || value.ConsecutiveErrors > 20 {
+		return errors.New("qualityGuard 连续异常次数必须在 1 到 20 之间")
+	}
+	if value.QuarantineDuration.Value() < 30*time.Second || value.QuarantineDuration.Value() > 24*time.Hour || value.NoAccountBackoff.Value() < 30*time.Second || value.NoAccountBackoff.Value() > 24*time.Hour {
+		return errors.New("qualityGuard 隔离和无账号退避时间必须在 30 秒到 24 小时之间")
+	}
+	if value.MinimumHealthyNodes < 1 || (len(value.NodeIDs) > 0 && value.MinimumHealthyNodes > len(value.NodeIDs)) {
+		return errors.New("qualityGuard.minimumHealthyNodes 与受管节点数量不匹配")
+	}
+	if value.MaxOutputTokens < 32 || value.MaxOutputTokens > 4096 {
+		return errors.New("qualityGuard.maxOutputTokens 必须在 32 到 4096 之间")
+	}
+	if value.MinimumGenerationWindow.Value() < time.Millisecond || value.MinimumGenerationWindow.Value() > 2*time.Minute {
+		return errors.New("qualityGuard.minimumGenerationWindow 必须在 1 毫秒到 2 分钟之间")
+	}
+	if value.RotationTimeout.Value() < 5*time.Second || value.RotationTimeout.Value() > 5*time.Minute {
+		return errors.New("qualityGuard.rotationTimeout 必须在 5 秒到 5 分钟之间")
+	}
+	if len(value.RotatableNodeIDs) > 0 && strings.TrimSpace(value.RotationURL) == "" {
+		return errors.New("qualityGuard.rotatableNodeIDs 非空时必须配置 rotationURL")
+	}
+	if raw := strings.TrimSpace(value.RotationURL); raw != "" {
+		parsed, err := url.ParseRequestURI(raw)
+		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return errors.New("qualityGuard.rotationURL 必须是无凭据的 HTTP(S) URL")
 		}
-		if len(name) > 64 {
-			return errors.New("auth.apiKeyHeaders 名称过长")
-		}
-		lower := strings.ToLower(name)
-		if lower == "authorization" || lower == "x-api-key" {
-			return errors.New("auth.apiKeyHeaders 无需重复配置 Authorization 或 X-API-Key")
-		}
-		if !isHTTPHeaderToken(name) {
-			// Do not echo the raw header name into errors (may surface in logs).
-			return errors.New("auth.apiKeyHeaders 含非法头名")
-		}
-		if _, ok := seen[lower]; ok {
-			return errors.New("auth.apiKeyHeaders 存在重复项")
-		}
-		seen[lower] = struct{}{}
 	}
 	return nil
 }
 
-// isHTTPHeaderToken matches RFC 7230 token characters for header field-names.
-func isHTTPHeaderToken(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
-		//  "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
-			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
-			c == '`' || c == '|' || c == '~':
-		default:
+func validUniquePositiveIDs(values []uint64) bool {
+	seen := make(map[uint64]struct{}, len(values))
+	for _, value := range values {
+		if value == 0 {
 			return false
 		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
 	}
 	return true
+}
+
+// validateAPIBaseURL 仅允许无凭据、query、fragment 的 HTTP(S) API 根地址。
+// requireHTTPS 为 true 时强制 HTTPS（用于生产默认 XAI 备用地址）。
+func validateAPIBaseURL(name, raw string, requireHTTPS bool) error {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s 必须是不含凭据、查询参数和片段的 HTTP(S) URL", name)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if requireHTTPS {
+			return fmt.Errorf("%s 必须是 HTTPS URL", name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s 必须是不含凭据、查询参数和片段的 HTTP(S) URL", name)
+	}
+}
+
+// NormalizeBuildFallbackBaseURL 在旧配置缺字段时填入默认 XAI 备用地址。
+func NormalizeBuildFallbackBaseURL(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return DefaultBuildFallbackBaseURL
+	}
+	return strings.TrimSpace(value)
 }
 
 func defaultConfig() Config {
@@ -775,47 +810,40 @@ func defaultConfig() Config {
 		Database: DatabaseConfig{
 			Driver:   "sqlite",
 			SQLite:   SQLiteDatabaseConfig{Path: "./data/backend.db"},
-			Postgres: PostgresDatabaseConfig{MaxOpenConns: 12, MaxIdleConns: 4},
+			Postgres: PostgresDatabaseConfig{MaxOpenConns: 50, MaxIdleConns: 10},
 		},
 		RuntimeStore: RuntimeStoreConfig{
 			Driver: "memory",
 			Redis:  RedisRuntimeConfig{Address: "127.0.0.1:6379", KeyPrefix: "grok2api:"},
 		},
+		Deployment: DeploymentConfig{Replicas: 1, ClusterID: "grok2api"},
 		Auth: AuthConfig{
 			AccessTokenTTL:  Duration(15 * time.Minute),
 			RefreshTokenTTL: Duration(30 * 24 * time.Hour),
-			APIKeyHeaders:   nil,
 		},
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
-				ClientVersion:         RecommendedBuildClientVersion,
-				ClientIdentifier:      "grok-shell", TokenAuth: "xai-grok-cli",
-				UserAgent:             RecommendedBuildUserAgent,
-				ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
+				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+				UserAgent: RecommendedBuildUserAgent, ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
+				StreamIdleTimeout: Duration(settingsdomain.DefaultBuildStreamIdleTimeout),
 			},
 			Web: WebProviderConfig{
-				// Default: pure-Go local x-statsig-id (no remote signer process).
-				BaseURL: "https://grok.com", StatsigMode: StatsigModeLocal,
+				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,
+				ClearanceMode: ClearanceModeManual, FlareSolverrURL: DefaultFlareSolverrURL,
+				ClearanceTimeout: Duration(time.Minute), ClearanceRefresh: Duration(10 * time.Minute),
 				QuotaTimeout: Duration(25 * time.Second),
-				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
+				ChatTimeout:  Duration(2 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultWebStreamIdleTimeout),
+				ImageTimeout:     Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
-				RecoveryBackoffMax:  Duration(30 * time.Minute),
-				FlareSolverrEnabled: false, FlareSolverrURL: "", FlareSolverrTargetURL: "https://grok.com/",
-				FlareSolverrTimeout: Duration(60 * time.Second), FlareSolverrRefreshInterval: Duration(time.Hour),
+				RecoveryBackoffMax: Duration(30 * time.Minute),
 			},
-			Console: ConsoleProviderConfig{
-				BaseURL: "https://console.x.ai", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-				ChatTimeout: Duration(5 * time.Minute),
-			},
+			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultConsoleStreamIdleTimeout)},
 		},
 		Batch: BatchConfig{
-			// Slow bulk workers (default 6) + jitter reduce ban risk while spreading
-			// load across the egress proxy pool (least-inflight selection).
-			ImportConcurrency: 6, ConversionConcurrency: 3, SyncConcurrency: 6,
-			RefreshConcurrency: 6, RandomDelay: Duration(2 * time.Second),
-			DBBuffer: DBBufferConfig{Enabled: false, Driver: "none", Path: ""},
+			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
+			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{
 			Driver: "local", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 30,
@@ -823,31 +851,55 @@ func defaultConfig() Config {
 			Local: LocalMediaConfig{Path: "./data/media"},
 		},
 		Routing: RoutingConfig{
-			StickyTTL:                  Duration(time.Hour),
-			CooldownBase:               Duration(30 * time.Second),
-			CooldownMax:                Duration(30 * time.Minute),
-			CapacityWait:               Duration(500 * time.Millisecond),
-			MaxAttempts:                3,
-			RetryStatusCodes:           append([]int(nil), DefaultRetryStatusCodes...),
-			RetryServerErrors:          true,
-			DeprioritizeFailedAccounts: true,
-		PreferFreeBuild:            false,
-		SegmentedSelectorEnabled:   false,
-		SegmentedMinCandidates:     3000,
-		SegmentedWindowSize:        64,
+			StickyTTL:                   Duration(time.Hour),
+			CooldownBase:                Duration(30 * time.Second),
+			CooldownMax:                 Duration(30 * time.Minute),
+			CapacityWait:                Duration(500 * time.Millisecond),
+			MaxAttempts:                 999,
+			MarkBuildChatDeniedAsReauth: false,
+			PreferFreeBuild:             false,
+			AccountIsolatedConnections:  false,
+			SegmentedSelectorEnabled:    false,
+			SegmentedMinCandidates:      3000,
+			SegmentedWindowSize:         64,
+			ReasoningReplayEnabled:      true,
+			ReasoningReplayTTL:          Duration(time.Hour),
+			ReasoningReplayMaxEntries:   10240,
 			PromptCacheAffinity: PromptCacheAffinityConfig{
-				Enabled:     true,
-				Fingerprint: true,
-				Expire:      true,
-				TTL:         Duration(24 * time.Hour),
+				Enabled: true, Fingerprint: true, Expire: true, TTL: Duration(24 * time.Hour),
 			},
-			ReasoningReplayEnabled:    true,
-			ReasoningReplayTTL:        Duration(time.Hour),
-			ReasoningReplayMaxEntries: 10240,
 		},
-		Audit:             AuditConfig{BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond)},
+		Audit: AuditConfig{
+			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
+			LedgerMode: "enforce", LedgerFailureThreshold: 1,
+			LedgerUnhealthyGrace: Duration(10 * time.Second), LedgerQueueHighWatermarkPct: 90,
+		},
+		QualityGuard: QualityGuardConfig{
+			Model: "grok-4.5", Mode: "hybrid",
+			ActiveInterval: Duration(30 * time.Minute), PassivePollInterval: Duration(5 * time.Second),
+			SoftTPS: 500, HardTPS: 1000, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
+			QuarantineDuration: Duration(5 * time.Minute), NoAccountBackoff: Duration(5 * time.Minute),
+			MinimumHealthyNodes: 3, MaxOutputTokens: 384,
+			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
+		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
+		Accounts: AccountsConfig{
+			MarkBuildForbiddenReauth:             false,
+			BuildForbiddenReauthCodes:            []string{"permission-denied"},
+			ExcludeBuildBotFlaggedFromScheduling: false,
+			AutoCleanReauthEnabled:               false,
+			AutoCleanReauthInterval:              Duration(10 * time.Minute),
+			AutoCleanReauthMinAge:                Duration(time.Hour),
+			AutoCleanIncludeDisabled:             false,
+		},
 	}
+}
+
+func validateFlareSolverrURL(value string) error {
+	if err := signerurl.Validate(value); err != nil {
+		return errors.New(strings.ReplaceAll(err.Error(), "签名 URL", "URL"))
+	}
+	return nil
 }
 
 func validStatsigID(value string) bool {
@@ -871,4 +923,39 @@ func isExampleSecret(value string) bool {
 	default:
 		return false
 	}
+}
+
+func NormalizeRoutingRetry(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.Routing.RetryStatusCodes) == 0 {
+		cfg.Routing.RetryStatusCodes = append([]int(nil), DefaultRetryStatusCodes...)
+		return
+	}
+	seen := make(map[int]struct{}, len(cfg.Routing.RetryStatusCodes))
+	normalized := make([]int, 0, len(cfg.Routing.RetryStatusCodes))
+	for _, code := range cfg.Routing.RetryStatusCodes {
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		normalized = append(normalized, code)
+	}
+	cfg.Routing.RetryStatusCodes = normalized
+}
+
+func IsRetryableStatus(status int, codes []int, retryServerErrors bool) bool {
+	if retryServerErrors && status >= 500 {
+		return true
+	}
+	if len(codes) == 0 {
+		codes = DefaultRetryStatusCodes
+	}
+	for _, code := range codes {
+		if status == code {
+			return true
+		}
+	}
+	return false
 }

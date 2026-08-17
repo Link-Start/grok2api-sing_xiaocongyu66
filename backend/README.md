@@ -7,7 +7,7 @@ Grok2API 的 Go 后端，负责上游账号调度、协议转换、额度管理�
 - Go 1.26、Gin、GORM
 - SQLite / PostgreSQL
 - Memory / Redis
-- Grok Build OAuth 与 Grok Web SSO Provider
+- Grok Build OAuth、Grok Web SSO 与 Grok Console SSO Provider
 
 ## 本地运行
 
@@ -36,6 +36,8 @@ go run ./cmd/grok2api --config /path/to/config.yaml --listen 0.0.0.0:8000
 
 启动配置统一由根目录 `config.yaml` 管理，启动阶段字段见 [`config.example.yaml`](../config.example.yaml)。Provider、服务容量、批量任务、路由、媒体、审计和客户端密钥默认限制由管理端设置页持久化；除页面明确标记“重启生效”的字段外均会热加载。
 
+PostgreSQL DSN 也可通过非空的 `GROK2API_DATABASE_URL` 注入；它的优先级高于 YAML，并会自动将数据库驱动切换为 `postgres`。空值不覆盖 YAML，程序不会隐式读取通用的 `DATABASE_URL`。
+
 | 场景 | 数据库 | 运行态存储 |
 | --- | --- | --- |
 | 本地开发 / 单实例 | SQLite | Memory |
@@ -53,13 +55,7 @@ go run ./cmd/grok2api --config /path/to/config.yaml --listen 0.0.0.0:8000
 - `/swagger/index.html`：公开 API Swagger，仅在 `server.swaggerEnabled: true` 时注册
 - `frontend.staticPath`：前端静态目录，默认 `./frontend/dist`
 
-详细协议说明见 [`docs`](./docs)：
-
-| 文档 | 说明 |
-| --- | --- |
-| [`PROVIDER_ARCHITECTURE.md`](./docs/PROVIDER_ARCHITECTURE.md) | Provider 架构 |
-| [`RESPONSES_COMPATIBILITY.md`](./docs/RESPONSES_COMPATIBILITY.md) | Responses 协议兼容 |
-| [`SECURITY_AUDIT.md`](./docs/SECURITY_AUDIT.md) | 安全与逻辑审计报告 |
+详细协议说明见 [`docs`](./docs)。
 
 修改公开接口注释后，在仓库根目录执行 `make swagger` 更新 `backend/docs/docs.go`、`swagger.json` 与 `swagger.yaml`。生产配置应保持 `server.swaggerEnabled: false`。
 
@@ -75,6 +71,8 @@ internal/repository/ 持久化接口
 ```
 
 依赖方向保持为 Transport → Application → Domain，基础设施通过接口接入，不在领域层依赖 HTTP、数据库或具体 Provider。
+
+三个 Provider 通过声明式 Definition 和小型能力接口注册：Build 使用远程模型目录与 Billing，Web 使用按等级过滤的静态目录与上游额度窗口，Console 使用静态目录和无状态 Responses。Gateway 只根据能力声明完成路由与调度，不在通用 Handler 中拼装 Provider 私有请求。
 
 ## 验证
 

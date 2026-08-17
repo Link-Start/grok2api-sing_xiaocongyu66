@@ -482,6 +482,42 @@ func TestCollectServerToolCountsOnlyNamedWebSearchForAnthropicUsage(t *testing.T
 	}
 }
 
+func TestStructuredToolUsageCardDoesNotLeakIntoReasoning(t *testing.T) {
+	parsed := &parsedChat{}
+	frame := map[string]any{"result": map[string]any{"response": map[string]any{
+		"messageTag": "tool_usage_card", "isThinking": true,
+		"toolUsageCardId": "search-1",
+		"toolUsageCard": map[string]any{
+			"toolUsageCardId": "search-1",
+			"webSearch":       map[string]any{"args": map[string]any{"query": "latest news"}},
+		},
+		"token": `<xai:tool_usage_card><xai:tool_name>web_search</xai:tool_name></xai:tool_usage_card>`,
+	}}}
+	data, _ := json.Marshal(frame)
+	kind, delta, err := parseUpstreamFrame(data, parsed)
+	if err != nil || kind != "" || delta != "" {
+		t.Fatalf("kind=%q delta=%q err=%v", kind, delta, err)
+	}
+	if parsed.Reasoning.Len() != 0 || parsed.ServerTools != 1 || parsed.WebSearchTools != 1 {
+		t.Fatalf("reasoning=%q server=%d web=%d", parsed.Reasoning.String(), parsed.ServerTools, parsed.WebSearchTools)
+	}
+}
+
+func TestStructuredToolUsageCardWorksWithoutXMLToken(t *testing.T) {
+	parsed := &parsedChat{}
+	collectServerTool(parsed, map[string]any{
+		"toolUsageCardId": "search-1",
+		"toolUsageCard":   map[string]any{"webSearch": map[string]any{"args": map[string]any{"query": "x"}}},
+	})
+	collectServerTool(parsed, map[string]any{
+		"toolUsageCardId": "browse-1",
+		"toolUsageCard":   map[string]any{"browsePage": map[string]any{"args": map[string]any{"url": "https://example.com"}}},
+	})
+	if parsed.ServerTools != 2 || parsed.WebSearchTools != 1 {
+		t.Fatalf("server=%d web=%d", parsed.ServerTools, parsed.WebSearchTools)
+	}
+}
+
 func TestCollectServerToolEnrichesEarlierUnknownCard(t *testing.T) {
 	parsed := &parsedChat{}
 	collectServerTool(parsed, map[string]any{
@@ -561,6 +597,60 @@ func TestGeneratedImageURLsCollectAllCandidates(t *testing.T) {
 	}
 }
 
+func TestModelResponseCompletesMissingTextAndDirectSearchResults(t *testing.T) {
+	parsed := &parsedChat{}
+	first, _ := json.Marshal(map[string]any{"result": map[string]any{"response": map[string]any{
+		"token": "Hello ", "isThinking": false, "messageTag": "final",
+	}}})
+	if kind, delta, err := parseUpstreamFrame(first, parsed); err != nil || kind != "text" || delta != "Hello " {
+		t.Fatalf("first kind=%q delta=%q err=%v", kind, delta, err)
+	}
+	final, _ := json.Marshal(map[string]any{"result": map[string]any{"response": map[string]any{
+		"modelResponse": map[string]any{
+			"message":          "Hello world",
+			"parentResponseId": "parent-1",
+			"webSearchResults": []any{
+				map[string]any{"url": "https://example.com/news", "title": "News"},
+			},
+			"citedWebSearchResults": []any{
+				map[string]any{"url": "https://example.com/news", "title": "Duplicate"},
+			},
+			"generatedImageUrls": []any{"users/test/generated/final/image.jpg"},
+		},
+	}}})
+	kind, delta, err := parseUpstreamFrame(final, parsed)
+	if err != nil || kind != "text" || delta != "world" {
+		t.Fatalf("final kind=%q delta=%q err=%v", kind, delta, err)
+	}
+	if parsed.Text.String() != "Hello world" || parsed.ParentID != "parent-1" || len(parsed.SearchSources) != 1 || len(parsed.Images) != 1 {
+		t.Fatalf("parsed=%#v text=%q sources=%#v images=%#v", parsed, parsed.Text.String(), parsed.SearchSources, parsed.Images)
+	}
+	if kind, delta, err := parseUpstreamFrame(final, parsed); err != nil || kind != "" || delta != "" {
+		t.Fatalf("duplicate kind=%q delta=%q err=%v", kind, delta, err)
+	}
+}
+
+func TestModelResponseUsesFullMessageWhenIncrementalTextIsMissing(t *testing.T) {
+	parsed := &parsedChat{}
+	frame, _ := json.Marshal(map[string]any{"result": map[string]any{"response": map[string]any{
+		"modelResponse": map[string]any{"message": "final only"},
+	}}})
+	kind, delta, err := parseUpstreamFrame(frame, parsed)
+	if err != nil || kind != "text" || delta != "final only" || parsed.Text.String() != "final only" {
+		t.Fatalf("kind=%q delta=%q text=%q err=%v", kind, delta, parsed.Text.String(), err)
+	}
+}
+
+func TestModelResponseSurfacesStreamErrors(t *testing.T) {
+	parsed := &parsedChat{}
+	frame, _ := json.Marshal(map[string]any{"result": map[string]any{"response": map[string]any{
+		"modelResponse": map[string]any{"streamErrors": []any{map[string]any{"message": "upstream stream failed"}}},
+	}}})
+	if _, _, err := parseUpstreamFrame(frame, parsed); err == nil || !strings.Contains(err.Error(), "upstream stream failed") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestGrokRenderCitationBecomesMarkdownAndAnnotation(t *testing.T) {
 	parsed := &parsedChat{}
 	cardFrame := map[string]any{
@@ -586,12 +676,50 @@ func TestGrokRenderCitationBecomesMarkdownAndAnnotation(t *testing.T) {
 	}
 	tokenData, _ := json.Marshal(tokenFrame)
 	kind, delta, err := parseUpstreamFrame(tokenData, parsed)
-	if err != nil || kind != "text" || delta != "Answer [[1]](https://example.com)" || len(parsed.Annotations) != 1 {
+	wantDelta := `Answer[[1]](https://example.com)`
+	if err != nil || kind != "text" || delta != wantDelta || len(parsed.Annotations) != 1 {
 		t.Fatalf("kind=%q delta=%q annotations=%#v err=%v", kind, delta, parsed.Annotations, err)
 	}
 	annotation := parsed.Annotations[0]
-	if annotation["title"] != "Example" || annotation["start_index"] != 6 || annotation["end_index"] != len(delta) {
+	// Responses title is the visible citation number; source title remains
+	// available for the Chat Completions nested annotation.
+	if annotation["title"] != "1" || annotation["source_title"] != "Example" || annotation["start_index"] != 6 || annotation["end_index"] != len(wantDelta) {
 		t.Fatalf("annotation = %#v", annotation)
+	}
+}
+
+func TestGrokRenderCitationUsesCharacterOffsets(t *testing.T) {
+	parsed := &parsedChat{cardCache: map[string]map[string]any{
+		"cite_1": {"url": "https://example.com"},
+	}}
+	token := `中文<grok:render card_id="cite_1" card_type="citation" type="render_inline_citation"></grok:render>`
+	cleaned := cleanChatToken(parsed, token)
+	parsed.Text.WriteString(cleaned)
+	if len(parsed.Annotations) != 1 {
+		t.Fatalf("annotations = %#v", parsed.Annotations)
+	}
+	annotation := parsed.Annotations[0]
+	if annotation["start_index"] != 2 || annotation["end_index"] != 28 {
+		t.Fatalf("annotation uses byte offsets: %#v", annotation)
+	}
+}
+
+func TestParsedChatTextCharacterCountTracksAllWrites(t *testing.T) {
+	parsed := &parsedChat{}
+	parsed.appendText("中文")
+	if got := parsed.textCharacterLen(); got != 2 {
+		t.Fatalf("appendText character length = %d, want 2", got)
+	}
+
+	// Direct builder writes must use the same counter as production helpers.
+	parsed.Text.WriteString("🙂")
+	if got := parsed.textCharacterLen(); got != 3 {
+		t.Fatalf("direct write character length = %d, want 3", got)
+	}
+
+	parsed.resetText("a界")
+	if got := parsed.textCharacterLen(); got != 2 {
+		t.Fatalf("resetText character length = %d, want 2", got)
 	}
 }
 

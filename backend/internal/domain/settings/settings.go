@@ -3,46 +3,33 @@ package settings
 import "time"
 
 const (
-	// DefaultBuildResponseHeaderTimeout is the default wait for first response headers from Build.
 	DefaultBuildResponseHeaderTimeout = 5 * time.Minute
-	// MinBuildResponseHeaderTimeout is the lower bound for admin/runtime updates.
-	MinBuildResponseHeaderTimeout = 30 * time.Second
-	// MaxBuildResponseHeaderTimeout is the upper bound for admin/runtime updates.
-	MaxBuildResponseHeaderTimeout = 30 * time.Minute
+	MinBuildResponseHeaderTimeout     = 30 * time.Second
+	MaxBuildResponseHeaderTimeout     = 30 * time.Minute
+
+	DefaultBuildStreamIdleTimeout = 2 * time.Minute
+	MinBuildStreamIdleTimeout     = 30 * time.Second
+	MaxBuildStreamIdleTimeout     = 10 * time.Minute
+
+	DefaultWebStreamIdleTimeout     = 90 * time.Second
+	DefaultConsoleStreamIdleTimeout = 2 * time.Minute
+	MinProviderStreamIdleTimeout    = 30 * time.Second
+	MaxProviderStreamIdleTimeout    = 10 * time.Minute
 )
 
 // Config 表示可跨重启持久化并支持热加载的网关运行参数。
 type Config struct {
-	Server                ServerConfig
-	ProviderBuild         ProviderBuildConfig
-	ProviderWeb           ProviderWebConfig
-	ProviderConsole       ProviderConsoleConfig
-	ProactiveUpstreamSync ProactiveUpstreamSyncConfig
-	Batch                 BatchConfig
-	Media                 MediaConfig
-	Frontend              FrontendConfig
-	Routing               RoutingConfig
-	Audit                 AuditConfig
-	ClientKeyDefaults     ClientKeyDefaultsConfig
-	PromptCacheAffinity   PromptCacheAffinityConfig
-}
-
-// PromptCacheAffinityConfig is hot-reloadable xAI prompt-cache affinity policy.
-type PromptCacheAffinityConfig struct {
-	Enabled     bool
-	Fingerprint bool
-	Expire      bool
-	TTL         time.Duration
-}
-
-// ProactiveUpstreamSyncConfig toggles optional xAI billing/quota/model polling.
-// Default all-false matches CLIProxy (inference + token refresh only).
-type ProactiveUpstreamSyncConfig struct {
-	Billing                   bool
-	WebQuota                  bool
-	ModelCatalogCatchup       bool
-	AllowManualBillingRefresh bool
-	AllowManualQuotaRefresh   bool
+	Server            ServerConfig
+	ProviderBuild     ProviderBuildConfig
+	ProviderWeb       ProviderWebConfig
+	ProviderConsole   ProviderConsoleConfig
+	Batch             BatchConfig
+	Media             MediaConfig
+	Frontend          FrontendConfig
+	Routing           RoutingConfig
+	Audit             AuditConfig
+	ClientKeyDefaults ClientKeyDefaultsConfig
+	Accounts          AccountsConfig
 }
 
 // ServerConfig 定义可热更新的推理入口容量参数。
@@ -56,9 +43,9 @@ type FrontendConfig struct {
 }
 
 type ProviderConsoleConfig struct {
-	BaseURL     string
-	UserAgent   string
-	ChatTimeout time.Duration
+	BaseURL           string
+	ChatTimeout       time.Duration
+	StreamIdleTimeout time.Duration
 }
 
 type MediaConfig struct {
@@ -73,20 +60,19 @@ type ProviderWebConfig struct {
 	StatsigMode         string
 	StatsigManualValue  string
 	StatsigSignerURL    string
+	ClearanceMode       string
+	FlareSolverrURL     string
+	ClearanceTimeout    time.Duration
+	ClearanceRefresh    time.Duration
 	QuotaTimeout        time.Duration
 	ChatTimeout         time.Duration
+	StreamIdleTimeout   time.Duration
 	ImageTimeout        time.Duration
 	VideoTimeout        time.Duration
 	MediaConcurrency    int
 	AllowNSFW           bool
 	RecoveryBackoffBase time.Duration
 	RecoveryBackoffMax  time.Duration
-	// FlareSolverr auto-obtains cf_clearance for Web/Console egress nodes.
-	FlareSolverrEnabled         bool
-	FlareSolverrURL             string
-	FlareSolverrTargetURL       string
-	FlareSolverrTimeout         time.Duration
-	FlareSolverrRefreshInterval time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。
@@ -96,49 +82,70 @@ type BatchConfig struct {
 	SyncConcurrency       int
 	RefreshConcurrency    int
 	RandomDelay           *time.Duration
-	DBBuffer              DBBufferConfig
-}
-
-// DBBufferConfig enables optional Redis/SQLite buffering for bulk DB operations to reduce main DB pressure.
-type DBBufferConfig struct {
-	Enabled bool
-	Driver  string // "redis" or "sqlite"
-	Path    string // for sqlite
 }
 
 // ProviderBuildConfig 定义 Grok Build CLI 上游协议标识。
 type ProviderBuildConfig struct {
 	BaseURL               string
+	FallbackBaseURL       string
 	ClientVersion         string
 	ClientIdentifier      string
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration
+	StreamIdleTimeout     time.Duration
 }
 
 // RoutingConfig 定义会话粘性、冷却和故障切换边界。
 type RoutingConfig struct {
-	StickyTTL                  time.Duration
-	CooldownBase               time.Duration
-	CooldownMax                time.Duration
-	CapacityWait               time.Duration
-	MaxAttempts                int
-	RetryStatusCodes           []int
-	RetryServerErrors          bool
-	// DeprioritizeFailedAccounts puts accounts with higher failure_count last when selecting
-	// and when batch-syncing quotas (switchable; default on).
-	DeprioritizeFailedAccounts bool
+	StickyTTL       time.Duration
+	CooldownBase    time.Duration
+	CooldownMax     time.Duration
+	CapacityWait    time.Duration
+	MaxAttempts     int
+	PreferFreeBuild bool
+	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false 保留模型级冷却。
+	MarkBuildChatDeniedAsReauth bool
+	// AccountIsolatedConnections is optional so persisted payloads written by
+	// older releases do not silently override a value supplied by config.yaml.
+	AccountIsolatedConnections *bool
+	SegmentedSelector          *SegmentedSelectorConfig
 }
 
-// AuditConfig 定义请求审计异步写入参数。
+type SegmentedSelectorConfig struct {
+	ActiveEnabled bool
+	MinCandidates int
+	WindowSize    int
+}
+
 type AuditConfig struct {
 	BufferSize    int
 	BatchSize     int
 	FlushInterval time.Duration
+	CommitDelay   time.Duration
 }
 
 // ClientKeyDefaultsConfig 定义新建客户端密钥的默认限制。
 type ClientKeyDefaultsConfig struct {
 	RPMLimit      int
 	MaxConcurrent int
+}
+
+// AccountsConfig 定义账号池后台维护策略；默认全部关闭。
+type AccountsConfig struct {
+	// MarkBuildForbiddenReauth marks high-confidence Grok Build permission denials as requiring reauthorization.
+	MarkBuildForbiddenReauth bool
+	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.
+	BuildForbiddenReauthCodes []string
+	// ExcludeBuildBotFlaggedFromScheduling 为 true 时，bot_flag_source/bfs∈{1,2} 的 Build 账号不参与调度。
+	// 仅影响 ProviderBuild 选号；关联 Web/Console 账号调度不受影响。
+	ExcludeBuildBotFlaggedFromScheduling bool
+	// AutoCleanReauthEnabled 为 true 时，周期性删除已标记 reauthRequired 且超过 minAge 的账号。
+	AutoCleanReauthEnabled bool
+	// AutoCleanReauthInterval 自动清理扫描间隔。
+	AutoCleanReauthInterval time.Duration
+	// AutoCleanReauthMinAge 仅删除 reauth_marked_at 早于该时长的 reauthRequired 账号。
+	AutoCleanReauthMinAge time.Duration
+	// AutoCleanIncludeDisabled 为 true 时，reauth 清理时包含 enabled=false 的账号。
+	AutoCleanIncludeDisabled bool
 }

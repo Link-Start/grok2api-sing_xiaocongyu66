@@ -7,50 +7,49 @@ import (
 )
 
 const (
-	QuotaMode = "console"
-	// DefaultQuotaLimit is the per-window request budget for console.x.ai.
-	DefaultQuotaLimit = 20
-	// DefaultQuotaWindow is the recovery window in seconds once the rotate timer starts.
-	DefaultQuotaWindow = 3600
-	// RotateThreshold starts the recovery timer only after remaining drops to this
-	// value (inclusive). Mirrors jiujiu532/grok2api delayed rotation so high-balance
-	// accounts stay preferred and timers are not started on first use.
-	RotateThreshold = 12
+	QuotaMode      = "console"
+	QuotaModeImage = "console_image"
+	QuotaModeVideo = "console_video"
 )
 
 type ModelSpec struct {
-	PublicID               string
-	UpstreamModel          string
-	SupportsReasoning      bool
-	DefaultReasoningEffort string
-	MaxOutputTokens        int
-	SearchTools            bool
+	PublicID                string
+	UpstreamModel           string
+	SupportsReasoning       bool
+	SupportsReasoningEffort bool
+	DefaultReasoningEffort  string
+	MaxOutputTokens         int
 }
 
-// catalog is the built-in console.x.ai model directory (aligned with
-// jiujiu532/grok2api app/control/model/registry.py Console Chat section).
-// These are seeded into model_routes at startup and on admin「同步模型」;
-// they are NOT discovered from a remote /models API.
 var catalog = []ModelSpec{
-	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309", UpstreamModel: "grok-4.20-0309", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-0309-non-reasoning", UpstreamModel: "grok-4.20-0309-non-reasoning", MaxOutputTokens: 1_000_000, SearchTools: true},
-	{PublicID: "grok-4.20-multi-agent-0309", UpstreamModel: "grok-4.20-multi-agent-0309", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 2_000_000, SearchTools: true},
-	{PublicID: "grok-build-0.1", UpstreamModel: "grok-build-0.1", MaxOutputTokens: 256_000, SearchTools: true},
+	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, SupportsReasoningEffort: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", SupportsReasoning: true, MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-0309-non-reasoning", UpstreamModel: "grok-4.20-0309-non-reasoning", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.20-multi-agent-0309", UpstreamModel: "grok-4.20-multi-agent-0309", SupportsReasoning: true, SupportsReasoningEffort: true, MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-4.5", UpstreamModel: "grok-4.5", SupportsReasoning: true, SupportsReasoningEffort: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000},
+	{PublicID: "grok-build-0.1", UpstreamModel: "grok-build-0.1", MaxOutputTokens: 256_000},
 }
 
-// aliases are client-facing IDs (same names as jiujiu MODELS console entries).
-// They resolve to a catalog upstream + optional fixed reasoning effort — no separate DB row.
+var mediaCatalog = []struct {
+	PublicID      string
+	UpstreamModel string
+	Capabilities  []modeldomain.Capability
+}{
+	{PublicID: "grok-imagine-image-quality", UpstreamModel: "grok-imagine-image-quality", Capabilities: []modeldomain.Capability{modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit}},
+	{PublicID: "grok-imagine-image", UpstreamModel: "grok-imagine-image", Capabilities: []modeldomain.Capability{modeldomain.CapabilityImage, modeldomain.CapabilityImageEdit}},
+	{PublicID: "grok-imagine-video", UpstreamModel: "grok-imagine-video", Capabilities: []modeldomain.Capability{modeldomain.CapabilityVideo}},
+}
+
+// Effort-suffixed aliases only include levels each Provider/model combination
+// actually supports (see domain/model.SupportedReasoningEffortsForProvider).
+// No blanket none/low/medium/high/xhigh/max template.
 var aliases = []provider.ModelAlias{
-	// *-console names (jiujiu public names for the same upstream models)
 	consoleAlias("grok-4.3-console", "grok-4.3", "grok-4.3", ""),
-	consoleAlias("grok-4.20-0309-console", "grok-4.20-0309", "grok-4.20-0309", ""),
 	consoleAlias("grok-4.20-0309-reasoning-console", "grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning", ""),
 	consoleAlias("grok-4.20-0309-non-reasoning-console", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning", ""),
 	consoleAlias("grok-4.20-multi-agent-console", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", ""),
+	consoleAlias("grok-4.5-console", "grok-4.5", "grok-4.5", ""),
 	consoleAlias("grok-build-console", "grok-build-0.1", "grok-build-0.1", ""),
-	// fixed reasoning effort shortcuts
 	consoleAlias("grok-4.3-low", "grok-4.3", "grok-4.3", "low"),
 	consoleAlias("grok-4.3-medium", "grok-4.3", "grok-4.3", "medium"),
 	consoleAlias("grok-4.3-high", "grok-4.3", "grok-4.3", "high"),
@@ -58,19 +57,6 @@ var aliases = []provider.ModelAlias{
 	consoleAlias("grok-4.20-multi-agent-medium", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "medium"),
 	consoleAlias("grok-4.20-multi-agent-high", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "high"),
 	consoleAlias("grok-4.20-multi-agent-xhigh", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", "xhigh"),
-}
-
-// ClientFacingIDs returns every name clients may put in request.model / GET /v1/models
-// for Console: catalog public IDs + aliases (jiujiu-style pre-registered list).
-func ClientFacingIDs() []string {
-	out := make([]string, 0, len(catalog)+len(aliases))
-	for _, spec := range catalog {
-		out = append(out, spec.PublicID)
-	}
-	for _, alias := range aliases {
-		out = append(out, alias.Alias)
-	}
-	return out
 }
 
 func consoleAlias(alias, publicModel, upstreamModel, effort string) provider.ModelAlias {
@@ -84,35 +70,26 @@ func consoleAlias(alias, publicModel, upstreamModel, effort string) provider.Mod
 func Catalog() []ModelSpec { return append([]ModelSpec(nil), catalog...) }
 
 func Routes() []modeldomain.Route {
-	// Catalog rows + fixed client aliases (each gets its own model_routes id for key ACL).
-	values := make([]modeldomain.Route, 0, len(catalog)+len(aliases))
-	seenPublic := make(map[string]struct{}, len(catalog)+len(aliases))
+	capacity := len(catalog)
+	for _, spec := range mediaCatalog {
+		capacity += len(spec.Capabilities)
+	}
+	values := make([]modeldomain.Route, 0, capacity)
 	for _, spec := range catalog {
 		publicID, _ := modeldomain.NormalizePublicID(account.ProviderConsole, spec.PublicID)
-		if publicID == "" {
-			continue
-		}
-		seenPublic[publicID] = struct{}{}
 		values = append(values, modeldomain.Route{
 			PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: spec.UpstreamModel,
-			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog, Enabled: true,
+			Capability: modeldomain.CapabilityResponses, Enabled: true,
 		})
 	}
-	for _, alias := range aliases {
-		// Persist alias as its own public ID row (same upstream as target).
-		// Client keys bind to this row's id so effort shortcuts can be allowed independently.
-		publicID, ok := modeldomain.NormalizePublicID(account.ProviderConsole, alias.Alias)
-		if !ok || publicID == "" {
-			continue
+	for _, spec := range mediaCatalog {
+		publicID, _ := modeldomain.NormalizePublicID(account.ProviderConsole, spec.PublicID)
+		for _, capability := range spec.Capabilities {
+			values = append(values, modeldomain.Route{
+				PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: spec.UpstreamModel,
+				Capability: capability, Enabled: true,
+			})
 		}
-		if _, exists := seenPublic[publicID]; exists {
-			continue
-		}
-		seenPublic[publicID] = struct{}{}
-		values = append(values, modeldomain.Route{
-			PublicID: publicID, Provider: account.ProviderConsole, UpstreamModel: alias.UpstreamModel,
-			Capability: modeldomain.CapabilityResponses, Origin: modeldomain.OriginCatalog, Enabled: true,
-		})
 	}
 	return values
 }
@@ -124,6 +101,31 @@ func Resolve(upstreamModel string) (ModelSpec, bool) {
 		}
 	}
 	return ModelSpec{}, false
+}
+
+func ResolveMedia(upstreamModel string, capability modeldomain.Capability) bool {
+	for _, spec := range mediaCatalog {
+		if spec.UpstreamModel != upstreamModel {
+			continue
+		}
+		for _, supported := range spec.Capabilities {
+			if supported == capability {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func allModels() []string {
+	values := make([]string, 0, len(catalog)+len(mediaCatalog))
+	for _, spec := range catalog {
+		values = append(values, spec.UpstreamModel)
+	}
+	for _, spec := range mediaCatalog {
+		values = append(values, spec.UpstreamModel)
+	}
+	return values
 }
 
 func Aliases() []provider.ModelAlias { return append([]provider.ModelAlias(nil), aliases...) }

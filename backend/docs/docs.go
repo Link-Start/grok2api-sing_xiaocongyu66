@@ -299,14 +299,13 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "与管理端「模型列表」一致：返回已启用的 model_routes；对列表中已有上游的兼容别名（如 grok-4.20-multi-agent-xhigh）一并暴露。非固定写死清单。",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Models"
                 ],
-                "summary": "获取模型列表",
+                "summary": "获取可用模型",
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -611,6 +610,10 @@ const docTemplate = `{
         "httpserver.SwaggerImageEditRequest": {
             "type": "object",
             "properties": {
+                "aspect_ratio": {
+                    "type": "string",
+                    "example": "1:1"
+                },
                 "image": {
                     "$ref": "#/definitions/httpserver.SwaggerImageReference"
                 },
@@ -621,6 +624,10 @@ const docTemplate = `{
                 "n": {
                     "type": "integer",
                     "example": 1
+                },
+                "partial_images": {
+                    "type": "integer",
+                    "example": 0
                 },
                 "prompt": {
                     "type": "string",
@@ -633,6 +640,14 @@ const docTemplate = `{
                 "response_format": {
                     "type": "string",
                     "example": "url"
+                },
+                "size": {
+                    "type": "string",
+                    "example": "1024x1024"
+                },
+                "stream": {
+                    "type": "boolean",
+                    "example": false
                 }
             }
         },
@@ -651,6 +666,10 @@ const docTemplate = `{
                     "type": "integer",
                     "example": 1
                 },
+                "partial_images": {
+                    "type": "integer",
+                    "example": 0
+                },
                 "prompt": {
                     "type": "string",
                     "example": "A cinematic city at night"
@@ -662,6 +681,10 @@ const docTemplate = `{
                 "response_format": {
                     "type": "string",
                     "example": "url"
+                },
+                "stream": {
+                    "type": "boolean",
+                    "example": false
                 }
             }
         },

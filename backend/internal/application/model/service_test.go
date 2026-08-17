@@ -16,10 +16,8 @@ import (
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
-	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
-	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
@@ -30,6 +28,36 @@ func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
 	}
 	if validProviderFilter("cli") {
 		t.Fatal("unsupported provider filter was accepted")
+	}
+}
+
+func TestEndpointCapabilitiesFollowProviderSurface(t *testing.T) {
+	routes := []modeldomain.Route{
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityResponses},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImage},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImageEdit},
+	}
+	capabilities := endpointCapabilitiesForDefinition(routes, provider.Definition{
+		Conversation: provider.ConversationSurface{Responses: true, Messages: true},
+		Media:        provider.MediaSurface{ImageGeneration: true},
+	})
+	want := []string{"responses", "messages", "image"}
+	if fmt.Sprint(capabilities) != fmt.Sprint(want) {
+		t.Fatalf("endpoint capabilities = %v, want %v", capabilities, want)
+	}
+}
+
+func TestNormalizeBatchIDsAllowsGroupedRouteExpansion(t *testing.T) {
+	ids := make([]uint64, maxModelBatchSize)
+	for index := range ids {
+		ids[index] = uint64(index + 1)
+	}
+	if values, err := normalizeModelRouteBatchIDs(ids); err != nil || len(values) != maxModelBatchSize {
+		t.Fatalf("expanded grouped batch = %d, err=%v", len(values), err)
+	}
+	ids = append(ids, uint64(maxModelBatchSize+1))
+	if _, err := normalizeModelRouteBatchIDs(ids); err == nil {
+		t.Fatal("oversized grouped batch was accepted")
 	}
 }
 
@@ -71,13 +99,9 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 		first.ID:  {"grok-basic"},
 		second.ID: {"grok-basic", "grok-premium"},
 	}}
-	webAdapter := &modelCapabilityAdapter{
-		provider: account.ProviderWeb,
-		catalog:  provider.ModelCatalogStatic,
-		models: map[uint64][]string{
-			webAccount.ID: {"grok-chat-fast", "grok-chat-auto"},
-		},
-	}
+	webAdapter := &modelCapabilityAdapter{provider: account.ProviderWeb, models: map[uint64][]string{
+		webAccount.ID: {"grok-chat-fast", "grok-chat-auto"},
+	}}
 	registry := provider.NewRegistry(adapter, webAdapter)
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, cipher, nil)
@@ -93,7 +117,7 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	if attempts := webAdapter.attemptCount(); attempts != 1 {
 		t.Fatalf("web attempts = %d", attempts)
 	}
-	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, "grok-premium", "")
+	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "grok-premium", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +131,7 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	if support[first.ID] || !support[second.ID] {
 		t.Fatalf("support = %#v", support)
 	}
-	webCandidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderWeb, "grok-chat-auto", "")
+	webCandidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderWeb, 0, "grok-chat-auto", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,92 +140,9 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	}
 }
 
-func TestListPublicModelsFollowsConfiguredListAndAliases(t *testing.T) {
+func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "public-models.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	if err := database.InitializeSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
-	modelRepo := relational.NewModelRepository(database)
-	// Seed catalog + effort aliases as real model_routes (each has its own id for keys).
-	if err := modelRepo.ReplaceProviderRoutes(ctx, account.ProviderConsole, consoleprovider.Routes()); err != nil {
-		t.Fatal(err)
-	}
-	registry := provider.NewRegistry(consoleprovider.NewAdapter(consoleprovider.Config{}, nil, nil))
-	service := NewService(modelRepo, nil, nil, registry)
-	routes, aliases, err := service.ListPublicModels(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(routes) == 0 {
-		t.Fatal("expected configured console routes")
-	}
-	// Effort shortcuts are real rows (public id) and also listed as aliases.
-	foundXHighRoute := false
-	for _, route := range routes {
-		if modeldomain.ExternalPublicID(route.Provider, route.PublicID) == "grok-4.20-multi-agent-xhigh" {
-			foundXHighRoute = true
-			if route.ID == 0 {
-				t.Fatal("effort alias must have a real route id for client-key ACL")
-			}
-			break
-		}
-	}
-	if !foundXHighRoute {
-		t.Fatalf("routes missing multi-agent-xhigh row: count=%d aliases=%#v", len(routes), aliases)
-	}
-	foundXHighAlias := false
-	for _, name := range aliases {
-		if name == "grok-4.20-multi-agent-xhigh" {
-			foundXHighAlias = true
-			break
-		}
-	}
-	if !foundXHighAlias {
-		t.Fatalf("aliases missing multi-agent-xhigh: %#v", aliases)
-	}
-	// Disable the effort-alias route itself → it must leave the public list.
-	values, _, err := modelRepo.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 200}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var xhighID uint64
-	for _, value := range values {
-		if modeldomain.ExternalPublicID(value.Provider, value.PublicID) == "grok-4.20-multi-agent-xhigh" {
-			xhighID = value.ID
-			break
-		}
-	}
-	if xhighID == 0 {
-		t.Fatal("multi-agent-xhigh route missing from seeded list")
-	}
-	enabled := false
-	if _, err := service.Update(ctx, xhighID, UpdateInput{Enabled: &enabled}); err != nil {
-		t.Fatal(err)
-	}
-	routes, aliases, err = service.ListPublicModels(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, route := range routes {
-		if modeldomain.ExternalPublicID(route.Provider, route.PublicID) == "grok-4.20-multi-agent-xhigh" {
-			t.Fatal("disabled effort alias must not appear in public routes")
-		}
-	}
-	for _, name := range aliases {
-		if name == "grok-4.20-multi-agent-xhigh" {
-			t.Fatal("disabled effort alias must not reappear via registry aliases")
-		}
-	}
-}
-
-func TestSyncStaticCatalogUsesBulkWrite(t *testing.T) {
-	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-static-sync.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-build-video15.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,52 +154,134 @@ func TestSyncStaticCatalogUsesBulkWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encrypted, err := cipher.Encrypt("sso-token")
+	encrypted, err := cipher.Encrypt("access-token")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	accountRepo := relational.NewAccountRepository(database)
 	modelRepo := relational.NewModelRepository(database)
 	auditRepo := relational.NewAuditRepository(database)
-	const n = 1200
-	modelsByID := make(map[uint64][]string, n)
-	for index := range n {
-		value, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
-			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
-			Name: fmt.Sprintf("web-%d", index), SourceKey: fmt.Sprintf("web-%d", index),
-			EncryptedAccessToken: encrypted, Enabled: true, AuthStatus: account.AuthStatusActive,
-		})
-		if createErr != nil {
-			t.Fatal(createErr)
-		}
-		modelsByID[value.ID] = []string{"grok-chat-fast", "grok-imagine-image"}
-	}
-	webAdapter := &modelCapabilityAdapter{
-		provider: account.ProviderWeb,
-		catalog:  provider.ModelCatalogStatic,
-		models:   modelsByID,
-	}
-	registry := provider.NewRegistry(webAdapter)
-	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), memory.NewStickyStore(), registry, cipher, nil)
-	service := NewService(modelRepo, accountRepo, accountService, registry)
-	started := time.Now()
-	count, err := service.Sync(ctx)
+
+	// Super on primary Build: upstream exposes only grok-4.5 and fallback is disabled.
+	superPrimary, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "super-primary", SourceKey: "super-primary",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count < 2 {
-		t.Fatalf("synced models = %d", count)
+	// Super with fallback: the upstream catalog includes 1.5 and other models.
+	superFallback, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "super-fallback", SourceKey: "super-fallback",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
+		BuildAPIFallback: true,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 1200 static accounts must finish well under the old multi-minute path.
-	if elapsed := time.Since(started); elapsed > 15*time.Second {
-		t.Fatalf("static bulk sync too slow: %s", elapsed)
+	// Free: Billing has no paid signal, but the upstream catalog exposes 1.5.
+	freeAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "free-fallback", SourceKey: "free-fallback",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
+		BuildAPIFallback: true,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if attempts := webAdapter.attemptCount(); attempts != n {
-		t.Fatalf("list calls = %d want %d", attempts, n)
+	// Unknown: no Billing snapshot and the upstream catalog exposes 1.5.
+	unknownAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "unknown", SourceKey: "unknown",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	ok, err := modelRepo.HasSuccessfulAccountSync(ctx, 1)
-	if err != nil || !ok {
-		t.Fatalf("first account sync state ok=%v err=%v", ok, err)
+	// Web must not implement capability normalization; persist its catalog unchanged.
+	webAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper, Name: "web", SourceKey: "web",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: superPrimary.ID, MonthlyLimit: 100, SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: superFallback.ID, OnDemandCap: 50, SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: freeAccount.ID, Used: 1, PlanName: "free", SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	const video15 = "grok-imagine-video-1.5"
+	buildAdapter := &buildCapabilityNormalizerAdapter{modelCapabilityAdapter: &modelCapabilityAdapter{models: map[uint64][]string{
+		superPrimary.ID:   {"grok-4.5"},
+		superFallback.ID:  {"grok-4.5", video15, "grok-code-fast-1", video15},
+		freeAccount.ID:    {"grok-4.5", video15},
+		unknownAccount.ID: {video15, "grok-4.5"},
+	}}}
+	webAdapter := &modelCapabilityAdapter{provider: account.ProviderWeb, models: map[uint64][]string{
+		webAccount.ID: {"grok-chat-fast", "grok-imagine-video"},
+	}}
+	registry := provider.NewRegistry(buildAdapter, webAdapter)
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), memory.NewStickyStore(), registry, cipher, nil)
+	service := NewService(modelRepo, accountRepo, accountService, registry)
+
+	for _, id := range []uint64{superPrimary.ID, superFallback.ID, freeAccount.ID, unknownAccount.ID, webAccount.ID} {
+		if _, err := service.SyncAccount(ctx, id); err != nil {
+			t.Fatalf("sync account %d: %v", id, err)
+		}
+	}
+
+	assertSupports := func(accountID uint64, upstream string, want bool) {
+		t.Helper()
+		candidates, listErr := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, 0, upstream, "")
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, candidate := range candidates {
+			if candidate.Credential.ID != accountID {
+				continue
+			}
+			if !candidate.ModelCapabilityKnown {
+				t.Fatalf("account %d capability unknown for %s", accountID, upstream)
+			}
+			if candidate.SupportsModel != want {
+				t.Fatalf("account %d supports %s = %v, want %v", accountID, upstream, candidate.SupportsModel, want)
+			}
+			return
+		}
+		t.Fatalf("account %d missing from candidates for %s", accountID, upstream)
+	}
+
+	assertSupports(superPrimary.ID, video15, true)
+	assertSupports(superFallback.ID, video15, true)
+	assertSupports(freeAccount.ID, video15, false)
+	assertSupports(unknownAccount.ID, video15, false)
+	assertSupports(superPrimary.ID, "grok-4.5", true)
+	assertSupports(superFallback.ID, "grok-code-fast-1", true)
+	assertSupports(freeAccount.ID, "grok-4.5", true)
+	for _, accountID := range []uint64{superPrimary.ID, superFallback.ID, freeAccount.ID, unknownAccount.ID} {
+		assertSupports(accountID, modeldomain.GrokComposer25Fast, true)
+	}
+
+	// Build 1.5 routes default to the video capability.
+	route, err := modelRepo.GetByPublicID(ctx, "Build/"+video15)
+	if err != nil || route.Capability != modeldomain.CapabilityVideo {
+		t.Fatalf("build video route = %#v, err = %v", route, err)
+	}
+	composerRoute, err := modelRepo.GetByPublicID(ctx, modeldomain.GrokComposer25Fast)
+	if err != nil || composerRoute.Provider != account.ProviderBuild || composerRoute.Capability != modeldomain.CapabilityResponses {
+		t.Fatalf("Build Composer route = %#v, err = %v", composerRoute, err)
+	}
+	// Web does not use Build normalization and still supports its catalog models.
+	webCandidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderWeb, 0, "grok-imagine-video", "")
+	if err != nil || len(webCandidates) != 1 || !webCandidates[0].SupportsModel {
+		t.Fatalf("web candidates = %#v, err = %v", webCandidates, err)
 	}
 }
 
@@ -336,7 +359,6 @@ func TestSyncAccountRunsUpstreamDiscoveryConcurrently(t *testing.T) {
 
 type modelCapabilityAdapter struct {
 	provider account.Provider
-	catalog  provider.ModelCatalogKind
 	mu       sync.Mutex
 	models   map[uint64][]string
 	attempts []uint64
@@ -346,6 +368,47 @@ type modelCapabilityAdapter struct {
 	peak     atomic.Int64
 }
 
+// buildCapabilityNormalizerAdapter simulates a Build Adapter implementing optional capability normalization.
+type buildCapabilityNormalizerAdapter struct {
+	*modelCapabilityAdapter
+}
+
+func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
+	// Match cli.Adapter rules: Build OAuth adds Composer; Super (paid or
+	// entitlement) ensures 1.5; otherwise remove video 1.5 exactly.
+	const video15 = "grok-imagine-video-1.5"
+	super := account.IsBuildSuper(credential, billing)
+	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
+	result := make([]string, 0, len(models)+2)
+	seen := make(map[string]struct{}, len(models)+2)
+	hasVideo15 := false
+	for _, modelName := range models {
+		if modelName == "" {
+			continue
+		}
+		if _, exists := seen[modelName]; exists {
+			continue
+		}
+		if modelName == video15 {
+			if !super {
+				continue
+			}
+			hasVideo15 = true
+		}
+		seen[modelName] = struct{}{}
+		result = append(result, modelName)
+	}
+	if super && !hasVideo15 {
+		result = append(result, video15)
+	}
+	if composer {
+		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
+			result = append(result, modeldomain.GrokComposer25Fast)
+		}
+	}
+	return result
+}
+
 func (a *modelCapabilityAdapter) Provider() account.Provider {
 	if a.provider == "" {
 		return account.ProviderBuild
@@ -353,11 +416,7 @@ func (a *modelCapabilityAdapter) Provider() account.Provider {
 	return a.provider
 }
 func (a *modelCapabilityAdapter) Definition() provider.Definition {
-	catalog := a.catalog
-	if catalog == "" {
-		catalog = provider.ModelCatalogRemote
-	}
-	return provider.Definition{Provider: a.Provider(), ModelCatalog: catalog}
+	return provider.Definition{Provider: a.Provider()}
 }
 func (a *modelCapabilityAdapter) ListModels(ctx context.Context, credential account.Credential) ([]string, error) {
 	a.mu.Lock()

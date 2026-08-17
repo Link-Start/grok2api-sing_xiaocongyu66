@@ -35,8 +35,8 @@ func (c *ResponseStateCache) Delete(ctx context.Context, responseID string, clie
 	return c.inner.Delete(ctx, responseID, clientKeyID)
 }
 
-func (c *ResponseStateCache) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
-	return c.inner.DeleteExpired(ctx, now)
+func (c *ResponseStateCache) DeleteExpired(ctx context.Context, now time.Time, ownershipLimit, webStateLimit int) (repository.ResponseCleanupResult, error) {
+	return c.inner.DeleteExpired(ctx, now, ownershipLimit, webStateLimit)
 }
 
 func (c *ResponseStateCache) SaveWebState(ctx context.Context, value inferencedomain.WebResponseState) error {

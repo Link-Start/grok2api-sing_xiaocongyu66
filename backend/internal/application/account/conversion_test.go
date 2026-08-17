@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -225,86 +224,11 @@ func TestConvertAllWebAccountsToBuildProcessesMoreThanLegacyLimitInBatches(t *te
 	if result.Created != totalAccounts || result.Linked != 0 || result.Skipped != 0 || result.Failed != 0 || len(result.BuildAccountIDs) != totalAccounts {
 		t.Fatalf("conversion result = %#v", result)
 	}
-	if adapter.calls.Load() != totalAccounts || repository.listCalls.Load() != 2 {
-		t.Fatalf("adapter calls = %d, repository batches = %d", adapter.calls.Load(), repository.listCalls.Load())
+	if adapter.calls.Load() != totalAccounts || repository.listCalls != 2 {
+		t.Fatalf("adapter calls = %d, repository batches = %d", adapter.calls.Load(), repository.listCalls)
 	}
 	if len(progress) != totalAccounts+1 || progress[0] != [2]int{0, totalAccounts} || progress[len(progress)-1] != [2]int{totalAccounts, totalAccounts} {
 		t.Fatalf("progress first=%v last=%v count=%d", progress[0], progress[len(progress)-1], len(progress))
-	}
-}
-
-// TestConvertAllPrefetchesNextBatchWhileConverting ensures batch N+1 list + GetMany
-// (bulk working-set preprocess) starts before batch N conversion finishes.
-func TestConvertAllPrefetchesNextBatchWhileConverting(t *testing.T) {
-	const totalAccounts = maxBuildConversionAccounts + 1
-	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedSSO, err := cipher.Encrypt("test-sso")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Gate blocks the first ConvertToBuild call until the second list has started.
-	// That proves next-batch preprocess overlaps current conversion.
-	firstConvertStarted := make(chan struct{})
-	secondListStarted := make(chan struct{})
-	releaseFirstConvert := make(chan struct{})
-	var firstConvertOnce sync.Once
-	repository := &conversionBatchRepository{
-		total: totalAccounts, encryptedSSO: encryptedSSO,
-		onList: func(call int) {
-			if call == 2 {
-				close(secondListStarted)
-			}
-		},
-	}
-	adapter := &buildConversionAdapter{
-		beforeConvert: func() {
-			firstConvertOnce.Do(func() {
-				close(firstConvertStarted)
-				select {
-				case <-releaseFirstConvert:
-				case <-time.After(5 * time.Second):
-					t.Error("timed out waiting for next-batch preprocess")
-				}
-			})
-		},
-	}
-	service := NewService(repository, nil, nil, nil, provider.NewRegistry(adapter), cipher, memory.NewLockStore())
-
-	done := make(chan error, 1)
-	go func() {
-		_, convErr := service.ConvertAllWebAccountsToBuildWithProgress(context.Background(), nil, nil)
-		done <- convErr
-	}()
-
-	select {
-	case <-firstConvertStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("conversion did not start")
-	}
-	select {
-	case <-secondListStarted:
-		// Next batch list ran while first convert was still blocked ⇒ preprocess pipelined.
-	case <-time.After(5 * time.Second):
-		t.Fatal("next batch was not listed while first batch was still converting")
-	}
-	close(releaseFirstConvert)
-
-	select {
-	case convErr := <-done:
-		if convErr != nil {
-			t.Fatal(convErr)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("conversion did not finish")
-	}
-	if repository.listCalls.Load() != 2 {
-		t.Fatalf("listCalls = %d want 2", repository.listCalls.Load())
-	}
-	if adapter.calls.Load() != totalAccounts {
-		t.Fatalf("adapter calls = %d want %d", adapter.calls.Load(), totalAccounts)
 	}
 }
 
@@ -312,16 +236,12 @@ type conversionBatchRepository struct {
 	repository.AccountRepository
 	total        int
 	encryptedSSO string
-	listCalls    atomic.Int64
+	listCalls    int
 	nextBuildID  atomic.Uint64
-	onList       func(call int)
 }
 
 func (r *conversionBatchRepository) ListUnlinkedWebAccountIDs(_ context.Context, afterID uint64, limit int) ([]uint64, int64, error) {
-	call := int(r.listCalls.Add(1))
-	if r.onList != nil {
-		r.onList(call)
-	}
+	r.listCalls++
 	ids := make([]uint64, 0, limit)
 	for id := afterID + 1; id <= uint64(r.total) && len(ids) < limit; id++ {
 		ids = append(ids, id)
@@ -337,18 +257,6 @@ func (r *conversionBatchRepository) Get(_ context.Context, id uint64) (accountdo
 	}, nil
 }
 
-func (r *conversionBatchRepository) GetMany(_ context.Context, ids []uint64) ([]accountdomain.Credential, error) {
-	out := make([]accountdomain.Credential, len(ids))
-	for i, id := range ids {
-		out[i] = accountdomain.Credential{
-			ID: id, Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
-			Name: fmt.Sprintf("web-%d", id), SourceKey: fmt.Sprintf("web-source-%d", id),
-			EncryptedAccessToken: r.encryptedSSO, Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
-		}
-	}
-	return out, nil
-}
-
 func (r *conversionBatchRepository) UpsertByIdentity(_ context.Context, value accountdomain.Credential) (accountdomain.Credential, bool, error) {
 	value.ID = 10_000 + r.nextBuildID.Add(1)
 	return value, true, nil
@@ -356,17 +264,11 @@ func (r *conversionBatchRepository) UpsertByIdentity(_ context.Context, value ac
 
 func (r *conversionBatchRepository) LinkWebToBuild(context.Context, uint64, uint64) error { return nil }
 
-type buildConversionAdapter struct {
-	calls         atomic.Int64
-	beforeConvert func()
-}
+type buildConversionAdapter struct{ calls atomic.Int64 }
 
 func (a *buildConversionAdapter) Provider() accountdomain.Provider { return accountdomain.ProviderWeb }
 
 func (a *buildConversionAdapter) ConvertToBuild(_ context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
-	if a.beforeConvert != nil {
-		a.beforeConvert()
-	}
 	call := a.calls.Add(1)
 	return provider.CredentialSeed{
 		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "build", UserID: credential.SourceKey,

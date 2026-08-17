@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"strings"
 
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
@@ -72,56 +72,12 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 	}
 	original := cloneBufferedResponse(response, errorBody, truncated)
 	if truncated || !isReasoningDecodeFailure(errorBody) {
-		// Non-recoverable 400: keep a short diagnostic for operators.
-		// (Recoverable decode failures log via logReasoningRecovery instead.)
-		if response.StatusCode == http.StatusBadRequest && !truncated {
-			slog.Warn("upstream_bad_request",
-				"path", request.Path,
-				"account_id", request.Credential.ID,
-				"model", request.Model,
-				"operation", request.Operation,
-				"prompt_cache_key_set", strings.TrimSpace(request.PromptCacheKey) != "",
-				"error_len", len(errorBody),
-				"error_prefix", truncateForLog(string(errorBody), 180),
-			)
-		}
 		return original, requestURL, reasoningRecoveryOutcome{}
 	}
 	// 一旦上游明确拒绝 opaque reasoning，立即清理该账号/平面的服务端回放，
 	// 防止下次请求再次注入同一份已失效密文。成功响应会按正常 Capture 流程写回新状态。
 	if a.replay != nil && replayKey != "" {
 		a.replay.Clear(ctx, request.Model, replayKey)
-	}
-
-	// Evaluate session-reset safety against the ORIGINAL body. Compaction
-	// sanitization may strip previous_response_id, which must not re-enable a
-	// session reset that would break an official stored-response chain.
-	sessionResetSafe := canResetReasoningSession(request, body)
-
-	// Fold sing-specific compact-blob sanitization into the same recovery path
-	// so type=compaction residue is cleared before encrypted_content strip.
-	// Keep previous_response_id intact when a stored chain is present.
-	if isCompactionBlobDecodeError(errorBody) {
-		if sanitized, stats := sanitizeBodyAfterCompactionDecodeError(body, a.compactRecall); stats["changed"] == true {
-			if scrubbed, n := scrubUpstreamCompactionBlobs(sanitized); n > 0 {
-				sanitized = scrubbed
-				stats["post_scrub"] = n
-			}
-			// If the original request chained via previous_response_id, put it
-			// back so we never convert a stored chain into a free-floating turn.
-			if !sessionResetSafe {
-				if restored, ok := restorePreviousResponseID(body, sanitized); ok {
-					sanitized = restored
-					stats["previous_response_restored"] = true
-				}
-			}
-			slog.Warn("compaction_blob_decode_sanitize",
-				"path", request.Path,
-				"account_id", request.Credential.ID,
-				"stats", stats,
-			)
-			body = sanitized
-		}
 	}
 
 	portableBody, encryptedChanged := stripReasoningEncryptedContent(body)
@@ -156,7 +112,7 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 		a.logReasoningRecovery(request, base, "encrypted_content", "decode_error_persisted", retry.StatusCode, nil)
 	}
 
-	if !sessionResetSafe {
+	if !canResetReasoningSession(request, portableBody) {
 		a.logReasoningRecovery(request, base, "session_reset", "not_safe", 0, nil)
 		return original, requestURL, reasoningRecoveryOutcome{failed: true}
 	}
@@ -199,10 +155,13 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 func (a *Adapter) retryReasoningRecovery(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string, resetSession bool) (*http.Response, string, error) {
 	retryRequest := request
 	retryRequest.IdempotencyID, _ = security.NewOpaqueToken(18)
+	stage := "reasoning_replay"
 	if resetSession {
 		retryRequest.PromptCacheKey = ""
+		retryRequest.GrokTurnIndex = ""
+		stage = "reasoning_session_reset"
 	}
-	return a.doResponseRequest(ctx, retryRequest, accessToken, body, base)
+	return a.doResponseRequest(infraegress.WithPhysicalCallStage(ctx, stage), retryRequest, accessToken, body, base)
 }
 
 func responseHasReasoningDecodeFailure(response *http.Response) (bool, error) {
@@ -245,34 +204,6 @@ func removePromptCacheKey(body []byte) []byte {
 	return encoded
 }
 
-// restorePreviousResponseID copies previous_response_id from original into
-// sanitized when sanitization stripped it. Used to keep stored-response chains
-// intact during compaction recovery.
-func restorePreviousResponseID(original, sanitized []byte) ([]byte, bool) {
-	var src map[string]any
-	if json.Unmarshal(original, &src) != nil {
-		return sanitized, false
-	}
-	prev, _ := src["previous_response_id"].(string)
-	prev = strings.TrimSpace(prev)
-	if prev == "" {
-		return sanitized, false
-	}
-	var dst map[string]any
-	if json.Unmarshal(sanitized, &dst) != nil {
-		return sanitized, false
-	}
-	if existing, _ := dst["previous_response_id"].(string); strings.TrimSpace(existing) == prev {
-		return sanitized, false
-	}
-	dst["previous_response_id"] = prev
-	encoded, err := json.Marshal(dst)
-	if err != nil {
-		return sanitized, false
-	}
-	return encoded, true
-}
-
 func (a *Adapter) logReasoningRecovery(request provider.ResponseResourceRequest, base, stage, result string, status int, err error) {
 	plane := "build"
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
@@ -292,7 +223,10 @@ func (a *Adapter) logReasoningRecovery(request provider.ResponseResourceRequest,
 	if err != nil {
 		attributes = append(attributes, "error", err)
 	}
-	slog.Warn("reasoning_decode_recovery", attributes...)
+	logger := a.logger
+	if logger != nil {
+		logger.Warn("reasoning_decode_recovery", attributes...)
+	}
 }
 
 func isReasoningDecodeFailure(body []byte) bool {

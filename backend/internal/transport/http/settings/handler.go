@@ -21,37 +21,27 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 }
 
 type settingsConfigDTO struct {
-	ProviderBuild         providerBuildConfigDTO         `json:"providerBuild"`
-	ProviderWeb           providerWebConfigDTO           `json:"providerWeb"`
-	ProviderConsole       providerConsoleConfigDTO       `json:"providerConsole"`
-	ProactiveUpstreamSync proactiveUpstreamSyncConfigDTO `json:"proactiveUpstreamSync"`
-	Batch                 batchConfigDTO                 `json:"batch"`
-	Media                 mediaConfigDTO                 `json:"media"`
-	Routing               routingConfigDTO               `json:"routing"`
-	PromptCacheAffinity   promptCacheAffinityConfigDTO   `json:"promptCacheAffinity"`
-	Audit                 auditConfigDTO                 `json:"audit"`
-	ClientKeyDefaults     clientKeyDefaultsConfigDTO     `json:"clientKeyDefaults"`
+	Server            serverConfigDTO            `json:"server"`
+	ProviderBuild     providerBuildConfigDTO     `json:"providerBuild"`
+	ProviderWeb       providerWebConfigDTO       `json:"providerWeb"`
+	ProviderConsole   providerConsoleConfigDTO   `json:"providerConsole"`
+	Batch             batchConfigDTO             `json:"batch"`
+	Media             mediaConfigDTO             `json:"media"`
+	Frontend          frontendConfigDTO          `json:"frontend"`
+	Routing           routingConfigDTO           `json:"routing"`
+	Audit             auditConfigDTO             `json:"audit"`
+	ClientKeyDefaults clientKeyDefaultsConfigDTO `json:"clientKeyDefaults"`
+	Accounts          *accountsConfigDTO         `json:"accounts,omitempty"`
 }
 
-type promptCacheAffinityConfigDTO struct {
-	Enabled     bool   `json:"enabled"`
-	Fingerprint bool   `json:"fingerprint"`
-	Expire      bool   `json:"expire"`
-	TTL         string `json:"ttl"`
-}
-
-type proactiveUpstreamSyncConfigDTO struct {
-	Billing                   bool `json:"billing"`
-	WebQuota                  bool `json:"webQuota"`
-	ModelCatalogCatchup       bool `json:"modelCatalogCatchup"`
-	AllowManualBillingRefresh bool `json:"allowManualBillingRefresh"`
-	AllowManualQuotaRefresh   bool `json:"allowManualQuotaRefresh"`
+type serverConfigDTO struct {
+	MaxConcurrentRequests int `json:"maxConcurrentRequests"`
 }
 
 type providerConsoleConfigDTO struct {
-	BaseURL     string `json:"baseURL"`
-	UserAgent   string `json:"userAgent"`
-	ChatTimeout string `json:"chatTimeout"`
+	BaseURL           string `json:"baseURL"`
+	ChatTimeout       string `json:"chatTimeout"`
+	StreamIdleTimeout string `json:"streamIdleTimeout"`
 }
 
 type mediaConfigDTO struct {
@@ -61,72 +51,89 @@ type mediaConfigDTO struct {
 	CleanupInterval         string `json:"cleanupInterval"`
 }
 
+type frontendConfigDTO struct {
+	PublicAPIBaseURL string `json:"publicApiBaseURL"`
+}
+
 type providerBuildConfigDTO struct {
 	BaseURL               string `json:"baseURL"`
+	FallbackBaseURL       string `json:"fallbackBaseURL"`
 	ClientVersion         string `json:"clientVersion"`
 	ClientIdentifier      string `json:"clientIdentifier"`
 	TokenAuth             string `json:"tokenAuth"`
 	TokenAuthConfigured   bool   `json:"tokenAuthConfigured"`
 	UserAgent             string `json:"userAgent"`
 	ResponseHeaderTimeout string `json:"responseHeaderTimeout"`
+	StreamIdleTimeout     string `json:"streamIdleTimeout"`
 }
 
 type providerWebConfigDTO struct {
-	BaseURL                     string `json:"baseURL"`
-	StatsigMode                 string `json:"statsigMode"`
-	StatsigManualValue          string `json:"statsigManualValue,omitempty"`
-	StatsigManualConfigured     bool   `json:"statsigManualConfigured"`
-	StatsigSignerURL            string `json:"statsigSignerURL"`
-	QuotaTimeout                string `json:"quotaTimeout"`
-	ChatTimeout                 string `json:"chatTimeout"`
-	ImageTimeout                string `json:"imageTimeout"`
-	VideoTimeout                string `json:"videoTimeout"`
-	MediaConcurrency            int    `json:"mediaConcurrency"`
-	AllowNSFW                   bool   `json:"allowNSFW"`
-	RecoveryBackoffBase         string `json:"recoveryBackoffBase"`
-	RecoveryBackoffMax          string `json:"recoveryBackoffMax"`
-	FlareSolverrEnabled         bool   `json:"flareSolverrEnabled"`
-	FlareSolverrURL             string `json:"flareSolverrURL"`
-	FlareSolverrTargetURL       string `json:"flareSolverrTargetURL"`
-	FlareSolverrTimeout         string `json:"flareSolverrTimeout"`
-	FlareSolverrRefreshInterval string `json:"flareSolverrRefreshInterval"`
+	BaseURL                 string  `json:"baseURL"`
+	StatsigMode             string  `json:"statsigMode"`
+	StatsigManualValue      string  `json:"statsigManualValue,omitempty"`
+	StatsigManualConfigured bool    `json:"statsigManualConfigured"`
+	StatsigSignerURL        string  `json:"statsigSignerURL"`
+	ClearanceMode           *string `json:"clearanceMode,omitempty"`
+	FlareSolverrURL         *string `json:"flareSolverrURL,omitempty"`
+	ClearanceTimeout        *string `json:"clearanceTimeout,omitempty"`
+	ClearanceRefresh        *string `json:"clearanceRefresh,omitempty"`
+	QuotaTimeout            string  `json:"quotaTimeout"`
+	ChatTimeout             string  `json:"chatTimeout"`
+	StreamIdleTimeout       string  `json:"streamIdleTimeout"`
+	ImageTimeout            string  `json:"imageTimeout"`
+	VideoTimeout            string  `json:"videoTimeout"`
+	MediaConcurrency        int     `json:"mediaConcurrency"`
+	AllowNSFW               bool    `json:"allowNSFW"`
+	RecoveryBackoffBase     string  `json:"recoveryBackoffBase"`
+	RecoveryBackoffMax      string  `json:"recoveryBackoffMax"`
 }
 
 type batchConfigDTO struct {
-	ImportConcurrency     int               `json:"importConcurrency"`
-	ConversionConcurrency int               `json:"conversionConcurrency"`
-	SyncConcurrency       int               `json:"syncConcurrency"`
-	RefreshConcurrency    int               `json:"refreshConcurrency"`
-	RandomDelay           string            `json:"randomDelay"`
-	DBBuffer              dbBufferConfigDTO `json:"dbBuffer"`
-}
-
-type dbBufferConfigDTO struct {
-	Enabled bool   `json:"enabled"`
-	Driver  string `json:"driver"`
-	Path    string `json:"path"`
+	ImportConcurrency     int    `json:"importConcurrency"`
+	ConversionConcurrency int    `json:"conversionConcurrency"`
+	SyncConcurrency       int    `json:"syncConcurrency"`
+	RefreshConcurrency    int    `json:"refreshConcurrency"`
+	RandomDelay           string `json:"randomDelay"`
 }
 
 type routingConfigDTO struct {
-	StickyTTL                  string `json:"stickyTTL"`
-	CooldownBase               string `json:"cooldownBase"`
-	CooldownMax                string `json:"cooldownMax"`
-	CapacityWait               string `json:"capacityWait"`
-	MaxAttempts                int    `json:"maxAttempts"`
-	RetryStatusCodes           []int  `json:"retryStatusCodes"`
-	RetryServerErrors          bool   `json:"retryServerErrors"`
-	DeprioritizeFailedAccounts bool   `json:"deprioritizeFailedAccounts"`
+	StickyTTL                   string                      `json:"stickyTTL"`
+	CooldownBase                string                      `json:"cooldownBase"`
+	CooldownMax                 string                      `json:"cooldownMax"`
+	CapacityWait                string                      `json:"capacityWait"`
+	MaxAttempts                 int                         `json:"maxAttempts"`
+	PreferFreeBuild             bool                        `json:"preferFreeBuild"`
+	MarkBuildChatDeniedAsReauth *bool                       `json:"markBuildChatDeniedAsReauth,omitempty"`
+	AccountIsolatedConnections  *bool                       `json:"accountIsolatedConnections,omitempty"`
+	SegmentedSelector           *segmentedSelectorConfigDTO `json:"segmentedSelector,omitempty"`
+}
+
+type segmentedSelectorConfigDTO struct {
+	Enabled       bool `json:"enabled"`
+	MinCandidates int  `json:"minCandidates"`
+	WindowSize    int  `json:"windowSize"`
 }
 
 type auditConfigDTO struct {
 	BufferSize    int    `json:"bufferSize"`
 	BatchSize     int    `json:"batchSize"`
 	FlushInterval string `json:"flushInterval"`
+	CommitDelayMS int    `json:"commitDelayMS"`
 }
 
 type clientKeyDefaultsConfigDTO struct {
 	RPMLimit      int `json:"rpmLimit"`
 	MaxConcurrent int `json:"maxConcurrent"`
+}
+
+type accountsConfigDTO struct {
+	MarkBuildForbiddenReauth             *bool     `json:"markBuildForbiddenReauth,omitempty"`
+	BuildForbiddenReauthCodes            *[]string `json:"buildForbiddenReauthCodes,omitempty"`
+	ExcludeBuildBotFlaggedFromScheduling *bool     `json:"excludeBuildBotFlaggedFromScheduling,omitempty"`
+	AutoCleanReauthEnabled               bool      `json:"autoCleanReauthEnabled"`
+	AutoCleanReauthInterval              string    `json:"autoCleanReauthInterval"`
+	AutoCleanReauthMinAge                string    `json:"autoCleanReauthMinAge"`
+	AutoCleanIncludeDisabled             bool      `json:"autoCleanIncludeDisabled"`
 }
 
 type settingsResponse struct {
@@ -174,141 +181,153 @@ func (h *Handler) update(c *gin.Context) {
 }
 
 func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
-	return settingsapp.EditableConfig{
+	clearanceProvided := value.ProviderWeb.ClearanceMode != nil || value.ProviderWeb.FlareSolverrURL != nil ||
+		value.ProviderWeb.ClearanceTimeout != nil || value.ProviderWeb.ClearanceRefresh != nil
+	result := settingsapp.EditableConfig{
+		Server: settingsapp.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsapp.ProviderBuildConfig{
-			BaseURL: value.ProviderBuild.BaseURL, ClientVersion: value.ProviderBuild.ClientVersion,
-			ClientIdentifier: value.ProviderBuild.ClientIdentifier, TokenAuth: value.ProviderBuild.TokenAuth,
-			UserAgent: value.ProviderBuild.UserAgent,
+			BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: value.ProviderBuild.FallbackBaseURL,
+			ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+			TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 			ResponseHeaderTimeout: value.ProviderBuild.ResponseHeaderTimeout,
+			StreamIdleTimeout:     value.ProviderBuild.StreamIdleTimeout,
 		},
 		ProviderWeb: settingsapp.ProviderWebConfig{
 			BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: value.ProviderWeb.QuotaTimeout,
 			StatsigMode: value.ProviderWeb.StatsigMode, StatsigManualValue: value.ProviderWeb.StatsigManualValue,
 			StatsigManualConfigured: value.ProviderWeb.StatsigManualConfigured, StatsigSignerURL: value.ProviderWeb.StatsigSignerURL,
-			ChatTimeout: value.ProviderWeb.ChatTimeout, ImageTimeout: value.ProviderWeb.ImageTimeout,
+			ClearanceMode: optionalString(value.ProviderWeb.ClearanceMode), FlareSolverrURL: optionalString(value.ProviderWeb.FlareSolverrURL),
+			ClearanceTimeout: optionalString(value.ProviderWeb.ClearanceTimeout), ClearanceRefresh: optionalString(value.ProviderWeb.ClearanceRefresh),
+			ClearanceProvided: clearanceProvided,
+			ChatTimeout:       value.ProviderWeb.ChatTimeout, StreamIdleTimeout: value.ProviderWeb.StreamIdleTimeout,
+			ImageTimeout:     value.ProviderWeb.ImageTimeout,
 			VideoTimeout:     value.ProviderWeb.VideoTimeout,
 			MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 			RecoveryBackoffBase: value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
-			FlareSolverrEnabled: value.ProviderWeb.FlareSolverrEnabled, FlareSolverrURL: value.ProviderWeb.FlareSolverrURL,
-			FlareSolverrTargetURL: value.ProviderWeb.FlareSolverrTargetURL,
-			FlareSolverrTimeout:   value.ProviderWeb.FlareSolverrTimeout, FlareSolverrRefreshInterval: value.ProviderWeb.FlareSolverrRefreshInterval,
 		},
 		ProviderConsole: settingsapp.ProviderConsoleConfig{
-			BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
-			ChatTimeout: value.ProviderConsole.ChatTimeout,
+			BaseURL: value.ProviderConsole.BaseURL, ChatTimeout: value.ProviderConsole.ChatTimeout,
+			StreamIdleTimeout: value.ProviderConsole.StreamIdleTimeout,
 		},
 		Batch: settingsapp.BatchConfig{
 			ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
 			SyncConcurrency: value.Batch.SyncConcurrency, RefreshConcurrency: value.Batch.RefreshConcurrency,
 			RandomDelay: value.Batch.RandomDelay,
-			DBBuffer: settingsapp.DBBufferConfig{
-				Enabled: value.Batch.DBBuffer.Enabled,
-				Driver:  value.Batch.DBBuffer.Driver,
-				Path:    value.Batch.DBBuffer.Path,
-			},
 		},
 		Media: settingsapp.MediaConfig{
 			MaxImageBytes: value.Media.MaxImageBytes, MaxTotalBytes: value.Media.MaxTotalBytes,
 			CleanupThresholdPercent: value.Media.CleanupThresholdPercent, CleanupInterval: value.Media.CleanupInterval,
 		},
+		Frontend: settingsapp.FrontendConfig{
+			PublicAPIBaseURL: value.Frontend.PublicAPIBaseURL,
+		},
 		Routing: settingsapp.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL, CooldownBase: value.Routing.CooldownBase,
 			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts,
-			RetryStatusCodes: append([]int(nil), value.Routing.RetryStatusCodes...), RetryServerErrors: value.Routing.RetryServerErrors,
-			DeprioritizeFailedAccounts: value.Routing.DeprioritizeFailedAccounts,
+			PreferFreeBuild:                     value.Routing.PreferFreeBuild,
+			MarkBuildChatDeniedAsReauth:         boolValue(value.Routing.MarkBuildChatDeniedAsReauth),
+			MarkBuildChatDeniedAsReauthProvided: value.Routing.MarkBuildChatDeniedAsReauth != nil,
+			AccountIsolatedConnections:          boolValue(value.Routing.AccountIsolatedConnections),
+			AccountIsolatedConnectionsProvided:  value.Routing.AccountIsolatedConnections != nil,
 		},
 		Audit: settingsapp.AuditConfig{
-			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval,
+			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval, CommitDelayMS: value.Audit.CommitDelayMS,
 		},
 		ClientKeyDefaults: settingsapp.ClientKeyDefaultsConfig{
 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
 		},
-		ProactiveUpstreamSync: settingsapp.ProactiveUpstreamSyncConfig{
-			Billing:                   value.ProactiveUpstreamSync.Billing,
-			WebQuota:                  value.ProactiveUpstreamSync.WebQuota,
-			ModelCatalogCatchup:       value.ProactiveUpstreamSync.ModelCatalogCatchup,
-			AllowManualBillingRefresh: value.ProactiveUpstreamSync.AllowManualBillingRefresh,
-			AllowManualQuotaRefresh:   value.ProactiveUpstreamSync.AllowManualQuotaRefresh,
-		},
-		PromptCacheAffinity: settingsapp.PromptCacheAffinityConfig{
-			Enabled: value.PromptCacheAffinity.Enabled, Fingerprint: value.PromptCacheAffinity.Fingerprint,
-			Expire: value.PromptCacheAffinity.Expire, TTL: value.PromptCacheAffinity.TTL,
-		},
 	}
-}
-
-func normalizeDBBufferDTO(value settingsapp.DBBufferConfig) dbBufferConfigDTO {
-	driver := strings.ToLower(strings.TrimSpace(value.Driver))
-	switch driver {
-	case "redis", "sqlite", "none":
-	default:
-		driver = "none"
+	if value.Routing.SegmentedSelector != nil {
+		result.Routing.SegmentedSelector = settingsapp.SegmentedSelectorConfig{
+			Enabled: value.Routing.SegmentedSelector.Enabled, MinCandidates: value.Routing.SegmentedSelector.MinCandidates,
+			WindowSize: value.Routing.SegmentedSelector.WindowSize,
+		}
+		result.Routing.SegmentedSelectorProvided = true
 	}
-	return dbBufferConfigDTO{
-		Enabled: value.Enabled,
-		Driver:  driver,
-		Path:    strings.TrimSpace(value.Path),
+	if value.Accounts != nil {
+		result.Accounts = settingsapp.AccountsConfig{
+			MarkBuildForbiddenReauth:                     boolValue(value.Accounts.MarkBuildForbiddenReauth),
+			BuildForbiddenReauthCodes:                    stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
+			ExcludeBuildBotFlaggedFromScheduling:         boolValue(value.Accounts.ExcludeBuildBotFlaggedFromScheduling),
+			MarkBuildForbiddenReauthProvided:             value.Accounts.MarkBuildForbiddenReauth != nil,
+			BuildForbiddenReauthCodesProvided:            value.Accounts.BuildForbiddenReauthCodes != nil,
+			ExcludeBuildBotFlaggedFromSchedulingProvided: value.Accounts.ExcludeBuildBotFlaggedFromScheduling != nil,
+			AutoCleanReauthEnabled:                       value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:                      value.Accounts.AutoCleanReauthInterval,
+			AutoCleanReauthMinAge:                        value.Accounts.AutoCleanReauthMinAge,
+			AutoCleanIncludeDisabled:                     value.Accounts.AutoCleanIncludeDisabled,
+		}
+		result.AccountsProvided = true
 	}
+	return result
 }
 
 func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 	config := value.Config
 	return settingsResponse{
 		Config: settingsConfigDTO{
+			Server: serverConfigDTO{MaxConcurrentRequests: config.Server.MaxConcurrentRequests},
 			ProviderBuild: providerBuildConfigDTO{
-				BaseURL: config.ProviderBuild.BaseURL, ClientVersion: config.ProviderBuild.ClientVersion,
-				ClientIdentifier: config.ProviderBuild.ClientIdentifier, TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "",
-				UserAgent: config.ProviderBuild.UserAgent,
+				BaseURL: config.ProviderBuild.BaseURL, FallbackBaseURL: config.ProviderBuild.FallbackBaseURL,
+				ClientVersion: config.ProviderBuild.ClientVersion, ClientIdentifier: config.ProviderBuild.ClientIdentifier,
+				TokenAuth:           config.ProviderBuild.TokenAuth,
+				TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "", UserAgent: config.ProviderBuild.UserAgent,
 				ResponseHeaderTimeout: config.ProviderBuild.ResponseHeaderTimeout,
+				StreamIdleTimeout:     config.ProviderBuild.StreamIdleTimeout,
 			},
 			ProviderWeb: providerWebConfigDTO{
 				BaseURL: config.ProviderWeb.BaseURL, QuotaTimeout: config.ProviderWeb.QuotaTimeout,
 				StatsigMode: config.ProviderWeb.StatsigMode, StatsigManualConfigured: config.ProviderWeb.StatsigManualConfigured,
 				StatsigSignerURL: config.ProviderWeb.StatsigSignerURL,
-				ChatTimeout:      config.ProviderWeb.ChatTimeout, ImageTimeout: config.ProviderWeb.ImageTimeout,
+				ClearanceMode:    stringPointer(config.ProviderWeb.ClearanceMode), FlareSolverrURL: stringPointer(config.ProviderWeb.FlareSolverrURL),
+				ClearanceTimeout: stringPointer(config.ProviderWeb.ClearanceTimeout), ClearanceRefresh: stringPointer(config.ProviderWeb.ClearanceRefresh),
+				ChatTimeout: config.ProviderWeb.ChatTimeout, StreamIdleTimeout: config.ProviderWeb.StreamIdleTimeout,
+				ImageTimeout:     config.ProviderWeb.ImageTimeout,
 				VideoTimeout:     config.ProviderWeb.VideoTimeout,
 				MediaConcurrency: config.ProviderWeb.MediaConcurrency, AllowNSFW: config.ProviderWeb.AllowNSFW,
 				RecoveryBackoffBase: config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
-				FlareSolverrEnabled: config.ProviderWeb.FlareSolverrEnabled, FlareSolverrURL: config.ProviderWeb.FlareSolverrURL,
-				FlareSolverrTargetURL: config.ProviderWeb.FlareSolverrTargetURL,
-				FlareSolverrTimeout:   config.ProviderWeb.FlareSolverrTimeout, FlareSolverrRefreshInterval: config.ProviderWeb.FlareSolverrRefreshInterval,
 			},
 			ProviderConsole: providerConsoleConfigDTO{
-				BaseURL: config.ProviderConsole.BaseURL, UserAgent: config.ProviderConsole.UserAgent,
-				ChatTimeout: config.ProviderConsole.ChatTimeout,
+				BaseURL: config.ProviderConsole.BaseURL, ChatTimeout: config.ProviderConsole.ChatTimeout,
+				StreamIdleTimeout: config.ProviderConsole.StreamIdleTimeout,
 			},
 			Batch: batchConfigDTO{
 				ImportConcurrency: config.Batch.ImportConcurrency, ConversionConcurrency: config.Batch.ConversionConcurrency,
 				SyncConcurrency: config.Batch.SyncConcurrency, RefreshConcurrency: config.Batch.RefreshConcurrency,
 				RandomDelay: config.Batch.RandomDelay,
-				DBBuffer:    normalizeDBBufferDTO(config.Batch.DBBuffer),
 			},
 			Media: mediaConfigDTO{
 				MaxImageBytes: config.Media.MaxImageBytes, MaxTotalBytes: config.Media.MaxTotalBytes,
 				CleanupThresholdPercent: config.Media.CleanupThresholdPercent, CleanupInterval: config.Media.CleanupInterval,
 			},
+			Frontend: frontendConfigDTO{
+				PublicAPIBaseURL: config.Frontend.PublicAPIBaseURL,
+			},
 			Routing: routingConfigDTO{
 				StickyTTL: config.Routing.StickyTTL, CooldownBase: config.Routing.CooldownBase,
 				CooldownMax: config.Routing.CooldownMax, CapacityWait: config.Routing.CapacityWait, MaxAttempts: config.Routing.MaxAttempts,
-				RetryStatusCodes: append([]int(nil), config.Routing.RetryStatusCodes...), RetryServerErrors: config.Routing.RetryServerErrors,
-				DeprioritizeFailedAccounts: config.Routing.DeprioritizeFailedAccounts,
+				MarkBuildChatDeniedAsReauth: boolPointer(config.Routing.MarkBuildChatDeniedAsReauth),
+				PreferFreeBuild:             config.Routing.PreferFreeBuild,
+				AccountIsolatedConnections:  boolPointer(config.Routing.AccountIsolatedConnections),
+				SegmentedSelector: &segmentedSelectorConfigDTO{
+					Enabled: config.Routing.SegmentedSelector.Enabled, MinCandidates: config.Routing.SegmentedSelector.MinCandidates,
+					WindowSize: config.Routing.SegmentedSelector.WindowSize,
+				},
 			},
 			Audit: auditConfigDTO{
-				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval,
+				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval, CommitDelayMS: config.Audit.CommitDelayMS,
 			},
 			ClientKeyDefaults: clientKeyDefaultsConfigDTO{
 				RPMLimit: config.ClientKeyDefaults.RPMLimit, MaxConcurrent: config.ClientKeyDefaults.MaxConcurrent,
 			},
-			PromptCacheAffinity: promptCacheAffinityConfigDTO{
-				Enabled: config.PromptCacheAffinity.Enabled, Fingerprint: config.PromptCacheAffinity.Fingerprint,
-				Expire: config.PromptCacheAffinity.Expire, TTL: config.PromptCacheAffinity.TTL,
-			},
-			ProactiveUpstreamSync: proactiveUpstreamSyncConfigDTO{
-				Billing:                   config.ProactiveUpstreamSync.Billing,
-				WebQuota:                  config.ProactiveUpstreamSync.WebQuota,
-				ModelCatalogCatchup:       config.ProactiveUpstreamSync.ModelCatalogCatchup,
-				AllowManualBillingRefresh: config.ProactiveUpstreamSync.AllowManualBillingRefresh,
-				AllowManualQuotaRefresh:   config.ProactiveUpstreamSync.AllowManualQuotaRefresh,
+			Accounts: &accountsConfigDTO{
+				MarkBuildForbiddenReauth:             boolPointer(config.Accounts.MarkBuildForbiddenReauth),
+				BuildForbiddenReauthCodes:            stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
+				ExcludeBuildBotFlaggedFromScheduling: boolPointer(config.Accounts.ExcludeBuildBotFlaggedFromScheduling),
+				AutoCleanReauthEnabled:               config.Accounts.AutoCleanReauthEnabled,
+				AutoCleanReauthInterval:              config.Accounts.AutoCleanReauthInterval,
+				AutoCleanReauthMinAge:                config.Accounts.AutoCleanReauthMinAge,
+				AutoCleanIncludeDisabled:             config.Accounts.AutoCleanIncludeDisabled,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{
@@ -317,4 +336,34 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 		},
 		UpdatedAt: value.UpdatedAt, Revision: value.Revision, RestartRequired: value.RestartRequired,
 	}
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func stringPointer(value string) *string { return &value }
+
+func boolPointer(value bool) *bool { return &value }
+
+func boolValue(value *bool) bool {
+	if value == nil {
+		return false
+	}
+	return *value
+}
+
+func stringSliceValue(value *[]string) []string {
+	if value == nil {
+		return nil
+	}
+	return append([]string(nil), (*value)...)
+}
+
+func stringSlicePointer(value []string) *[]string {
+	cloned := append([]string(nil), value...)
+	return &cloned
 }

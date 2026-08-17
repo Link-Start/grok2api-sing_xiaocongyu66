@@ -252,24 +252,23 @@ func (s *StickyStore) Set(_ context.Context, affinityKey string, accountID uint6
 }
 
 func pruneStickyBindingsLocked(shard *stickyShard, now time.Time) {
-	if len(shard.bindings) <= maxEntriesPerShard() {
-		return
-	}
-	for key, binding := range shard.bindings {
-		if !now.Before(binding.expiresAt) {
-			delete(shard.bindings, key)
-		}
-	}
-	for len(shard.bindings) > maxEntriesPerShard() {
-		var oldestKey string
-		var oldest time.Time
+	if len(shard.bindings) > maxEntriesPerShard() {
 		for key, binding := range shard.bindings {
-			if oldestKey == "" || binding.expiresAt.Before(oldest) {
-				oldestKey = key
-				oldest = binding.expiresAt
+			if !now.Before(binding.expiresAt) {
+				delete(shard.bindings, key)
 			}
 		}
-		delete(shard.bindings, oldestKey)
+		for len(shard.bindings) > maxEntriesPerShard() {
+			var oldestKey string
+			var oldest time.Time
+			for key, binding := range shard.bindings {
+				if oldestKey == "" || binding.expiresAt.Before(oldest) {
+					oldestKey = key
+					oldest = binding.expiresAt
+				}
+			}
+			delete(shard.bindings, oldestKey)
+		}
 	}
 }
 
@@ -279,6 +278,29 @@ func (s *StickyStore) DeleteByAccount(_ context.Context, accountID uint64) error
 		shard.mu.Lock()
 		for key, binding := range shard.bindings {
 			if binding.accountID == accountID {
+				delete(shard.bindings, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *StickyStore) DeleteByAccounts(_ context.Context, accountIDs []uint64) error {
+	ids := make(map[uint64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID != 0 {
+			ids[accountID] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for index := range s.shards {
+		shard := &s.shards[index]
+		shard.mu.Lock()
+		for key, binding := range shard.bindings {
+			if _, remove := ids[binding.accountID]; remove {
 				delete(shard.bindings, key)
 			}
 		}

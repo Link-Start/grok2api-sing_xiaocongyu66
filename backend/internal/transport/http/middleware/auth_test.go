@@ -23,6 +23,30 @@ func TestClientRuntimeStoreFailureUsesServiceUnavailable(t *testing.T) {
 	}
 }
 
+func TestQualityGuardAuthIsScopedBearerToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(QualityGuardAuth("scoped-secret"))
+	router.GET("/probe", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	for _, test := range []struct {
+		header string
+		status int
+	}{
+		{header: "Bearer scoped-secret", status: http.StatusNoContent},
+		{header: "Bearer wrong-secret", status: http.StatusUnauthorized},
+		{header: "", status: http.StatusUnauthorized},
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+		request.Header.Set("Authorization", test.header)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("header %q status = %d, want %d", test.header, response.Code, test.status)
+		}
+	}
+}
+
 func TestBearerTokenAcceptsCaseInsensitiveSchemeAndWhitespace(t *testing.T) {
 	token, ok := bearerToken("  bearer\tsecret-token  ")
 	if !ok || token != "secret-token" {
@@ -32,50 +56,5 @@ func TestBearerTokenAcceptsCaseInsensitiveSchemeAndWhitespace(t *testing.T) {
 		if _, ok := bearerToken(value); ok {
 			t.Fatalf("header %q unexpectedly accepted", value)
 		}
-	}
-}
-
-func TestExtractClientAPIKeyCustomHeader(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	const key = "g2a_15fc1704968b_vhHjniwKU_x3ROA1JbWo8U3G5YbMGFPT"
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("congyu_15fc", key)
-	c.Request = req
-
-	if got := extractClientAPIKey(c, []string{"congyu_15fc"}); got != key {
-		t.Fatalf("custom header key = %q", got)
-	}
-}
-
-func TestExtractClientAPIKeyPrefersBearerOverCustom(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer g2a_from_bearer_secret")
-	req.Header.Set("congyu_15fc", "g2a_from_custom_secret")
-	c.Request = req
-
-	if got := extractClientAPIKey(c, []string{"congyu_15fc"}); got != "g2a_from_bearer_secret" {
-		t.Fatalf("prefer bearer, got %q", got)
-	}
-}
-
-func TestExtractClientAPIKeyCustomHeaderBearerPrefix(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("congyu_15fc", "Bearer g2a_custom_bearer_value")
-	c.Request = req
-
-	if got := extractClientAPIKey(c, []string{"congyu_15fc"}); got != "g2a_custom_bearer_value" {
-		t.Fatalf("custom bearer-style header = %q", got)
-	}
-}
-
-func TestNormalizeAPIKeyHeadersDropsBuiltinsAndDupes(t *testing.T) {
-	got := normalizeAPIKeyHeaders([]string{" congyu_15fc ", "Authorization", "X-API-Key", "congyu_15fc", "My-Key"})
-	if len(got) != 2 || got[0] != "congyu_15fc" || got[1] != "My-Key" {
-		t.Fatalf("normalized = %#v", got)
 	}
 }

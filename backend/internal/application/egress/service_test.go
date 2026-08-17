@@ -1,16 +1,13 @@
 package egress
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
-	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 func TestSanitizeCloudflareCookiesDropsControlsAndNonCloudflareValues(t *testing.T) {
@@ -28,55 +25,15 @@ func TestNormalizeProxyURLValidatesStructure(t *testing.T) {
 		"http://user:password@127.0.0.1:8080", "https://proxy.example:8443",
 		"socks4://127.0.0.1:1080", "socks4a://proxy.example:1080",
 		"socks5://user:password@127.0.0.1:1080", "socks5h://user:password@proxy.example:1080",
-		"vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?security=tls&type=ws&path=%2F",
-		"trojan://secret@1.2.3.4:443?sni=example.com",
-		"hysteria2://secret@1.2.3.4:443?sni=example.com",
-		"hy2://secret@1.2.3.4:443",
-		"tuic://11111111-1111-1111-1111-111111111111:pass@1.2.3.4:443?sni=example.com",
-		"ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388",
-		"vmess://eyJhZGQiOiIxLjIuMy40In0=",
-		`{"type":"socks","tag":"p","server":"127.0.0.1","server_port":1080}`,
 	} {
 		value, err := NormalizeProxyURL(raw)
 		if err != nil || value == "" {
 			t.Fatalf("valid proxy %q = %q, err = %v", raw, value, err)
 		}
 	}
-	for _, invalid := range []string{"file:///tmp/proxy", "https://", "http://proxy.example/path", "http://proxy.example\r\nX-Leak: yes", "vmess://"} {
+	for _, invalid := range []string{"file:///tmp/proxy", "https://", "http://proxy.example/path", "http://proxy.example\r\nX-Leak: yes"} {
 		if _, err := NormalizeProxyURL(invalid); err == nil {
 			t.Fatalf("invalid proxy accepted: %q", invalid)
-		}
-	}
-}
-
-func TestProxyProtocolLabel(t *testing.T) {
-	if got := ProxyProtocolLabel(""); got != "" {
-		t.Fatalf("empty label = %q", got)
-	}
-	cases := map[string]string{
-		"socks5h://user:pass@1.2.3.4:1080":                                   "socks5h",
-		"vmess://eyJhZGQiOiIxLjIuMy40In0=":                                   "vmess",
-		"ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388":                      "ss",
-		"hy2://secret@1.2.3.4:443":                                           "hysteria2",
-		`{"type":"socks","tag":"p","server":"127.0.0.1","server_port":1080}`: "sing-box",
-	}
-	for raw, want := range cases {
-		got := ProxyProtocolLabel(raw)
-		if got != want {
-			t.Fatalf("ProxyProtocolLabel(%q) = %q, want %q", raw, got, want)
-		}
-		if strings.Contains(got, "user") || strings.Contains(got, "pass") || strings.Contains(got, "1.2.3.4") {
-			t.Fatalf("label leaked secret material: %q from %q", got, raw)
-		}
-	}
-}
-
-func TestBatchCreateNamesUsePrefixIndex(t *testing.T) {
-	prefix := "代理"
-	for i, want := range []string{"代理#1", "代理#2", "代理#3"} {
-		name := fmt.Sprintf("%s#%d", prefix, i+1)
-		if name != want {
-			t.Fatalf("name = %q, want %q", name, want)
 		}
 	}
 }
@@ -117,71 +74,141 @@ func TestBuildNodeAlwaysUsesProviderUserAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewService(nil, cipher, "web-agent", "console-agent")
+	service := NewService(nil, cipher, "browser-agent")
 	value, err := service.applyInput(domain.Node{UserAgent: "legacy-build-agent"}, Input{
 		Name: "build", Scope: domain.ScopeBuild, Enabled: true, UserAgent: "custom-build-agent",
 	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.UserAgent != "" || publicNode(value).UserAgent != "" {
+	if value.UserAgent != "" || service.publicNode(value).UserAgent != "" {
 		t.Fatalf("build node userAgent = %q", value.UserAgent)
 	}
-	if defaults := service.DefaultUserAgents(); defaults[string(domain.ScopeBuild)] != "" || defaults[string(domain.ScopeWeb)] != "web-agent" || defaults[string(domain.ScopeConsole)] != "console-agent" {
+	if defaults := service.DefaultUserAgents(); defaults[string(domain.ScopeBuild)] != "" || defaults[string(domain.ScopeWeb)] != "browser-agent" || defaults[string(domain.ScopeConsole)] != "browser-agent" || defaults[string(domain.ScopeWebAsset)] != "browser-agent" || defaults[string(domain.ScopeConsoleAsset)] != "browser-agent" {
 		t.Fatalf("default user agents = %#v", defaults)
 	}
 }
 
-func TestConsoleNodeUsesConsoleDefaultUserAgent(t *testing.T) {
+func TestConsoleNodeUsesBrowserDefaultUserAgent(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewService(nil, cipher, "web-agent", "console-agent")
+	service := NewService(nil, cipher, "browser-agent")
 	value, err := service.applyInput(domain.Node{}, Input{Name: "console", Scope: domain.ScopeConsole, Enabled: true}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.UserAgent != "console-agent" {
+	if value.UserAgent != "browser-agent" {
 		t.Fatalf("console node userAgent = %q", value.UserAgent)
 	}
 }
 
-type stubRuntime struct {
-	success, failure int64
-	inflight         int
-}
-
-func (s stubRuntime) RuntimeStats(uint64) (int64, int64, int, *time.Time, *bool, int64, string) {
-	return s.success, s.failure, s.inflight, nil, nil, 0, ""
-}
-func (stubRuntime) ProbeNode(context.Context, uint64) (domain.ProbeResult, error) {
-	return domain.ProbeResult{}, nil
-}
-func (stubRuntime) ProbeAll(context.Context, domain.Scope) ([]domain.ProbeResult, error) {
-	return nil, nil
-}
-
-func TestPublicNodeEnrichesRuntimeRates(t *testing.T) {
-	service := NewService(nil, nil, "", "")
-	service.SetRuntime(stubRuntime{success: 8, failure: 2, inflight: 1})
-	node := service.publicNode(domain.Node{ID: 7, Name: "p", Scope: domain.ScopeBuild, Enabled: true, Health: 1})
-	if node.SuccessCount != 8 || node.RequestCount != 10 || node.Inflight != 1 {
-		t.Fatalf("counts = success=%d request=%d inflight=%d", node.SuccessCount, node.RequestCount, node.Inflight)
+func TestConsoleAssetNodeUsesBrowserAgentButDropsClearanceCookie(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if node.SuccessRate != 0.8 || node.FailureRate != 0.2 {
-		t.Fatalf("rates = success=%v failure=%v", node.SuccessRate, node.FailureRate)
+	existingCookie, err := cipher.Encrypt("cf_clearance=legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(nil, cipher, "browser-agent")
+	value, err := service.applyInput(domain.Node{EncryptedCloudflareCookie: existingCookie}, Input{
+		Name: "console-assets", Scope: domain.ScopeConsoleAsset, Enabled: true,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.UserAgent != "browser-agent" || value.EncryptedCloudflareCookie != "" {
+		t.Fatalf("Console asset node identity = %#v", value)
 	}
 }
 
-func TestSortPublicNodesBySuccessRate(t *testing.T) {
-	values := []domain.PublicNode{
-		{ID: 1, SuccessRate: 0.2},
-		{ID: 2, SuccessRate: 0.9},
-		{ID: 3, SuccessRate: 0.5},
+func TestPublicNodeReportsAccountBoundProxy(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
 	}
-	sortPublicNodes(values, repository.SortQuery{Field: "successRate", Direction: repository.SortDescending})
-	if values[0].ID != 2 || values[2].ID != 1 {
-		t.Fatalf("sorted = %#v", values)
+	encryptedProxy, err := cipher.Encrypt("socks5h://Default.{account}:token@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(nil, cipher, "browser-agent")
+	cooldown := time.Now().UTC().Add(time.Minute)
+	public := service.publicNode(domain.Node{
+		Scope: domain.ScopeWeb, EncryptedProxyURL: encryptedProxy, Health: 0.2,
+		FailureCount: 3, CooldownUntil: &cooldown, LastError: "legacy failure",
+	})
+	if !public.AccountBoundProxy {
+		t.Fatal("Resin proxy was not reported as account-bound")
+	}
+	if !public.ProxyPool {
+		t.Fatal("account-bound proxy was not reported as a proxy pool")
+	}
+	if public.Health != 1 || public.FailureCount != 0 || public.CooldownUntil != nil || public.LastError != "" {
+		t.Fatalf("proxy pool exposed obsolete node health: %#v", public)
+	}
+	if service.publicNode(domain.Node{Scope: domain.ScopeWeb}).AccountBoundProxy {
+		t.Fatal("direct node was reported as account-bound")
+	}
+}
+
+func TestApplyInputResetsHealthOnlyWhenEgressConfigurationChanges(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(nil, cipher, "browser-agent")
+	cooldown := time.Now().UTC().Add(time.Minute)
+	base := domain.Node{
+		Name: "node", Scope: domain.ScopeWeb, Enabled: true, Health: 0.2,
+		FailureCount: 4, CooldownUntil: &cooldown, LastError: "transport error",
+	}
+
+	renamed, err := service.applyInput(base, Input{Name: "renamed", Scope: domain.ScopeWeb, Enabled: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.Health != base.Health || renamed.FailureCount != base.FailureCount || renamed.CooldownUntil == nil || renamed.LastError != base.LastError {
+		t.Fatalf("name-only edit reset health: %#v", renamed)
+	}
+	legacyPool := base
+	legacyPool.ProxyPool = true
+	legacyPool.EncryptedProxyURL, err = cipher.Encrypt("socks5h://proxy.example:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := service.applyInput(legacyPool, Input{Name: "renamed", Scope: domain.ScopeWeb, Enabled: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preserved.ProxyPool {
+		t.Fatal("an update without proxyPool disabled the existing mode")
+	}
+
+	proxyURL := "socks5h://proxy.example:1080"
+	proxyPool := true
+	changed, err := service.applyInput(base, Input{Name: "node", Scope: domain.ScopeWeb, Enabled: true, ProxyPool: &proxyPool, ProxyURL: &proxyURL}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Health != 1 || changed.FailureCount != 0 || changed.CooldownUntil != nil || changed.LastError != "" || !changed.ProxyPool {
+		t.Fatalf("egress configuration did not reset health: %#v", changed)
+	}
+}
+
+func TestProxyPoolRequiresConfiguredProxy(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(nil, cipher, "browser-agent")
+	proxyPool := true
+	_, err = service.applyInput(domain.Node{}, Input{
+		Name: "pool", Scope: domain.ScopeBuild, Enabled: true, ProxyPool: &proxyPool,
+	}, true)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("proxy pool without a proxy error = %v", err)
 	}
 }

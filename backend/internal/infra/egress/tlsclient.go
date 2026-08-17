@@ -3,8 +3,11 @@ package egress
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,10 +17,9 @@ import (
 	"github.com/bogdanfinn/websocket"
 )
 
-type browserClient struct {
-	inner tlsclient.HttpClient
-	close func()
-}
+type browserClient struct{ inner tlsclient.HttpClient }
+
+var chromeMajorPattern = regexp.MustCompile(`(?i)Chrome/(\d+)`)
 
 func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhttp.Header, handshakeTimeout time.Duration) (*websocket.Conn, *fhttp.Response, error) {
 	if l == nil || l.browser == nil {
@@ -30,7 +32,13 @@ func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhtt
 			NetDialContext:    l.browser.inner.GetDialer().DialContext,
 		}
 		connection, response, err := dialer.DialContext(ctx, endpoint, headers)
-		if err == nil || !l.sticky || attempt >= stickyProxyRetryLimit || !safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
+		if err == nil || !l.proxyPool || attempt >= proxyPoolRetryLimit || !safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
+			if l.proxyPool && safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
+				l.browser.CloseIdleConnections()
+			}
+			if response != nil && response.StatusCode == http.StatusForbidden && l.clearanceManager != nil && l.clearanceKey != "" {
+				l.clearanceManager.invalidateClearanceKey(l.clearanceKey, l.client)
+			}
 			return connection, response, err
 		}
 		if response != nil && response.Body != nil {
@@ -47,30 +55,46 @@ func fhttpResponseAsHTTP(response *fhttp.Response) *http.Response {
 	return &http.Response{StatusCode: response.StatusCode, Header: http.Header(response.Header), Body: response.Body}
 }
 
-func newBrowserClient(proxyURL string) (*browserClient, error) {
+func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(7200),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithClientProfile(browserProfile(userAgent)),
 		tlsclient.WithNotFollowRedirects(),
 	}
-	var closeFn func()
-	if strings.TrimSpace(proxyURL) != "" {
-		// Route browser TLS through in-process sing-box instead of tls-client's own proxy stack.
-		dialer, err := openProxyDialer(proxyURL)
-		if err != nil {
-			return nil, err
-		}
-		closeFn = dialer.Close
-		options = append(options, tlsclient.WithDialContext(dialer.DialContext))
+	if proxyURL != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxyURL))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {
-		if closeFn != nil {
-			closeFn()
-		}
 		return nil, err
 	}
-	return &browserClient{inner: client, close: closeFn}, nil
+	return &browserClient{inner: client}, nil
+}
+
+func browserProfile(userAgent string) profiles.ClientProfile {
+	match := chromeMajorPattern.FindStringSubmatch(strings.TrimSpace(userAgent))
+	if len(match) == 2 {
+		if profile, ok := profiles.MappedTLSClients["chrome_"+match[1]]; ok {
+			return profile
+		}
+		major, err := strconv.Atoi(match[1])
+		if err == nil {
+			bestMajor, bestDistance := 0, int(^uint(0)>>1)
+			for _, candidate := range []int{146, 144, 133, 131, 124, 120, 117} {
+				distance := candidate - major
+				if distance < 0 {
+					distance = -distance
+				}
+				if distance < bestDistance {
+					bestMajor, bestDistance = candidate, distance
+				}
+			}
+			if profile, ok := profiles.MappedTLSClients[fmt.Sprintf("chrome_%d", bestMajor)]; ok {
+				return profile
+			}
+		}
+	}
+	return profiles.Chrome_146
 }
 
 func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
@@ -86,8 +110,6 @@ func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
 }
 
 func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
-	// Always clone headers so callers cannot mutate the fhttp response map (Trailer may still
-	// receive deferred keys after body EOF and must keep the same map reference).
 	header := http.Header(fresponse.Header).Clone()
 	contentLength := fresponse.ContentLength
 	if fresponse.Uncompressed {
@@ -95,24 +117,19 @@ func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
 		header.Del("Content-Length")
 		contentLength = -1
 	}
+	transferEncoding := append([]string(nil), fresponse.TransferEncoding...)
 	return &http.Response{
 		Status: fresponse.Status, StatusCode: fresponse.StatusCode, Proto: fresponse.Proto,
 		ProtoMajor: fresponse.ProtoMajor, ProtoMinor: fresponse.ProtoMinor, Header: header,
-		Body: fresponse.Body, ContentLength: contentLength, TransferEncoding: append([]string(nil), fresponse.TransferEncoding...),
+		Body: fresponse.Body, ContentLength: contentLength, TransferEncoding: transferEncoding,
+		// fhttp 在读取 Body 到 EOF 时原地填充 Trailer，因此这里必须保留共享 map。
 		Close: fresponse.Close, Uncompressed: fresponse.Uncompressed, Trailer: http.Header(fresponse.Trailer),
 	}
 }
 
 func (c *browserClient) CloseIdleConnections() {
-	if c == nil {
-		return
-	}
-	if c.inner != nil {
+	if c != nil && c.inner != nil {
 		c.inner.CloseIdleConnections()
-	}
-	if c.close != nil {
-		c.close()
-		c.close = nil
 	}
 }
 
