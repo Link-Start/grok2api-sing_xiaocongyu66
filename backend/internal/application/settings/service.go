@@ -574,7 +574,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
 		SyncConcurrency: input.Batch.SyncConcurrency, RefreshConcurrency: input.Batch.RefreshConcurrency,
-		DBBuffer: config.DBBufferConfig{Enabled: input.Batch.DBBuffer.Enabled, Driver: input.Batch.DBBuffer.Driver, Path: input.Batch.DBBuffer.Path},
+		DBBuffer: normalizeDBBuffer(input.Batch.DBBuffer),
 	}
 	next.Media.MaxImageBytes = input.Media.MaxImageBytes
 	next.Media.MaxTotalBytes = input.Media.MaxTotalBytes
@@ -597,7 +597,11 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Routing.PromptCacheAffinity.Fingerprint = input.Routing.PromptCacheAffinity.Fingerprint
 	next.Routing.PromptCacheAffinity.Expire = input.Routing.PromptCacheAffinity.Expire
 	if strings.TrimSpace(input.Routing.PromptCacheAffinity.TTL) != "" {
-		next.Routing.PromptCacheAffinity.TTL = config.Duration(parseDurationOrKeep(input.Routing.PromptCacheAffinity.TTL, next.Routing.PromptCacheAffinity.TTL))
+		d, err := time.ParseDuration(strings.TrimSpace(input.Routing.PromptCacheAffinity.TTL))
+		if err != nil {
+			return config.Config{}, fmt.Errorf("routing.promptCacheAffinity.ttl 必须是有效时长")
+		}
+		next.Routing.PromptCacheAffinity.TTL = config.Duration(d)
 	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -782,4 +786,12 @@ func parseDurationOrKeep(s string, fallback config.Duration) time.Duration {
 		return time.Duration(fallback)
 	}
 	return d
+}
+
+func normalizeDBBuffer(in DBBufferConfig) config.DBBufferConfig {
+	driver := strings.ToLower(strings.TrimSpace(in.Driver))
+	if !in.Enabled || driver == "" || driver == "none" {
+		return config.DBBufferConfig{Enabled: false, Driver: "none", Path: in.Path}
+	}
+	return config.DBBufferConfig{Enabled: true, Driver: driver, Path: in.Path}
 }
