@@ -9,10 +9,11 @@ const ClientKeysPage = lazyNamed(() => import("@/features/client-keys/client-key
 const CreativeConsolePage = lazyNamed(() => import("@/features/creative-console/creative-console-page"), "CreativeConsolePage");
 const DashboardPage = lazyNamed(() => import("@/features/dashboard/dashboard-page"), "DashboardPage");
 const ApiDocsPage = lazyNamed(() => import("@/features/docs/api-docs-page"), "ApiDocsPage");
+const FilesPage = lazyNamed(() => import("@/features/media/files-page"), "FilesPage");
 const GalleryPage = lazyNamed(() => import("@/features/media/gallery-page"), "GalleryPage");
 const VideoGalleryPage = lazyNamed(() => import("@/features/media/video-gallery-page"), "VideoGalleryPage");
 const ModelsPage = lazyNamed(() => import("@/features/models/models-page"), "ModelsPage");
-const QualityGuardPage = lazyNamed(() => import("@/features/quality-guard/quality-guard-page"), "QualityGuardPage");
+const ProxiesPage = lazyNamed(() => import("@/features/proxies/proxies-page"), "ProxiesPage");
 const SettingsPage = lazyNamed(() => import("@/features/settings/settings-page"), "SettingsPage");
 
 function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(loader: () => Promise<T>, exportName: K): LazyExoticComponent<T[K]> {
@@ -39,10 +40,6 @@ export function DeferredModelsPage() {
   return <DeferredPage page={ModelsPage} />;
 }
 
-export function DeferredQualityGuardPage() {
-  return <DeferredPage page={QualityGuardPage} />;
-}
-
 export function DeferredClientKeysPage() {
   return <DeferredPage page={ClientKeysPage} />;
 }
@@ -55,6 +52,10 @@ export function DeferredRequestAuditsPage() {
   return <DeferredPage page={RequestAuditsPage} />;
 }
 
+export function DeferredFilesPage() {
+  return <DeferredPage page={FilesPage} />;
+}
+
 export function DeferredGalleryPage() {
   return <DeferredPage page={GalleryPage} />;
 }
@@ -65,6 +66,10 @@ export function DeferredVideoGalleryPage() {
 
 export function DeferredApiDocsPage() {
   return <DeferredPage page={ApiDocsPage} />;
+}
+
+export function DeferredProxiesPage() {
+  return <DeferredPage page={ProxiesPage} />;
 }
 
 export function DeferredSettingsPage() {
