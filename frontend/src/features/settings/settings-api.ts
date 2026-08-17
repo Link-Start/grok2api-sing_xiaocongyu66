@@ -456,7 +456,7 @@ export function createEgressNodesBatch(input: { namePrefix: string; scope: Egres
   return importEgressText({ name: input.namePrefix, scope: input.scope, accountCapacity: 0, content: input.proxyText }).then((r) => ({ created: r.imported, failed: r.failed, errors: [] as string[] }));
 }
 
-export function getEgressReport(_scope?: EgressScope): Promise<{ total: number; healthy: number; unhealthy: number }> {
+export function getEgressReport(): Promise<{ total: number; healthy: number; unhealthy: number }> {
   return listEgressNodes({ scope }).then((dto) => ({
     total: dto.items.length,
     healthy: dto.items.filter((n: EgressNodeDTO) => n.enabled).length,
@@ -468,7 +468,7 @@ export function setEgressNodesEnabled(ids: string[], enabled: boolean): Promise<
   return updateEgressNodesEnabled(ids, enabled).then((r) => ({ ...r, enabled }));
 }
 
-export function testAllEgressNodes(_scope?: EgressScope): Promise<{ passed: number; failed: number; total: number }> {
+export function testAllEgressNodes(): Promise<{ passed: number; failed: number; total: number }> {
   return testEgressNodes().then((r: EgressProbeBatchResultDTO) => {
     const total = r.requested;
     const passed = r.healthy;
