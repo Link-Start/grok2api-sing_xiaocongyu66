@@ -145,7 +145,7 @@ export type SettingsForm = z.infer<typeof settingsSchema>;
 
 export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
   return {
-    providerBuild: { ...config.providerBuild, tokenAuth: "" },
+    providerBuild: { ...config.providerBuild, tokenAuth: "", responseHeaderTimeout: parseDuration(config.providerBuild.responseHeaderTimeout) },
     providerWeb: {
       ...config.providerWeb,
       statsigManualValue: "",
@@ -202,7 +202,7 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
 
 export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
   return {
-    providerBuild: config.providerBuild,
+    providerBuild: { ...config.providerBuild, responseHeaderTimeout: formatDuration(config.providerBuild.responseHeaderTimeout) },
     providerWeb: {
       ...config.providerWeb,
       quotaTimeout: formatDuration(config.providerWeb.quotaTimeout), chatTimeout: formatDuration(config.providerWeb.chatTimeout),
