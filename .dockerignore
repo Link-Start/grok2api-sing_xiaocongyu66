@@ -29,6 +29,9 @@ backend/**/*_test.go
 !docker/
 !docker/entrypoint.sh
 
+!third_party/
+!third_party/**
+
 !tools/
 !tools/egress-quality-guard/
 !tools/egress-quality-guard/quality_guard.py
