@@ -16,26 +16,84 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  clearEgressNodesErrors,
-  createEgressNode,
-  createEgressNodesBatch,
   deleteEgressNode,
-  EGRESS_SCOPES,
-  getEgressReport,
-  listEgressNodes,
-  setEgressNodesEnabled,
-  testAllEgressNodes,
-  testEgressNode,
-  updateEgressNode,
-  type EgressNodeDTO,
-  type EgressNodeInput,
+  createEgressNode as apiCreateEgressNode,
+  deleteEgressNodes,
+  listEgressNodes as apiListEgressNodes,
+  updateEgressNodesEnabled,
+  testEgressNode as apiTestEgressNode,
+  testEgressNodes,
+  updateEgressNode as apiUpdateEgressNode,
+  type EgressNodeDTO as UpstreamEgressNodeDTO,
+  type EgressNodeInput as UpstreamEgressNodeInput,
   type EgressScope,
 } from "@/features/settings/settings-api";
+import { apiRequest } from "@/shared/api/client";
 import { ErrorState } from "@/shared/components/data-state";
 import { SortableTableHead } from "@/shared/components/sortable-table-head";
 import { cn } from "@/shared/lib/cn";
 import { formatDateTime } from "@/shared/lib/format";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
+
+type EgressNodeDTO = UpstreamEgressNodeDTO & {
+  scopes?: EgressScope[];
+  health?: number;
+  failureCount?: number;
+  successRate?: number;
+  failureRate?: number;
+  requestCount?: number;
+};
+
+type EgressNodeInput = UpstreamEgressNodeInput & {
+  scopes?: EgressScope[];
+};
+
+const EGRESS_SCOPES: EgressScope[] = ["grok_build", "grok_web", "grok_console", "grok_web_asset"];
+
+function listEgressNodes(sortBy?: string, sortOrder?: SortOrder): Promise<{ items: EgressNodeDTO[]; defaultUserAgents: Record<EgressScope, string> }> {
+  return apiListEgressNodes({ sortBy, sortOrder }).then((dto) => ({ items: dto.items as EgressNodeDTO[], defaultUserAgents: (dto as any).defaultUserAgents ?? {} }));
+}
+
+function getEgressReport(): Promise<{ totalNodes: number; enabledNodes: number; proxyNodes: number; healthyNodes: number; requestCount: number; successCount: number; failureCount: number; successRate: number; failureRate: number; items: EgressNodeDTO[] }> {
+  return apiListEgressNodes().then((dto) => {
+    const items = dto.items as EgressNodeDTO[];
+    return {
+      totalNodes: items.length,
+      enabledNodes: items.filter((n) => n.enabled).length,
+      proxyNodes: items.filter((n) => n.proxyConfigured).length,
+      healthyNodes: items.filter((n) => n.probeStatus === "healthy").length,
+      requestCount: 0, successCount: 0, failureCount: 0, successRate: 0, failureRate: 0, items,
+    };
+  });
+}
+
+function createEgressNode(input: EgressNodeInput): Promise<EgressNodeDTO> {
+  return apiCreateEgressNode(input);
+}
+
+function updateEgressNode(id: string, input: EgressNodeInput): Promise<EgressNodeDTO> {
+  return apiUpdateEgressNode(id, input);
+}
+
+function setEgressNodesEnabled(ids: string[], enabled: boolean): Promise<{ updated: number; enabled: boolean }> {
+  return updateEgressNodesEnabled(ids, enabled).then((r) => ({ ...r, enabled }));
+}
+
+function testEgressNode(id: string): Promise<{ ok: boolean; name: string; latencyMs: number; error?: string }> {
+  return apiTestEgressNode(id).then((r) => ({ ok: r.status === "healthy", name: id, latencyMs: r.latencyMs, error: r.error }));
+}
+
+function testAllEgressNodes(): Promise<{ passed: number; failed: number; total: number }> {
+  return testEgressNodes().then((r) => ({ passed: r.healthy, failed: r.unhealthy, total: r.requested }));
+}
+
+function clearEgressNodesErrors(ids: string[]): Promise<{ cleared: number }> {
+  return apiRequest("/api/admin/v1/egress-nodes/clear-errors", { method: "POST", body: { ids } }, () => ({ cleared: ids.length }));
+}
+
+function createEgressNodesBatch(input: { namePrefix: string; scope: EgressScope; scopes?: EgressScope[]; enabled?: boolean; proxyText: string; userAgent?: string; cloudflareCookies?: string }): Promise<{ created: number; failed: number; errors: string[] }> {
+  return apiRequest("/api/admin/v1/egress-nodes/import", { method: "POST", body: { name: input.namePrefix, scope: input.scope, content: input.proxyText, enabled: input.enabled ?? true } }, () => ({ created: 1, failed: 0, errors: [] as string[] }));
+}
 
 const emptyInput: EgressNodeInput = {
   name: "",
@@ -221,11 +279,8 @@ export function ProxiesPage() {
     onSettled: () => setTestingId(null),
     onSuccess: (result) => {
       invalidateAll();
-      const ok = result.status === "healthy";
-      const node = listQuery.data?.items.find((n) => n.id === testingId);
-      const name = node?.name ?? "node";
-      if (ok) toast.success(t("proxies.testPassed", { name, ms: result.latencyMs }));
-      else toast.error(t("proxies.testFailed", { name, error: localizeProbeError(result.error || "failed", t) }));
+      if (result.ok) toast.success(t("proxies.testPassed", { name: result.name, ms: result.latencyMs }));
+      else toast.error(t("proxies.testFailed", { name: result.name, error: localizeProbeError(result.error || "failed", t) }));
     },
     onError: (error) => showError(error, t("proxies.operationFailed")),
   });
