@@ -62,6 +62,9 @@ func (r *bulkBufferRepoStub) ListEnabledAccountIDs(context.Context, accountdomai
 func (r *bulkBufferRepoStub) ReplaceQuotaWindowGroup(context.Context, uint64, time.Time, []string, []accountdomain.QuotaWindow) error {
 	return nil
 }
+func (r *bulkBufferRepoStub) TouchLastUsed(context.Context, uint64, time.Time) error {
+	return nil
+}
 func (r *bulkBufferRepoStub) ListFailedAccountIDs(context.Context, accountdomain.Provider, bool, int) ([]uint64, error) {
 	return nil, nil
 }
