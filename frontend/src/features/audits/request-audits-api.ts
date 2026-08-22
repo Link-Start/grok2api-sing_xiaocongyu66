@@ -5,25 +5,44 @@ import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type AuditPeriod = PeriodValue;
 
+export type AuditBillingComponentDTO = {
+  kind: "uncached_input" | "cached_input" | "output" | "input_image" | "output_image" | "output_second";
+  unit: "token" | "image" | "second";
+  quantity: number;
+  unitPriceInUsdTicks: number;
+  subtotalInUsdTicks: number;
+};
+
+export type AuditBillingBreakdownDTO = {
+  source: "upstream" | "official";
+  method: "upstream_reported" | "official_rates" | "stored_estimate";
+  model?: string;
+  version?: string;
+  tier?: "standard" | "long_context" | "media";
+  components: AuditBillingComponentDTO[];
+  totalInUsdTicks: number;
+};
+
 export type AuditDTO = {
   id: string;
   requestId: string;
   clientKeyId: string;
   clientKeyName?: string;
+  clientIp?: string;
   modelRouteId: string;
   modelPublicId?: string;
-  clientModel?: string;
-  reasoningEffort?: string;
   modelUpstreamModel?: string;
   provider: "grok_build" | "grok_web" | "grok_console";
-  operation: "responses" | "chat" | "messages" | "image" | "image_edit" | "video";
+  operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "tts" | "stt" | "realtime" | "voice";
   usageSource: "upstream" | "estimated" | "none";
+  reasoningEffort?: "auto" | "none" | "low" | "medium" | "high" | "xhigh" | "fixed";
   accountId?: string;
   accountName?: string;
   egressNodeId?: string;
   egressNodeName?: string;
-  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset";
+  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset" | "grok_console_asset";
   egressMode?: "direct" | "proxy";
+  // 0 表示已返回 2xx 响应头但流随后失败（如首字节超时/流式中断），不属于任何 HTTP 状态段。
   statusCode: number;
   streaming: boolean;
   mediaInputImages: number;
@@ -38,16 +57,19 @@ export type AuditDTO = {
   estimatedCostInUsdTicks: number;
   pricingModel?: string;
   pricingVersion?: string;
+  billing?: AuditBillingBreakdownDTO;
   numSourcesUsed: number;
   numServerSideToolsUsed: number;
   contextInputTokens: number;
   contextOutputTokens: number;
+  firstTokenMs?: number;
+  outputTokensPerSecond?: number;
   durationMs: number;
   errorCode?: string;
+  requestMethod?: string;
+  requestPath?: string;
+  requestHeaders?: Record<string, string[]>;
   attemptCount: number;
-  clientType?: string;
-  clientUserAgent?: string;
-  clientIp?: string;
   createdAt: string;
 };
 
@@ -112,22 +134,31 @@ export type AuditSummaryDTO = {
   };
 };
 
+const auditBillingComponentValidator = hasShape({
+  kind: isOneOf("uncached_input", "cached_input", "output", "input_image", "output_image", "output_second"),
+  unit: isOneOf("token", "image", "second"), quantity: isNumber, unitPriceInUsdTicks: isNumber, subtotalInUsdTicks: isNumber,
+});
+const auditBillingValidator = hasShape({
+  source: isOneOf("upstream", "official"), method: isOneOf("upstream_reported", "official_rates", "stored_estimate"),
+  model: isOptional(isString), version: isOptional(isString), tier: isOptional(isOneOf("standard", "long_context", "media")),
+  components: isArrayOf(auditBillingComponentValidator), totalInUsdTicks: isNumber,
+});
 const auditValidator = hasShape({
-  id: isString, requestId: isString, clientKeyId: isString, clientKeyName: isOptional(isString), modelRouteId: isString,
-  modelPublicId: isOptional(isString), clientModel: isOptional(isString), reasoningEffort: isOptional(isString),
-  modelUpstreamModel: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
-  operation: isOneOf("responses", "chat", "messages", "image", "image_edit", "video"), usageSource: isOneOf("upstream", "estimated", "none"),
+  id: isString, requestId: isString, clientKeyId: isString, clientKeyName: isOptional(isString), clientIp: isOptional(isString), modelRouteId: isString,
+  modelPublicId: isOptional(isString), modelUpstreamModel: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
+  operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video", "tts", "stt", "realtime", "voice"), usageSource: isOneOf("upstream", "estimated", "none"),
+  reasoningEffort: isOptional(isOneOf("auto", "none", "low", "medium", "high", "xhigh", "fixed")),
   accountId: isOptional(isString), accountName: isOptional(isString),
   egressNodeId: isOptional(isString), egressNodeName: isOptional(isString),
-  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
+  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
   statusCode: isNumber, streaming: isBoolean,
   mediaInputImages: isNumber, mediaOutputImages: isNumber, mediaOutputSeconds: isNumber, inputTokens: isNumber,
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,
-  costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString),
+  costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString), billing: isOptional(auditBillingValidator),
   numSourcesUsed: isNumber, numServerSideToolsUsed: isNumber, contextInputTokens: isNumber, contextOutputTokens: isNumber,
-  durationMs: isNumber, errorCode: isOptional(isString), attemptCount: isNumber,
-  clientType: isOptional(isString), clientUserAgent: isOptional(isString), clientIp: isOptional(isString),
-  createdAt: isString,
+  firstTokenMs: isOptional(isNumber), outputTokensPerSecond: isOptional(isNumber),
+  durationMs: isNumber, errorCode: isOptional(isString), requestMethod: isOptional(isString), requestPath: isOptional(isString),
+  requestHeaders: isOptional(isRecordOf(isArrayOf(isString))), attemptCount: isNumber, createdAt: isString,
 });
 const auditAttemptValidator = hasShape({
   id: isString, number: isNumber, source: isOneOf("upstream_http", "gateway_transport", "credential"), stage: isString,
@@ -169,7 +200,7 @@ type AuditQuery = {
   sortOrder?: SortOrder;
 };
 
-export function getRequestAudits(input: AuditQuery): Promise<AuditCursorPageDTO> {
+export function getRequestAudits(input: AuditQuery, signal?: AbortSignal): Promise<AuditCursorPageDTO> {
   const query = new URLSearchParams({ pagination: "cursor", pageSize: String(input.pageSize ?? 50), period: input.period });
   if (input.cursor) query.set("cursor", input.cursor);
   if (input.search) query.set("search", input.search);
@@ -182,10 +213,10 @@ export function getRequestAudits(input: AuditQuery): Promise<AuditCursorPageDTO>
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
   }
-  return apiRequest(`/api/admin/v1/request-audits?${query}`, {}, decodeAuditPage);
+  return apiRequest(`/api/admin/v1/request-audits?${query}`, { signal }, decodeAuditPage);
 }
 
-export function getRequestAuditSummary(input: Omit<AuditQuery, "cursor" | "pageSize">, refresh = false): Promise<AuditSummaryDTO> {
+export function getRequestAuditSummary(input: Omit<AuditQuery, "cursor" | "pageSize">, refresh = false, signal?: AbortSignal): Promise<AuditSummaryDTO> {
   const query = new URLSearchParams({ period: input.period });
   if (input.search) query.set("search", input.search);
   if (input.model) query.set("model", input.model);
@@ -194,9 +225,9 @@ export function getRequestAuditSummary(input: Omit<AuditQuery, "cursor" | "pageS
   if (input.key) query.set("key", input.key);
   if (input.account) query.set("account", input.account);
   if (refresh) query.set("refresh", "1");
-  return apiRequest(`/api/admin/v1/request-audits/summary?${query}`, {}, decodeAuditSummary);
+  return apiRequest(`/api/admin/v1/request-audits/summary?${query}`, { signal }, decodeAuditSummary);
 }
 
-export function getRequestAudit(id: string): Promise<AuditDetailDTO> {
-  return apiRequest(`/api/admin/v1/request-audits/${id}`, {}, decodeAuditDetail);
+export function getRequestAudit(id: string, signal?: AbortSignal): Promise<AuditDetailDTO> {
+  return apiRequest(`/api/admin/v1/request-audits/${id}`, { signal }, decodeAuditDetail);
 }

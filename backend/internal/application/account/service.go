@@ -60,7 +60,9 @@ const (
 	credentialRefreshTimeout        time.Duration = 30 * time.Second
 	credentialRefreshStateTTL       time.Duration = 5 * time.Second
 	credentialStateWriteTimeout     time.Duration = 5 * time.Second
+	credentialConfigurationRetry    time.Duration = 30 * time.Minute
 	credentialRefreshBatchSize                    = 100
+	credentialUnclassifiedAuthLimit               = 5
 	managedTaskWorkerCeiling                      = 50
 	quotaRefreshQueueSize                         = 4096
 	quotaRefreshTimeout                           = 30 * time.Second
@@ -78,6 +80,7 @@ const (
 	maxCredentialExportAccounts                   = 10000
 	maxCredentialImportAccounts                   = 10000
 	credentialImportChunkSize                     = 100
+	credentialImportPrepareWorkers                = 3
 	maxQuotaResetAccounts                         = 10000
 	quotaResetChunkSize                           = 500
 	maxBatchUpdateAccounts                        = 10000
@@ -136,6 +139,7 @@ type quotaRefreshRequest struct {
 type quotaRefreshResult struct {
 	Credential accountdomain.Credential
 	Windows    []accountdomain.QuotaWindow
+	Modes      []string
 }
 
 type QuotaRefreshStats struct {
@@ -184,6 +188,10 @@ type View struct {
 	QuotaWindows       []accountdomain.QuotaWindow
 	BuildBotFlagged    bool
 	BuildBotFlagSource int
+	// EnabledChanged is request-scoped update metadata. It is not persisted or
+	// serialized directly; the HTTP layer uses it to avoid warning when a PATCH
+	// merely repeats the account's existing enabled value.
+	EnabledChanged bool
 }
 
 type UpdateInput struct {
@@ -221,6 +229,7 @@ type ImportResult struct {
 	Created    int
 	Updated    int
 	Skipped    int
+	Failed     int
 	AccountIDs []uint64
 }
 
@@ -1417,6 +1426,7 @@ func (s *Service) importCredentialDocumentsWithProgress(ctx context.Context, ada
 	seeds := make([]provider.CredentialSeed, 0)
 	seen := make(map[string]struct{})
 	parsedAccounts := 0
+	skipped := 0
 	for index, document := range documents {
 		values, err := adapter.ParseImportedCredentials(document)
 		if err != nil {
@@ -1433,6 +1443,7 @@ func (s *Service) importCredentialDocumentsWithProgress(ctx context.Context, ada
 			if value.SourceKey != "" {
 				key := string(value.Provider) + "\x00" + value.SourceKey
 				if _, exists := seen[key]; exists {
+					skipped++
 					continue
 				}
 				seen[key] = struct{}{}
@@ -1440,17 +1451,141 @@ func (s *Service) importCredentialDocumentsWithProgress(ctx context.Context, ada
 			seeds = append(seeds, value)
 		}
 	}
-	return s.persistImportedSeeds(ctx, seeds, observer, progress)
+	var result ImportResult
+	var err error
+	if preparer, ok := adapter.(provider.CredentialImportPreparer); ok && hasRefreshTokenOnlySeed(seeds) {
+		result, err = s.persistPreparedImportedSeeds(ctx, seeds, preparer, observer, progress)
+	} else {
+		result, err = s.persistImportedSeeds(ctx, seeds, observer, progress)
+	}
+	result.Skipped += skipped
+	return result, err
 }
 
-func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.CredentialSeed, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+func hasRefreshTokenOnlySeed(seeds []provider.CredentialSeed) bool {
+	for _, seed := range seeds {
+		if strings.TrimSpace(seed.AccessToken) == "" && strings.TrimSpace(seed.RefreshToken) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) persistPreparedImportedSeeds(ctx context.Context, seeds []provider.CredentialSeed, preparer provider.CredentialImportPreparer, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
 	result := ImportResult{AccountIDs: make([]uint64, 0, len(seeds))}
 	if progress != nil {
 		if err := progress(0, len(seeds)); err != nil {
+			return result, err
+		}
+	}
+	prepareCtx, cancelPrepare := context.WithCancel(ctx)
+	defer cancelPrepare()
+	var (
+		mu        sync.Mutex
+		firstErr  error
+		completed int
+		persisted bool
+		seen      = make(map[string]struct{}, len(seeds))
+	)
+	_, batchErr := batch.ForEachObserved(prepareCtx, seeds, batch.Options{Workers: credentialImportPrepareWorkers}, func(itemCtx context.Context, seed provider.CredentialSeed) (provider.CredentialSeed, error) {
+		if strings.TrimSpace(seed.AccessToken) == "" && strings.TrimSpace(seed.RefreshToken) != "" {
+			return preparer.PrepareImportedCredential(itemCtx, seed)
+		}
+		return seed, nil
+	}, func(index int, item batch.Result[provider.CredentialSeed]) {
+		mu.Lock()
+		defer mu.Unlock()
+		completed++
+		if !item.Completed || item.Err != nil {
+			result.Failed++
+			if item.Err != nil {
+				s.logger.Warn("account_rt_import_failed", "index", index+1, "error", item.Err)
+			}
+			reportCredentialImportProgress(progress, completed, len(seeds), &firstErr, cancelPrepare)
+			return
+		}
+		seed := item.Value
+		if seed.SourceKey != "" {
+			key := string(seed.Provider) + "\x00" + seed.SourceKey
+			if _, exists := seen[key]; exists {
+				result.Skipped++
+				reportCredentialImportProgress(progress, completed, len(seeds), &firstErr, cancelPrepare)
+				return
+			}
+			seen[key] = struct{}{}
+		}
+
+		// OAuth providers may invalidate the submitted refresh token as soon as
+		// they return its replacement. Persist that replacement before any
+		// request-scoped observer or progress callback can abort the import.
+		persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+		stored, err := s.persistImportedSeed(persistCtx, seed)
+		cancelPersist()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			cancelPrepare()
+			return
+		}
+		persisted = true
+		result.AccountIDs = append(result.AccountIDs, stored.ID)
+		if stored.Created {
+			result.Created++
+		} else {
+			result.Updated++
+		}
+		if firstErr == nil && observer != nil {
+			if err := observer(stored.ID); err != nil {
+				firstErr = err
+				cancelPrepare()
+			}
+		}
+		reportCredentialImportProgress(progress, completed, len(seeds), &firstErr, cancelPrepare)
+	})
+	if persisted {
+		s.WakeCredentialRefresh()
+	}
+	return result, errors.Join(firstErr, batchErr)
+}
+
+func reportCredentialImportProgress(progress BatchProgressObserver, completed, total int, firstErr *error, cancel context.CancelFunc) {
+	if progress == nil || *firstErr != nil {
+		return
+	}
+	if err := progress(completed, total); err != nil {
+		*firstErr = err
+		cancel()
+	}
+}
+
+func (s *Service) persistImportedSeed(ctx context.Context, seed provider.CredentialSeed) (repository.AccountUpsertResult, error) {
+	value, err := s.credentialFromSeed(seed)
+	if err != nil {
+		return repository.AccountUpsertResult{}, err
+	}
+	stored, err := s.accounts.UpsertManyByIdentity(ctx, []accountdomain.Credential{value})
+	if err != nil {
+		return repository.AccountUpsertResult{}, err
+	}
+	if len(stored) != 1 {
+		return repository.AccountUpsertResult{}, fmt.Errorf("导入账号持久化结果数量无效: %d", len(stored))
+	}
+	s.reconcileProviderLinksBestEffort(ctx, stored[0].ID)
+	return stored[0], nil
+}
+
+func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.CredentialSeed, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+	return s.persistImportedSeedsFromProgress(ctx, seeds, observer, progress, 0, len(seeds), true)
+}
+
+func (s *Service) persistImportedSeedsFromProgress(ctx context.Context, seeds []provider.CredentialSeed, observer ImportedAccountObserver, progress BatchProgressObserver, completed, total int, reportInitial bool) (ImportResult, error) {
+	result := ImportResult{AccountIDs: make([]uint64, 0, len(seeds))}
+	if progress != nil && reportInitial {
+		if err := progress(completed, total); err != nil {
 			return ImportResult{}, err
 		}
 	}
-	completed := 0
 	for start := 0; start < len(seeds); start += credentialImportChunkSize {
 		end := min(start+credentialImportChunkSize, len(seeds))
 		values := make([]accountdomain.Credential, 0, end-start)
@@ -1475,7 +1610,7 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 			}
 			completed++
 			if progress != nil {
-				if err := progress(completed, len(seeds)); err != nil {
+				if err := progress(completed, total); err != nil {
 					return ImportResult{}, err
 				}
 			}
@@ -2090,6 +2225,7 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 	if err != nil {
 		return View{}, mapRepositoryError(err)
 	}
+	enabledChanged := input.Enabled != nil && value.Enabled != *input.Enabled
 	if input.Name != nil {
 		value.Name = strings.TrimSpace(*input.Name)
 		if value.Name == "" {
@@ -2159,7 +2295,30 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 	} else if updated.Enabled && s.providers != nil && s.providers.SupportsCredentialRefresh(updated.Provider) {
 		s.WakeCredentialRefresh()
 	}
-	return s.Get(ctx, updated.ID)
+	view, err := s.Get(ctx, updated.ID)
+	if err != nil {
+		return View{}, err
+	}
+	view.EnabledChanged = enabledChanged
+	return view, nil
+}
+
+// ClearCooldown resets request-path health so a cooled account can be
+// scheduled again. UpdateHealth publishes InvalidationAccountHealthChanged,
+// which overwrites the selector memory overlay (runtimeStore=memory).
+func (s *Service) ClearCooldown(ctx context.Context, id uint64) (View, error) {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return View{}, mapRepositoryError(err)
+	}
+	// missing_thinking is a durable quality strike, not a transient cooldown
+	// error. Clearing the timer must not turn the next miss into another first
+	// strike and bypass the second-miss disable policy.
+	healthMarker := accountdomain.NormalizeHealthMarker(value.LastError)
+	if err := s.accounts.UpdateHealth(ctx, value.ID, value.Provider, 0, nil, healthMarker, false); err != nil {
+		return View{}, mapRepositoryError(err)
+	}
+	return s.Get(ctx, id)
 }
 
 // MarkBuildAPIFallback 幂等写入 Build 账号 XAI 推理回退标记；失败不吞掉，调用方可重试。
@@ -2344,7 +2503,7 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		refreshed, err := adapter.RefreshCredential(ctx, latest)
 		if err != nil {
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRefreshStateTTL)
-			s.recordCredentialRefreshFailure(persistCtx, latest, err, !options.retryPermanentOnce)
+			s.recordCredentialRefreshFailure(persistCtx, latest, err, !options.retryPermanentOnce, release != nil)
 			cancel()
 			return nil, err
 		}
@@ -2354,8 +2513,19 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		if metadata := s.credentialMetadata(riskCredential); metadata.BuildBotFlagInspected {
 			botFlagSource = metadata.BuildBotFlagSource
 		}
-		updated, err := s.accounts.UpdateTokens(ctx, latest.ID, refreshed.EncryptedAccessToken, refreshed.EncryptedRefreshToken, refreshed.ExpiresAt, botFlagSource)
+		persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+		updated, err := s.accounts.UpdateTokens(persistCtx, latest.ID, refreshed.EncryptedAccessToken, refreshed.EncryptedRefreshToken, refreshed.ExpiresAt, botFlagSource)
+		cancelPersist()
 		if err != nil {
+			s.logger.Error("credential_refresh_token_write_failed",
+				"account_id", latest.ID,
+				"provider", latest.Provider,
+				"refresh_token_rotated", refreshed.RefreshTokenRotated,
+				"egress_node_id", latest.EgressNodeID,
+				"build_api_fallback_marked", latest.BuildAPIFallback,
+				"distributed_lock", release != nil,
+				"error", err,
+			)
 			return nil, err
 		}
 		s.invalidateBuildBotFlagCache()
@@ -2437,7 +2607,7 @@ func (s *Service) clearRefreshState(accountID uint64) {
 	s.refreshMu.Unlock()
 }
 
-func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential accountdomain.Credential, refreshErr error, preservePermanent bool) {
+func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential accountdomain.Credential, refreshErr error, preservePermanent, distributedLock bool) {
 	if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.Canceled) {
 		return
 	}
@@ -2465,17 +2635,33 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		errorCode = "oauth_timeout"
 		errorMessage = "OAuth request timed out"
 	}
-	// 真正的 OAuth 永久失败（invalid_grant 等）只能由成功换 token 清除。
-	// credential_decrypt_failed 是可恢复本地错误：不得被旧 permanent 粘住，也不得把本次可恢复失败抬升为永久。
-	if permanent && isRecoverableRefreshErrorCode(errorCode) {
+	// Defend against adapters or historical rows that classified every OAuth
+	// 400/401 as terminal. Only explicit credential-specific terminal codes may
+	// stop future refresh attempts.
+	if permanent && !provider.IsPermanentCredentialRefreshErrorCode(errorCode) {
 		permanent = false
 	}
+	// 真正的 OAuth 永久失败（invalid_grant 等）只能由成功换 token 清除。
+	// 非终态错误不得被旧的 status-only permanent 分类粘住。
 	if preservePermanent && credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) && !isRecoverableRefreshErrorCode(errorCode) {
 		permanent = true
 	}
 	now := s.now()
+	unclassifiedAuthFailure := provider.IsUnclassifiedCredentialAuthRejection(errorStatus, errorCode)
+	configurationError := provider.IsCredentialRefreshConfigurationErrorCode(errorCode)
+	unclassifiedAuthFailureCount := 0
+	if unclassifiedAuthFailure {
+		unclassifiedAuthFailureCount = 1
+		if credential.LastRefreshErrorStatus == errorStatus && strings.EqualFold(strings.TrimSpace(credential.LastRefreshErrorCode), strings.TrimSpace(errorCode)) {
+			unclassifiedAuthFailureCount = credential.RefreshUnclassifiedAuthCount + 1
+		}
+	}
 	retryAt := now.Add(credentialRefreshBackoff(credential.ID, failureCount, retryAfter))
+	if configurationError && retryAt.Before(now.Add(credentialConfigurationRetry)) {
+		retryAt = now.Add(credentialConfigurationRetry)
+	}
 	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
+	requiresReauth := unclassifiedAuthFailure && !accessTokenAlive && unclassifiedAuthFailureCount >= credentialUnclassifiedAuthLimit
 	if permanent && accessTokenAlive {
 		// refresh token 已永久失效时，提前重试没有意义；到 access token 到期时再完成失效收敛。
 		retryAt = credential.ExpiresAt
@@ -2483,11 +2669,31 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		retryAt = now
 	}
 	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, repository.CredentialRefreshFailure{
-		Count: failureCount, RetryAt: retryAt, Status: errorStatus, Code: errorCode,
+		Count: failureCount, UnclassifiedAuthFailureCount: unclassifiedAuthFailureCount,
+		RetryAt: retryAt, Status: errorStatus, Code: errorCode,
 		Message: errorMessage, Response: errorResponse, Permanent: permanent,
 	}); err != nil {
 		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err)
 	}
+	s.logger.Warn("credential_refresh_failed",
+		"account_id", credential.ID,
+		"provider", credential.Provider,
+		"http_status", errorStatus,
+		"error_code", errorCode,
+		"error_message", errorMessage,
+		"permanent", permanent,
+		"failure_count", failureCount,
+		"unclassified_auth_failure", unclassifiedAuthFailure,
+		"unclassified_auth_failure_count", unclassifiedAuthFailureCount,
+		"configuration_error", configurationError,
+		"requires_reauth", requiresReauth,
+		"retry_at", retryAt,
+		"access_token_alive", accessTokenAlive,
+		"refresh_token_rotated", false,
+		"egress_node_id", credential.EgressNodeID,
+		"build_api_fallback_marked", credential.BuildAPIFallback,
+		"distributed_lock", distributedLock,
+	)
 	if permanent && accessTokenAlive {
 		s.logger.Warn("credential_refresh_permanent_but_token_alive", "account_id", credential.ID, "error_code", errorCode, "expires_at", credential.ExpiresAt, "retry_at", retryAt)
 		s.WakeCredentialRefresh()
@@ -2497,6 +2703,19 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
 			s.logger.Warn("credential_refresh_reauth_mark_failed", "account_id", credential.ID, "error", err)
 		}
+		return
+	}
+	if requiresReauth {
+		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh repeatedly rejected without a classifiable error"); err != nil {
+			s.logger.Warn("credential_refresh_unclassified_reauth_mark_failed", "account_id", credential.ID, "error", err)
+			return
+		}
+		s.logger.Warn("credential_refresh_unclassified_reauth_required",
+			"account_id", credential.ID,
+			"http_status", errorStatus,
+			"error_code", errorCode,
+			"failure_count", unclassifiedAuthFailureCount,
+		)
 		return
 	}
 	s.logger.Warn("credential_refresh_deferred", "account_id", credential.ID, "failure_count", failureCount, "retry_at", retryAt, "error_code", errorCode)
@@ -2567,12 +2786,7 @@ func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential
 
 // isRecoverableRefreshErrorCode 标识“永久标记可被后续成功刷新清除”的本地/临时错误。
 func isRecoverableRefreshErrorCode(code string) bool {
-	switch strings.TrimSpace(code) {
-	case "credential_decrypt_failed":
-		return true
-	default:
-		return false
-	}
+	return !provider.IsPermanentCredentialRefreshErrorCode(code)
 }
 
 func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter time.Duration) time.Duration {
@@ -2847,6 +3061,9 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	mode = strings.TrimSpace(mode)
 	key := quotaSyncKey(id, mode)
 	result, err, _ := s.quotaSyncs.Do(key, func() (any, error) {
+		if isWebImagineQuotaMode(mode) {
+			return s.refreshQuotaGroup(ctx, id, accountdomain.QuotaGroupWebImagine)
+		}
 		return s.refreshQuotaMode(ctx, id, mode)
 	})
 	if err != nil {
@@ -2856,19 +3073,26 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	if !ok {
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider 模式额度同步返回类型无效")
 	}
+	if len(refreshed.Modes) > 0 {
+		if err := s.reconcileQuotaGroupWindows(ctx, refreshed.Credential.Provider, id, refreshed.Modes, refreshed.Windows); err != nil {
+			return accountdomain.QuotaWindow{}, err
+		}
+	}
 	window, ok := quotaWindowByMode(refreshed.Windows, mode)
 	if !ok {
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider usage 响应缺少 %s 额度", mode)
 	}
-	if refreshed.Credential.Provider == accountdomain.ProviderConsole {
+	if len(refreshed.Modes) == 0 && refreshed.Credential.Provider == accountdomain.ProviderConsole {
 		// One Console request refreshes all three authoritative windows. Reconcile
 		// every matching recovery event so externally consumed media quota cannot
 		// remain unscheduled merely because a different kind triggered the refresh.
 		if err := s.reconcileQuotaRecoveryWindows(ctx, refreshed.Credential.Provider, id, refreshed.Windows); err != nil {
 			return window, err
 		}
-	} else if err := s.reconcileQuotaRecoveryWindow(ctx, refreshed.Credential.Provider, id, window); err != nil {
-		return window, err
+	} else if len(refreshed.Modes) == 0 {
+		if err := s.reconcileQuotaRecoveryWindow(ctx, refreshed.Credential.Provider, id, window); err != nil {
+			return window, err
+		}
 	}
 	return window, nil
 }
@@ -2880,6 +3104,9 @@ func (s *Service) ProbeQuotaMode(ctx context.Context, id uint64, mode string) (a
 	mode = strings.TrimSpace(mode)
 	key := quotaSyncKey(id, mode)
 	result, err, _ := s.quotaSyncs.Do(key, func() (any, error) {
+		if isWebImagineQuotaMode(mode) {
+			return s.refreshQuotaGroup(ctx, id, accountdomain.QuotaGroupWebImagine)
+		}
 		return s.refreshQuotaMode(ctx, id, mode)
 	})
 	if err != nil {
@@ -2894,6 +3121,34 @@ func (s *Service) ProbeQuotaMode(ctx context.Context, id uint64, mode string) (a
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider usage 响应缺少 %s 额度", mode)
 	}
 	return window, nil
+}
+
+func (s *Service) refreshQuotaGroup(ctx context.Context, id uint64, group string) (quotaRefreshResult, error) {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return quotaRefreshResult{}, mapRepositoryError(err)
+	}
+	adapter, ok := s.providers.QuotaGroup(value.Provider)
+	if !ok {
+		return quotaRefreshResult{}, fmt.Errorf("%s quota group Provider 未注册", value.Provider)
+	}
+	snapshot, err := adapter.SyncQuotaGroup(ctx, value, group)
+	if err != nil {
+		if errors.Is(err, provider.ErrUnauthorized) {
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
+		}
+		return quotaRefreshResult{}, err
+	}
+	if snapshot.Group != group || len(snapshot.Modes) == 0 {
+		return quotaRefreshResult{}, fmt.Errorf("Provider quota group %s 返回无效快照", group)
+	}
+	if snapshot.SyncedAt.IsZero() {
+		snapshot.SyncedAt = s.now()
+	}
+	if err := s.accounts.ReplaceQuotaWindowGroup(ctx, id, snapshot.SyncedAt, snapshot.Modes, snapshot.Windows); err != nil {
+		return quotaRefreshResult{}, err
+	}
+	return quotaRefreshResult{Credential: value, Windows: snapshot.Windows, Modes: snapshot.Modes}, nil
 }
 
 func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) (quotaRefreshResult, error) {
@@ -2963,6 +3218,9 @@ func quotaSyncKey(accountID uint64, mode string) string {
 	if isConsoleUsageQuotaMode(mode) {
 		return "all:" + strconv.FormatUint(accountID, 10)
 	}
+	if isWebImagineQuotaMode(mode) || mode == accountdomain.QuotaGroupWebImagine {
+		return accountdomain.QuotaGroupWebImagine + ":" + strconv.FormatUint(accountID, 10)
+	}
 	return mode + ":" + strconv.FormatUint(accountID, 10)
 }
 
@@ -2979,6 +3237,27 @@ func (s *Service) reconcileQuotaRecoveryWindows(ctx context.Context, providerVal
 	for _, window := range windows {
 		if err := s.reconcileQuotaRecoveryWindow(ctx, providerValue, accountID, window); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileQuotaGroupWindows(ctx context.Context, providerValue accountdomain.Provider, accountID uint64, modes []string, windows []accountdomain.QuotaWindow) error {
+	byMode := make(map[string]accountdomain.QuotaWindow, len(windows))
+	for _, window := range windows {
+		byMode[window.Mode] = window
+	}
+	for _, mode := range modes {
+		if window, ok := byMode[mode]; ok {
+			if err := s.reconcileQuotaRecoveryWindow(ctx, providerValue, accountID, window); err != nil {
+				return err
+			}
+			continue
+		}
+		if s.quotaQueue != nil {
+			if err := s.quotaQueue.CancelQuotaRecovery(ctx, accountID, mode); err != nil {
+				return fmt.Errorf("取消额度恢复事件: %w", err)
+			}
 		}
 	}
 	return nil
@@ -3026,7 +3305,10 @@ func quotaRecoveryDueAt(window accountdomain.QuotaWindow, now time.Time, exhaust
 // QueueQuotaRefresh asynchronously refreshes the remote quota window after a successful request.
 func (s *Service) QueueQuotaRefresh(id uint64, mode string) {
 	mode = strings.TrimSpace(mode)
-	if id == 0 || (!isConsoleUsageQuotaMode(mode) && mode != "weekly" && !isWebChatQuotaMode(mode)) {
+	if isWebImagineQuotaMode(mode) {
+		mode = accountdomain.QuotaGroupWebImagine
+	}
+	if id == 0 || (!isConsoleUsageQuotaMode(mode) && mode != "weekly" && mode != accountdomain.QuotaGroupWebImagine && !isWebChatQuotaMode(mode)) {
 		return
 	}
 	key := strconv.FormatUint(id, 10) + ":" + mode
@@ -3195,9 +3477,10 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 						break
 					}
 				}
-			} else {
+			} else if request.mode != accountdomain.QuotaGroupWebImagine {
 				// Weekly remains a Grok Web capability. Console never inherits this
 				// legacy mode and always refreshes its authoritative /usage snapshot.
+				// Imagine 配额组走 /rest/media/imagine/quota_info，不可被改刷 weekly。
 				for _, window := range windows[request.accountID] {
 					if window.Mode == "weekly" {
 						refreshMode = "weekly"
@@ -3220,7 +3503,15 @@ func (s *Service) runQuotaRefresh(parent context.Context, request quotaRefreshRe
 		}
 		if !skipUpstream && refreshErr == nil && acquired {
 			if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
-				_, refreshErr = s.RefreshQuotaMode(workCtx, request.accountID, refreshMode)
+				if refreshMode == accountdomain.QuotaGroupWebImagine {
+					var refreshed quotaRefreshResult
+					refreshed, refreshErr = s.refreshQuotaGroup(workCtx, request.accountID, refreshMode)
+					if refreshErr == nil {
+						refreshErr = s.reconcileQuotaGroupWindows(workCtx, refreshed.Credential.Provider, request.accountID, refreshed.Modes, refreshed.Windows)
+					}
+				} else {
+					_, refreshErr = s.RefreshQuotaMode(workCtx, request.accountID, refreshMode)
+				}
 				return refreshErr
 			}); err != nil {
 				refreshErr = err
@@ -3474,6 +3765,10 @@ func isConsoleUsageQuotaMode(mode string) bool {
 	}
 }
 
+func isWebImagineQuotaMode(mode string) bool {
+	return accountdomain.IsWebImagineQuotaMode(mode)
+}
+
 func quotaWindowControlsRouting(providerValue accountdomain.Provider, mode string) bool {
 	return providerValue != accountdomain.ProviderConsole || isConsoleUsageQuotaMode(mode)
 }
@@ -3698,7 +3993,7 @@ func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, i
 
 // DetectBuildAccountsWithProgress 对指定或全部 Grok Build 账号发起探测请求；all 与 ids 必须且只能提供一个。
 // 该方法同时上报批量进度与单账号明细。
-// itemObserver 在每个账号完成后调用：选中检测会推送全部结果，全量检测仅推送已确认失效账号。
+// itemObserver 在每个账号完成后串行调用：选中检测会推送全部结果，全量检测仅推送已确认失效账号。
 func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uint64, all bool, progress BatchProgressObserver, itemObserver BuildDetectItemObserver) (int, int, error) {
 	if all == (len(ids) > 0) {
 		return 0, 0, invalidInput("必须明确选择全部账号或提供非空账号 ID")
@@ -3731,7 +4026,7 @@ func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uin
 			return 0, 0, err
 		}
 	}
-	var progressMu sync.Mutex
+	var observerMu sync.Mutex
 	var progressErr error
 	completed := 0
 	runCtx, cancel := context.WithCancel(ctx)
@@ -3739,7 +4034,12 @@ func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uin
 	summary, err := batch.ForEachObserved(runCtx, ids, batch.Options{Workers: pool.Limit(), Pool: pool}, func(workCtx context.Context, id uint64) (BuildDetectItemResult, error) {
 		item := s.detectBuildAccount(workCtx, id)
 		if itemObserver != nil && (selectedMode || item.Outcome == BuildDetectOutcomeInvalid) {
-			if notifyErr := itemObserver(item); notifyErr != nil {
+			notifyErr := func() error {
+				observerMu.Lock()
+				defer observerMu.Unlock()
+				return itemObserver(item)
+			}()
+			if notifyErr != nil {
 				return item, notifyErr
 			}
 		}
@@ -3755,8 +4055,8 @@ func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uin
 		if errors.As(result.Err, &panicErr) {
 			s.logger.Error("account_bulk_task_panicked", "operation", "build_detect", "account_id", ids[index], "error", panicErr, "stack", string(panicErr.Stack))
 		}
-		progressMu.Lock()
-		defer progressMu.Unlock()
+		observerMu.Lock()
+		defer observerMu.Unlock()
 		completed++
 		if progress != nil {
 			if notifyErr := progress(completed, len(ids)); notifyErr != nil && progressErr == nil {
