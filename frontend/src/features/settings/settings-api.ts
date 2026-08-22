@@ -272,27 +272,10 @@ function normalizeSettingsConfig(raw: unknown): SettingsConfigDTO {
   const retryStatusCodes = Array.isArray(routingRaw.retryStatusCodes)
     ? routingRaw.retryStatusCodes.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
     : [402, 403, 429, 503];
-  const consoleRaw = isObject(record.providerConsole) ? (record.providerConsole as Record<string, unknown>) : {};
-  const proactiveRaw = isObject(record.proactiveUpstreamSync) ? (record.proactiveUpstreamSync as Record<string, unknown>) : {};
-  const promptCacheRaw = isObject(record.promptCacheAffinity) ? (record.promptCacheAffinity as Record<string, unknown>) : {};
   // Coerce upgrade-sensitive fields so a single missing/empty value cannot blank settings.
-  // Backend handler no longer returns providerConsole.userAgent, proactiveUpstreamSync,
-  // promptCacheAffinity, or routing.retryStatusCodes/retryServerErrors — backfill defaults
-  // so the validator passes and the form has sane initial values.
   const withBuffer = {
     ...record,
     providerWeb: { ...webRaw, statsigMode },
-    providerConsole: {
-      ...consoleRaw,
-      userAgent: coerceString(consoleRaw.userAgent, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-    },
-    proactiveUpstreamSync: {
-      billing: coerceBoolean(proactiveRaw.billing, false),
-      webQuota: coerceBoolean(proactiveRaw.webQuota, false),
-      modelCatalogCatchup: coerceBoolean(proactiveRaw.modelCatalogCatchup, false),
-      allowManualBillingRefresh: coerceBoolean(proactiveRaw.allowManualBillingRefresh, true),
-      allowManualQuotaRefresh: coerceBoolean(proactiveRaw.allowManualQuotaRefresh, true),
-    },
     batch: {
       ...batchRaw,
       dbBuffer: normalizeDBBuffer(batchRaw.dbBuffer),
@@ -301,12 +284,6 @@ function normalizeSettingsConfig(raw: unknown): SettingsConfigDTO {
       ...routingRaw,
       retryStatusCodes,
       retryServerErrors: coerceBoolean(routingRaw.retryServerErrors, true),
-    },
-    promptCacheAffinity: {
-      enabled: coerceBoolean(promptCacheRaw.enabled, true),
-      fingerprint: coerceBoolean(promptCacheRaw.fingerprint, true),
-      expire: coerceBoolean(promptCacheRaw.expire, true),
-      ttl: typeof promptCacheRaw.ttl === "string" && promptCacheRaw.ttl ? promptCacheRaw.ttl : "24h",
     },
   };
   if (!settingsConfigValidator(withBuffer)) {
