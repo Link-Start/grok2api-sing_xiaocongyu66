@@ -1,110 +1,244 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, decodeBooleanResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
+import {
+  createObjectDecoder,
+  decodeBooleanResult,
+  hasShape,
+  isArrayOf,
+  isBoolean,
+  isNumber,
+  isObject,
+  isOneOf,
+  isOptional,
+  isString,
+  type ApiDecoder,
+} from "@/shared/api/decoder";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type SettingsConfigDTO = {
-  server: { maxConcurrentRequests: number };
-  providerBuild: { baseURL: string; fallbackBaseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string; responseHeaderTimeout: string; streamIdleTimeout: string };
+  providerBuild: { baseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string; responseHeaderTimeout: string };
   providerWeb: {
-    baseURL: string; quotaTimeout: string; chatTimeout: string; streamIdleTimeout: string; imageTimeout: string; videoTimeout: string;
-    statsigMode: "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
-    clearanceMode: ClearanceMode; flareSolverrURL: string; clearanceTimeout: string; clearanceRefresh: string;
+    baseURL: string; quotaTimeout: string; chatTimeout: string; imageTimeout: string; videoTimeout: string;
+    statsigMode: "local" | "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
     mediaConcurrency: number; allowNSFW: boolean;
     recoveryBackoffBase: string; recoveryBackoffMax: string;
+    flareSolverrEnabled?: boolean; flareSolverrURL?: string; flareSolverrTargetURL?: string; flareSolverrTimeout?: string; flareSolverrRefreshInterval?: string;
   };
-  providerConsole: { baseURL: string; chatTimeout: string; streamIdleTimeout: string };
-  batch: { importConcurrency: number; conversionConcurrency: number; syncConcurrency: number; refreshConcurrency: number; randomDelay: string };
+  providerConsole: { baseURL: string; userAgent: string; chatTimeout: string };
+  proactiveUpstreamSync: {
+    billing: boolean;
+    webQuota: boolean;
+    modelCatalogCatchup: boolean;
+    allowManualBillingRefresh: boolean;
+    allowManualQuotaRefresh: boolean;
+  };
+  batch: { importConcurrency: number; conversionConcurrency: number; syncConcurrency: number; refreshConcurrency: number; randomDelay: string; dbBuffer: { enabled: boolean; driver: "none" | "redis" | "sqlite"; path?: string } };
   media: {
     maxImageBytes: number; maxTotalBytes: number; cleanupThresholdPercent: number;
     cleanupInterval: string;
   };
-  frontend: { publicApiBaseURL: string };
   routing: {
-    stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number; videoMaxAttempts: number; preferFreeBuild: boolean; markBuildChatDeniedAsReauth: boolean;
-    accountIsolatedConnections: boolean;
-    segmentedSelector: { enabled: boolean; minCandidates: number; windowSize: number };
+    stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number;
+    deprioritizeFailedAccounts?: boolean;
+    retryStatusCodes: number[]; retryServerErrors: boolean;
   };
-  audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number; retentionDays?: number };
+  promptCacheAffinity: { enabled: boolean; fingerprint: boolean; expire: boolean; ttl: string };
+  audit: { bufferSize: number; batchSize: number; flushInterval: string };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
-  accounts: {
-    markBuildForbiddenReauth: boolean;
-    buildForbiddenReauthCodes: string[];
-    excludeBuildBotFlaggedFromScheduling: boolean;
-    autoCleanReauthEnabled: boolean;
-    autoCleanReauthInterval: string;
-    autoCleanReauthMinAge: string;
-    autoCleanIncludeDisabled: boolean;
-  };
 };
 
-export type ClearanceMode = "manual" | "flaresolverr" | "on_demand";
-
 export type EgressNodeDTO = {
-	id: string; name: string; scope: EgressScope; enabled: boolean;
-	proxyConfigured: boolean; proxyDisplay?: string; proxyFingerprint?: string; userAgent: string; cookieConfigured: boolean;
-	accountBoundProxy: boolean; proxyPool: boolean; proxyProfileId?: string; proxyProfileName?: string;
-	sourceId?: string; accountCapacity: number; assignedAccountCount: number;
-	health: number; failureCount: number; cooldownUntil?: string; lastError?: string;
-	probeStatus: "unknown" | "healthy" | "unhealthy"; lastProbedAt?: string; probeLatencyMs: number; exitIp?: string; probeError?: string;
-	probeProvider?: "ipinfo" | "cloudflare";
-	ipv4Probe: EgressIPProbeDTO; ipv6Probe: EgressIPProbeDTO;
+  id: string; name: string; scope: EgressScope; scopes: EgressScope[]; enabled: boolean;
+  proxyConfigured: boolean; proxyProtocol?: string; userAgent: string; cookieConfigured: boolean;
+  health: number; failureCount: number; cooldownUntil?: string; lastError?: string;
+  successCount: number; requestCount: number; successRate: number; failureRate: number;
+  inflight: number; lastProbeAt?: string; lastProbeOK?: boolean; lastProbeMs?: number; lastProbeError?: string;
 };
 
 export type EgressNodeInput = {
-	name: string; scope: EgressScope; enabled: boolean; proxyPool: boolean; proxyURL?: string;
-	proxyProfileId?: string;
-	accountCapacity: number; clearProxyURL?: boolean; userAgent: string; cloudflareCookies?: string; clearCookies?: boolean;
+  name: string; scope: EgressScope; scopes: EgressScope[]; enabled: boolean; proxyURL?: string;
+  clearProxyURL?: boolean; userAgent: string; cloudflareCookies?: string; clearCookies?: boolean;
 };
 
-export type EgressProxyProfileDTO = {
-	id: string; name: string; proxyDisplay?: string; proxyFingerprint?: string;
-	boundNodeCount: number; createdAt: string; updatedAt: string;
+export type EgressBatchImportInput = {
+  namePrefix: string;
+  scope: EgressScope;
+  scopes: EgressScope[];
+  enabled: boolean;
+  proxyText: string;
+  userAgent?: string;
+  cloudflareCookies?: string;
 };
 
-export type EgressProxyProfileInput = { name: string; proxyURL?: string };
-export type EgressProxyProfileListDTO = {
-	items: EgressProxyProfileDTO[];
-	page: number;
-	pageSize: number;
-	total: number;
-};
-
-export type EgressScope = "grok_build" | "grok_web" | "grok_console" | "grok_web_asset" | "grok_console_asset";
-export type EgressFallbackMode = "none" | "direct" | "fixed";
-export type EgressFallbackConfigDTO = { mode: EgressFallbackMode; nodeId?: string };
-export type EgressNodeListDTO = {
+export type EgressBatchImportResultDTO = {
+  created: number;
+  failed: number;
+  skipped: number;
+  errors: string[];
   items: EgressNodeDTO[];
-  page: number;
-  pageSize: number;
-  total: number;
-  defaultUserAgents: Record<EgressScope, string>;
 };
-export type EgressSourceDTO = {
-  id: string; name: string; scope: EgressScope; enabled: boolean; urlConfigured: boolean; proxyConfigured: boolean;
-  refreshIntervalSeconds: number; defaultAccountCapacity: number;
-  lastSyncedAt?: string; nextSyncAt?: string; lastSyncImported: number; lastSyncError?: string;
+
+export type EgressScope = "grok_build" | "grok_web" | "grok_console" | "grok_web_asset";
+export type EgressNodeListDTO = { items: EgressNodeDTO[]; defaultUserAgents: Record<EgressScope, string> };
+
+/** Known scopes; unknown values are mapped to grok_web so one bad row cannot blank the whole list. */
+export const EGRESS_SCOPES = ["grok_build", "grok_web", "grok_console", "grok_web_asset"] as const;
+
+function coerceString(value: unknown, fallback = ""): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return fallback;
+}
+
+function coerceNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function coerceBoolean(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  return fallback;
+}
+
+function coerceScope(value: unknown): EgressScope {
+  if (typeof value === "string" && (EGRESS_SCOPES as readonly string[]).includes(value)) {
+    return value as EgressScope;
+  }
+  // Legacy / unknown scopes: keep list visible rather than failing the entire page.
+  return "grok_web";
+}
+
+function coerceScopes(raw: unknown, primary: unknown): EgressScope[] {
+  const out: EgressScope[] = [];
+  const seen = new Set<string>();
+  const push = (value: unknown) => {
+    const scope = coerceScope(value);
+    if (seen.has(scope)) return;
+    // Only accept known values from explicit strings; coerceScope maps unknown → grok_web.
+    if (typeof value === "string" && !(EGRESS_SCOPES as readonly string[]).includes(value) && value !== "") return;
+    seen.add(scope);
+    out.push(scope);
+  };
+  if (Array.isArray(raw)) {
+    for (const item of raw) push(item);
+  } else if (typeof raw === "string" && raw.includes(",")) {
+    for (const part of raw.split(",")) push(part.trim());
+  }
+  if (out.length === 0) push(primary);
+  if (out.length === 0) out.push("grok_web");
+  return out;
+}
+
+function normalizeEgressNode(raw: unknown): EgressNodeDTO | null {
+  if (!isObject(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const id = coerceString(record.id);
+  const name = coerceString(record.name);
+  if (!id || !name) return null;
+  const scopes = coerceScopes(record.scopes ?? record.scope, record.scope);
+  return {
+    id,
+    name,
+    scope: scopes[0] ?? coerceScope(record.scope),
+    scopes,
+    enabled: coerceBoolean(record.enabled, true),
+    proxyConfigured: coerceBoolean(record.proxyConfigured),
+    proxyProtocol: typeof record.proxyProtocol === "string" ? record.proxyProtocol : undefined,
+    userAgent: coerceString(record.userAgent),
+    cookieConfigured: coerceBoolean(record.cookieConfigured),
+    health: coerceNumber(record.health, 1),
+    failureCount: coerceNumber(record.failureCount),
+    cooldownUntil: typeof record.cooldownUntil === "string" ? record.cooldownUntil : undefined,
+    lastError: typeof record.lastError === "string" ? record.lastError : undefined,
+    successCount: coerceNumber(record.successCount),
+    requestCount: coerceNumber(record.requestCount),
+    successRate: coerceNumber(record.successRate),
+    failureRate: coerceNumber(record.failureRate),
+    inflight: coerceNumber(record.inflight),
+    lastProbeAt: typeof record.lastProbeAt === "string" ? record.lastProbeAt : undefined,
+    lastProbeOK: typeof record.lastProbeOK === "boolean" ? record.lastProbeOK : undefined,
+    lastProbeMs: typeof record.lastProbeMs === "number" ? record.lastProbeMs : undefined,
+    lastProbeError: typeof record.lastProbeError === "string" ? record.lastProbeError : undefined,
+  };
+}
+
+function normalizeDefaultUserAgents(raw: unknown): Record<EgressScope, string> {
+  const record = isObject(raw) ? (raw as Record<string, unknown>) : {};
+  return {
+    grok_build: coerceString(record.grok_build),
+    grok_web: coerceString(record.grok_web),
+    grok_console: coerceString(record.grok_console),
+    grok_web_asset: coerceString(record.grok_web_asset ?? record.grok_web),
+  };
+}
+
+const decodeEgressNodeResilient: ApiDecoder<EgressNodeDTO> = (value) => {
+  const node = normalizeEgressNode(value);
+  if (!node) throw new Error("egress node response shape is invalid");
+  return node;
 };
-export type EgressSourceListDTO = {
-  items: EgressSourceDTO[];
-  page: number;
-  pageSize: number;
-  total: number;
+
+const decodeEgressNodeListResilient: ApiDecoder<EgressNodeListDTO> = (value) => {
+  if (!isObject(value)) throw new Error("egress node list response shape is invalid");
+  const record = value as Record<string, unknown>;
+  const itemsRaw = Array.isArray(record.items) ? record.items : [];
+  const items = itemsRaw.map(normalizeEgressNode).filter((item): item is EgressNodeDTO => item !== null);
+  return { items, defaultUserAgents: normalizeDefaultUserAgents(record.defaultUserAgents) };
 };
-export type EgressSourceInput = {
-  name: string; scope: EgressScope; enabled: boolean; url?: string; clearUrl?: boolean;
-  proxyURL?: string; clearProxyURL?: boolean;
-  refreshIntervalSeconds: number; defaultAccountCapacity: number;
+
+const decodeEgressReportResilient: ApiDecoder<EgressReportDTO> = (value) => {
+  if (!isObject(value)) throw new Error("egress report response shape is invalid");
+  const record = value as Record<string, unknown>;
+  const itemsRaw = Array.isArray(record.items) ? record.items : [];
+  const items = itemsRaw.map(normalizeEgressNode).filter((item): item is EgressNodeDTO => item !== null);
+  return {
+    totalNodes: coerceNumber(record.totalNodes),
+    enabledNodes: coerceNumber(record.enabledNodes),
+    proxyNodes: coerceNumber(record.proxyNodes),
+    healthyNodes: coerceNumber(record.healthyNodes),
+    successCount: coerceNumber(record.successCount),
+    failureCount: coerceNumber(record.failureCount),
+    requestCount: coerceNumber(record.requestCount),
+    successRate: coerceNumber(record.successRate),
+    failureRate: coerceNumber(record.failureRate),
+    items,
+  };
 };
-export type EgressOperationsConfigDTO = {
-  probeProvider: "ipinfo" | "cloudflare"; probeIntervalSeconds: number; autoAssignEnabled: boolean; autoBalanceEnabled: boolean;
-  assignmentIntervalSeconds: number; fallbacks: Record<EgressScope, EgressFallbackConfigDTO>; updatedAt: string;
+
+const decodeEgressBatchImport: ApiDecoder<EgressBatchImportResultDTO> = (value) => {
+  if (!isObject(value)) throw new Error("egress batch import response shape is invalid");
+  const record = value as Record<string, unknown>;
+  const itemsRaw = Array.isArray(record.items) ? record.items : [];
+  const items = itemsRaw.map(normalizeEgressNode).filter((item): item is EgressNodeDTO => item !== null);
+  const errors = Array.isArray(record.errors)
+    ? record.errors.filter((item): item is string => typeof item === "string")
+    : [];
+  return {
+    created: coerceNumber(record.created),
+    failed: coerceNumber(record.failed),
+    skipped: coerceNumber(record.skipped),
+    errors,
+    items,
+  };
 };
-export type EgressImportResultDTO = { imported: number; skipped: number };
-export type EgressIPProbeDTO = { status: "unknown" | "healthy" | "unhealthy"; testedAt?: string; latencyMs: number; exitIp?: string; error?: string };
-export type EgressProbeResultDTO = { status: "unknown" | "healthy" | "unhealthy"; testedAt: string; latencyMs: number; exitIp?: string; error?: string; probeProvider?: "ipinfo" | "cloudflare"; ipv4: EgressIPProbeDTO; ipv6: EgressIPProbeDTO };
-export type EgressProbeBatchResultDTO = { requested: number; healthy: number; unhealthy: number };
-export type EgressRebalanceResultDTO = { assigned: number; rebalanced: number; unplaced: number };
-export type EgressUnhealthyCleanupPreviewDTO = { nodes: number; boundAccounts: number; subscriptionManaged: number };
+
+export type EgressReportDTO = {
+  totalNodes: number; enabledNodes: number; proxyNodes: number; healthyNodes: number;
+  successCount: number; failureCount: number; requestCount: number;
+  successRate: number; failureRate: number; items: EgressNodeDTO[];
+};
+
+export type EgressProbeDTO = {
+  nodeId: string; name: string; scope: EgressScope; ok: boolean;
+  latencyMs: number; status?: number; error?: string; proxyUsed: boolean; checkedAt: string;
+};
+
+export type EgressProbeBatchDTO = {
+  items: EgressProbeDTO[]; total: number; passed: number; failed: number;
+};
 
 export type SettingsSnapshotDTO = {
   config: SettingsConfigDTO;
@@ -114,222 +248,166 @@ export type SettingsSnapshotDTO = {
   restartRequired: string[];
 };
 
-const settingsConfigValidator = hasShape({
-  server: hasShape({ maxConcurrentRequests: isNumber }),
-  providerBuild: hasShape({ baseURL: isString, fallbackBaseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString, responseHeaderTimeout: isString, streamIdleTimeout: isString }),
-  providerWeb: hasShape({
-    baseURL: isString, quotaTimeout: isString, chatTimeout: isString, streamIdleTimeout: isOptional(isString), imageTimeout: isString, videoTimeout: isString,
-    statsigMode: isOneOf("manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
-    statsigSignerURL: isString, clearanceMode: isOneOf("manual", "flaresolverr", "on_demand"), flareSolverrURL: isString,
-    clearanceTimeout: isString, clearanceRefresh: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, recoveryBackoffBase: isString, recoveryBackoffMax: isString,
-  }),
-  providerConsole: hasShape({ baseURL: isString, chatTimeout: isString, streamIdleTimeout: isOptional(isString) }),
-  batch: hasShape({ importConcurrency: isNumber, conversionConcurrency: isNumber, syncConcurrency: isNumber, refreshConcurrency: isNumber, randomDelay: isString }),
-  media: hasShape({ maxImageBytes: isNumber, maxTotalBytes: isNumber, cleanupThresholdPercent: isNumber, cleanupInterval: isString }),
-  frontend: hasShape({ publicApiBaseURL: isString }),
-  routing: hasShape({
-    stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, videoMaxAttempts: isNumber, preferFreeBuild: isBoolean, markBuildChatDeniedAsReauth: isBoolean,
-    accountIsolatedConnections: isOptional(isBoolean),
-    segmentedSelector: isOptional(hasShape({ enabled: isBoolean, minCandidates: isNumber, windowSize: isNumber })),
-  }),
-  audit: hasShape({
-    bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber),
-    retentionDays: isOptional(isNumber),
-  }),
-  clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
-  // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
-  accounts: isOptional(hasShape({
-    markBuildForbiddenReauth: isOptional(isBoolean),
-    buildForbiddenReauthCodes: isOptional(isArrayOf(isString)),
-    excludeBuildBotFlaggedFromScheduling: isOptional(isBoolean),
-    autoCleanReauthEnabled: isBoolean,
-    autoCleanReauthInterval: isString,
-    autoCleanReauthMinAge: isString,
-    autoCleanIncludeDisabled: isBoolean,
-  })),
-});
-const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
-  markBuildForbiddenReauth: false,
-  buildForbiddenReauthCodes: ["permission-denied"],
-  excludeBuildBotFlaggedFromScheduling: false,
-  autoCleanReauthEnabled: false,
-  autoCleanReauthInterval: "10m",
-  autoCleanReauthMinAge: "1h",
-  autoCleanIncludeDisabled: false,
-});
-function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDTO {
-  const accounts = snapshot.config.accounts ?? defaultAccountsConfig();
-  const segmentedSelector = snapshot.config.routing.segmentedSelector ?? { enabled: true, minCandidates: 3000, windowSize: 64 };
+function normalizeDBBuffer(raw: unknown): SettingsConfigDTO["batch"]["dbBuffer"] {
+  const record = isObject(raw) ? (raw as Record<string, unknown>) : {};
+  const driverRaw = typeof record.driver === "string" ? record.driver.trim().toLowerCase() : "";
+  const driver = driverRaw === "redis" || driverRaw === "sqlite" || driverRaw === "none" ? driverRaw : "none";
   return {
-    ...snapshot,
-    config: {
-      ...snapshot.config,
-      providerWeb: {
-        ...snapshot.config.providerWeb,
-        streamIdleTimeout: snapshot.config.providerWeb.streamIdleTimeout || "1m30s",
-      },
-      providerConsole: {
-        ...snapshot.config.providerConsole,
-        streamIdleTimeout: snapshot.config.providerConsole.streamIdleTimeout || "2m",
-      },
-      audit: {
-        ...snapshot.config.audit,
-        commitDelayMS: snapshot.config.audit.commitDelayMS ?? 5,
-        retentionDays: snapshot.config.audit.retentionDays ?? 7,
-      },
-      routing: {
-        ...snapshot.config.routing,
-        markBuildChatDeniedAsReauth: snapshot.config.routing.markBuildChatDeniedAsReauth ?? false,
-        accountIsolatedConnections: snapshot.config.routing.accountIsolatedConnections ?? false,
-        segmentedSelector: {
-          enabled: segmentedSelector.enabled ?? true,
-          minCandidates: segmentedSelector.minCandidates || 3000,
-          windowSize: segmentedSelector.windowSize || 64,
-        },
-      },
-      accounts: {
-        markBuildForbiddenReauth: accounts.markBuildForbiddenReauth ?? false,
-        buildForbiddenReauthCodes: accounts.buildForbiddenReauthCodes ?? ["permission-denied"],
-        excludeBuildBotFlaggedFromScheduling: accounts.excludeBuildBotFlaggedFromScheduling ?? false,
-        autoCleanReauthEnabled: accounts.autoCleanReauthEnabled ?? false,
-        autoCleanReauthInterval: accounts.autoCleanReauthInterval || "10m",
-        autoCleanReauthMinAge: accounts.autoCleanReauthMinAge || "1h",
-        autoCleanIncludeDisabled: accounts.autoCleanIncludeDisabled ?? false,
-      },
-    },
+    enabled: coerceBoolean(record.enabled, false),
+    driver,
+    path: typeof record.path === "string" ? record.path : undefined,
   };
 }
-const decodeSettingsSnapshotRaw = createObjectDecoder<SettingsSnapshotDTO>("settings", {
-  config: settingsConfigValidator,
-  recommendedProviderBuild: hasShape({ clientVersion: isString, userAgent: isString }),
-  updatedAt: isString,
-  revision: isString,
-  restartRequired: isArrayOf(isString),
-});
-const decodeSettingsSnapshot = (value: unknown) => withSettingsDefaults(decodeSettingsSnapshotRaw(value));
-const egressIPProbeValidator = hasShape({
-  status: isOneOf("unknown", "healthy", "unhealthy"), testedAt: isOptional(isString), latencyMs: isNumber, exitIp: isOptional(isString), error: isOptional(isString),
-});
-type EgressNodeWireDTO = Omit<EgressNodeDTO, "ipv4Probe" | "ipv6Probe"> & { ipv4Probe?: EgressIPProbeDTO; ipv6Probe?: EgressIPProbeDTO };
-type EgressSourceWireDTO = Omit<EgressSourceDTO, "proxyConfigured"> & { proxyConfigured?: boolean };
-type EgressOperationsConfigWireDTO = Omit<EgressOperationsConfigDTO, "probeProvider"> & {
-  probeProvider?: "ipinfo" | "cloudflare";
-};
-type EgressProbeResultWireDTO = Omit<EgressProbeResultDTO, "ipv4" | "ipv6"> & { ipv4?: EgressIPProbeDTO; ipv6?: EgressIPProbeDTO };
-const unknownEgressIPProbe = (): EgressIPProbeDTO => ({ status: "unknown", latencyMs: 0 });
-const withEgressNodeProbeDefaults = (value: EgressNodeWireDTO): EgressNodeDTO => ({
-  ...value,
-  ipv4Probe: value.ipv4Probe ?? unknownEgressIPProbe(),
-  ipv6Probe: value.ipv6Probe ?? unknownEgressIPProbe(),
-});
-const withEgressSourceDefaults = (value: EgressSourceWireDTO): EgressSourceDTO => ({
-  ...value,
-  proxyConfigured: value.proxyConfigured ?? false,
-});
-const egressNodeValidator = hasShape({
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean,
-  proxyConfigured: isBoolean, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString), userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, proxyPool: isBoolean, health: isNumber, failureCount: isNumber,
-  sourceId: isOptional(isString), proxyProfileId: isOptional(isString), proxyProfileName: isOptional(isString), accountCapacity: isNumber, assignedAccountCount: isNumber,
-  probeStatus: isOneOf("unknown", "healthy", "unhealthy"), lastProbedAt: isOptional(isString), probeLatencyMs: isNumber, exitIp: isOptional(isString), probeError: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
-  ipv4Probe: isOptional(egressIPProbeValidator), ipv6Probe: isOptional(egressIPProbeValidator),
-  cooldownUntil: isOptional(isString), lastError: isOptional(isString),
-});
-const decodeEgressNodeRaw = createObjectDecoder<EgressNodeWireDTO>("egress node", {
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean,
-  proxyConfigured: isBoolean, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString), userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, proxyPool: isBoolean, health: isNumber, failureCount: isNumber,
-  sourceId: isOptional(isString), proxyProfileId: isOptional(isString), proxyProfileName: isOptional(isString), accountCapacity: isNumber, assignedAccountCount: isNumber,
-  probeStatus: isOneOf("unknown", "healthy", "unhealthy"), lastProbedAt: isOptional(isString), probeLatencyMs: isNumber, exitIp: isOptional(isString), probeError: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
-  ipv4Probe: isOptional(egressIPProbeValidator), ipv6Probe: isOptional(egressIPProbeValidator),
-  cooldownUntil: isOptional(isString), lastError: isOptional(isString),
-});
-const decodeEgressNode = (value: unknown) => withEgressNodeProbeDefaults(decodeEgressNodeRaw(value));
-const decodeEgressProxyProfile = createObjectDecoder<EgressProxyProfileDTO>("egress proxy profile", {
-  id: isString, name: isString, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString),
-  boundNodeCount: isNumber, createdAt: isString, updatedAt: isString,
-});
-const decodeEgressProxyProfiles = createObjectDecoder<EgressProxyProfileListDTO>("egress proxy profiles", { items: isArrayOf(hasShape({
-  id: isString, name: isString, proxyDisplay: isOptional(isString), proxyFingerprint: isOptional(isString),
-  boundNodeCount: isNumber, createdAt: isString, updatedAt: isString,
-})), page: isNumber, pageSize: isNumber, total: isNumber });
-type EgressNodeListWireDTO = {
-  items: EgressNodeWireDTO[];
-  page?: number;
-  pageSize?: number;
-  total?: number;
-  defaultUserAgents: Omit<Record<EgressScope, string>, "grok_console_asset"> & { grok_console_asset?: string };
-};
-const decodeEgressNodeListRaw = createObjectDecoder<EgressNodeListWireDTO>("egress node list", {
-  items: isArrayOf(egressNodeValidator),
-  page: isOptional(isNumber),
-  pageSize: isOptional(isNumber),
-  total: isOptional(isNumber),
-  defaultUserAgents: hasShape({ grok_build: isString, grok_web: isString, grok_console: isString, grok_web_asset: isString, grok_console_asset: isOptional(isString) }),
-});
-const decodeEgressNodeList = (value: unknown): EgressNodeListDTO => {
-  const decoded = decodeEgressNodeListRaw(value);
-  return {
-    ...decoded,
-    items: decoded.items.map(withEgressNodeProbeDefaults),
-    page: decoded.page ?? 1,
-    pageSize: decoded.pageSize ?? Math.max(20, decoded.items.length),
-    total: decoded.total ?? decoded.items.length,
-    defaultUserAgents: {
-      ...decoded.defaultUserAgents,
-      grok_console_asset: decoded.defaultUserAgents.grok_console_asset ?? decoded.defaultUserAgents.grok_console,
+
+function normalizeSettingsConfig(raw: unknown): SettingsConfigDTO {
+  if (!isObject(raw)) throw new Error("settings config response shape is invalid");
+  const record = raw as Record<string, unknown>;
+  const batchRaw = isObject(record.batch) ? (record.batch as Record<string, unknown>) : {};
+  const webRaw = isObject(record.providerWeb) ? (record.providerWeb as Record<string, unknown>) : {};
+  const statsigModeRaw = typeof webRaw.statsigMode === "string" ? webRaw.statsigMode : "local";
+  const statsigMode = statsigModeRaw === "manual" || statsigModeRaw === "url" || statsigModeRaw === "local"
+    ? statsigModeRaw
+    : "local";
+  const routingRaw = isObject(record.routing) ? (record.routing as Record<string, unknown>) : {};
+  const retryStatusCodes = Array.isArray(routingRaw.retryStatusCodes)
+    ? routingRaw.retryStatusCodes.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+    : [402, 403, 429, 503];
+  const consoleRaw = isObject(record.providerConsole) ? (record.providerConsole as Record<string, unknown>) : {};
+  const proactiveRaw = isObject(record.proactiveUpstreamSync) ? (record.proactiveUpstreamSync as Record<string, unknown>) : {};
+  const promptCacheRaw = isObject(record.promptCacheAffinity) ? (record.promptCacheAffinity as Record<string, unknown>) : {};
+  // Coerce upgrade-sensitive fields so a single missing/empty value cannot blank settings.
+  // Backend handler no longer returns providerConsole.userAgent, proactiveUpstreamSync,
+  // promptCacheAffinity, or routing.retryStatusCodes/retryServerErrors — backfill defaults
+  // so the validator passes and the form has sane initial values.
+  const withBuffer = {
+    ...record,
+    providerWeb: { ...webRaw, statsigMode },
+    providerConsole: {
+      ...consoleRaw,
+      userAgent: coerceString(consoleRaw.userAgent, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    },
+    proactiveUpstreamSync: {
+      billing: coerceBoolean(proactiveRaw.billing, false),
+      webQuota: coerceBoolean(proactiveRaw.webQuota, false),
+      modelCatalogCatchup: coerceBoolean(proactiveRaw.modelCatalogCatchup, false),
+      allowManualBillingRefresh: coerceBoolean(proactiveRaw.allowManualBillingRefresh, true),
+      allowManualQuotaRefresh: coerceBoolean(proactiveRaw.allowManualQuotaRefresh, true),
+    },
+    batch: {
+      ...batchRaw,
+      dbBuffer: normalizeDBBuffer(batchRaw.dbBuffer),
+    },
+    routing: {
+      ...routingRaw,
+      retryStatusCodes,
+      retryServerErrors: coerceBoolean(routingRaw.retryServerErrors, true),
+    },
+    promptCacheAffinity: {
+      enabled: coerceBoolean(promptCacheRaw.enabled, true),
+      fingerprint: coerceBoolean(promptCacheRaw.fingerprint, true),
+      expire: coerceBoolean(promptCacheRaw.expire, true),
+      ttl: typeof promptCacheRaw.ttl === "string" && promptCacheRaw.ttl ? promptCacheRaw.ttl : "24h",
     },
   };
-};
-const egressSourceValidator = hasShape({
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean, urlConfigured: isBoolean,
-  proxyConfigured: isOptional(isBoolean),
-  refreshIntervalSeconds: isNumber, defaultAccountCapacity: isNumber, lastSyncedAt: isOptional(isString), nextSyncAt: isOptional(isString),
-  lastSyncImported: isNumber, lastSyncError: isOptional(isString),
+  if (!settingsConfigValidator(withBuffer)) {
+    throw new Error("settings config response shape is invalid");
+  }
+  return withBuffer as SettingsConfigDTO;
+}
+
+const settingsConfigValidator = hasShape({
+  providerBuild: hasShape({ baseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString, responseHeaderTimeout: isString }),
+  providerWeb: hasShape({
+    baseURL: isString, quotaTimeout: isString, chatTimeout: isString, imageTimeout: isString, videoTimeout: isString,
+    statsigMode: isOneOf("local", "manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
+    statsigSignerURL: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, recoveryBackoffBase: isString, recoveryBackoffMax: isString,
+    flareSolverrEnabled: isOptional(isBoolean), flareSolverrURL: isOptional(isString), flareSolverrTargetURL: isOptional(isString),
+    flareSolverrTimeout: isOptional(isString), flareSolverrRefreshInterval: isOptional(isString),
+  }),
+  providerConsole: hasShape({ baseURL: isString, userAgent: isString, chatTimeout: isString }),
+  proactiveUpstreamSync: hasShape({
+    billing: isBoolean, webQuota: isBoolean, modelCatalogCatchup: isBoolean,
+    allowManualBillingRefresh: isBoolean, allowManualQuotaRefresh: isBoolean,
+  }),
+  // dbBuffer is normalized before validation; accept any object/missing here.
+  batch: hasShape({
+    importConcurrency: isNumber, conversionConcurrency: isNumber, syncConcurrency: isNumber, refreshConcurrency: isNumber, randomDelay: isString,
+    dbBuffer: (value) => value === undefined || isObject(value) || hasShape({
+      enabled: isBoolean, driver: isOneOf("none", "redis", "sqlite"), path: isOptional(isString),
+    })(value),
+  }),
+  media: hasShape({ maxImageBytes: isNumber, maxTotalBytes: isNumber, cleanupThresholdPercent: isNumber, cleanupInterval: isString }),
+  routing: hasShape({
+    stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, deprioritizeFailedAccounts: isOptional(isBoolean),
+    retryStatusCodes: isArrayOf(isNumber), retryServerErrors: isBoolean,
+  }),
+  promptCacheAffinity: hasShape({
+    enabled: isBoolean, fingerprint: isBoolean, expire: isBoolean, ttl: isString,
+  }),
+  audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString }),
+  clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
 });
-const decodeEgressSourceRaw = createObjectDecoder<EgressSourceWireDTO>("egress source", {
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset"), enabled: isBoolean, urlConfigured: isBoolean,
-  proxyConfigured: isOptional(isBoolean),
-  refreshIntervalSeconds: isNumber, defaultAccountCapacity: isNumber, lastSyncedAt: isOptional(isString), nextSyncAt: isOptional(isString),
-  lastSyncImported: isNumber, lastSyncError: isOptional(isString),
-});
-const decodeEgressSource = (value: unknown) => withEgressSourceDefaults(decodeEgressSourceRaw(value));
-type EgressSourceListWireDTO = {
-  items: EgressSourceWireDTO[];
-  page?: number;
-  pageSize?: number;
-  total?: number;
-};
-const decodeEgressSourceListRaw = createObjectDecoder<EgressSourceListWireDTO>("egress source list", {
-  items: isArrayOf(egressSourceValidator), page: isOptional(isNumber), pageSize: isOptional(isNumber), total: isOptional(isNumber),
-});
-const decodeEgressSourceList = (value: unknown): EgressSourceListDTO => {
-  const decoded = decodeEgressSourceListRaw(value);
+
+const decodeSettingsSnapshot: ApiDecoder<SettingsSnapshotDTO> = (value) => {
+  if (!isObject(value)) throw new Error("settings response shape is invalid");
+  const record = value as Record<string, unknown>;
+  const config = normalizeSettingsConfig(record.config);
+  if (!hasShape({ clientVersion: isString, userAgent: isString })(record.recommendedProviderBuild)) {
+    throw new Error("settings recommendedProviderBuild shape is invalid");
+  }
+  const recommended = record.recommendedProviderBuild as { clientVersion: string; userAgent: string };
+  const updatedAt = coerceString(record.updatedAt);
+  const revision = coerceString(record.revision);
+  if (!updatedAt || !revision) throw new Error("settings revision/updatedAt missing");
+  const restartRequired = Array.isArray(record.restartRequired)
+    ? record.restartRequired.filter((item): item is string => typeof item === "string")
+    : [];
   return {
-    ...decoded,
-    items: decoded.items.map(withEgressSourceDefaults),
-    page: decoded.page ?? 1,
-    pageSize: decoded.pageSize ?? Math.max(20, decoded.items.length),
-    total: decoded.total ?? decoded.items.length,
+    config,
+    recommendedProviderBuild: recommended,
+    updatedAt,
+    revision,
+    restartRequired,
   };
 };
-const decodeEgressImportResult = createObjectDecoder<EgressImportResultDTO>("egress import result", { imported: isNumber, skipped: isNumber });
-const decodeEgressProbeBatchResult = createObjectDecoder<EgressProbeBatchResultDTO>("egress probe result", { requested: isNumber, healthy: isNumber, unhealthy: isNumber });
-const decodeEgressRebalanceResult = createObjectDecoder<EgressRebalanceResultDTO>("egress rebalance result", { assigned: isNumber, rebalanced: isNumber, unplaced: isNumber });
-const egressFallbackConfigValidator = hasShape({ mode: isOneOf("none", "direct", "fixed"), nodeId: isOptional(isString) });
-const decodeEgressOperationsConfigRaw = createObjectDecoder<EgressOperationsConfigWireDTO>("egress operations config", {
-  probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")), probeIntervalSeconds: isNumber, autoAssignEnabled: isBoolean, autoBalanceEnabled: isBoolean, assignmentIntervalSeconds: isNumber,
-  fallbacks: isRecordOf(egressFallbackConfigValidator), updatedAt: isString,
-});
-const decodeEgressOperationsConfig = (value: unknown): EgressOperationsConfigDTO => {
-  const decoded = decodeEgressOperationsConfigRaw(value);
-  return { ...decoded, probeProvider: decoded.probeProvider ?? "cloudflare" };
+// Keep strict-ish probe validators; list/report use resilient normalizers so one
+// unexpected field (or historical scope typo) cannot blank the entire page.
+function normalizeEgressProbe(raw: unknown): EgressProbeDTO | null {
+  if (!isObject(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const nodeId = coerceString(record.nodeId);
+  const name = coerceString(record.name);
+  if (!nodeId || !name) return null;
+  return {
+    nodeId,
+    name,
+    scope: coerceScope(record.scope),
+    ok: coerceBoolean(record.ok),
+    latencyMs: coerceNumber(record.latencyMs),
+    status: typeof record.status === "number" ? record.status : undefined,
+    error: typeof record.error === "string" ? record.error : undefined,
+    proxyUsed: coerceBoolean(record.proxyUsed),
+    checkedAt: coerceString(record.checkedAt, new Date().toISOString()),
+  };
+}
+
+const decodeEgressProbe: ApiDecoder<EgressProbeDTO> = (value) => {
+  const probe = normalizeEgressProbe(value);
+  if (!probe) throw new Error("egress probe response shape is invalid");
+  return probe;
 };
-const decodeEgressProbeResultRaw = createObjectDecoder<EgressProbeResultWireDTO>("egress probe", {
-  status: isOneOf("unknown", "healthy", "unhealthy"), testedAt: isString, latencyMs: isNumber, exitIp: isOptional(isString), error: isOptional(isString), probeProvider: isOptional(isOneOf("ipinfo", "cloudflare")),
-  ipv4: isOptional(egressIPProbeValidator), ipv6: isOptional(egressIPProbeValidator),
-});
-const decodeEgressProbeResult = (value: unknown): EgressProbeResultDTO => {
-  const decoded = decodeEgressProbeResultRaw(value);
-  return { ...decoded, ipv4: decoded.ipv4 ?? unknownEgressIPProbe(), ipv6: decoded.ipv6 ?? unknownEgressIPProbe() };
+
+const decodeEgressProbeBatch: ApiDecoder<EgressProbeBatchDTO> = (value) => {
+  if (!isObject(value)) throw new Error("egress probe batch response shape is invalid");
+  const record = value as Record<string, unknown>;
+  const itemsRaw = Array.isArray(record.items) ? record.items : [];
+  const items = itemsRaw.map(normalizeEgressProbe).filter((item): item is EgressProbeDTO => item !== null);
+  return {
+    items,
+    total: coerceNumber(record.total, items.length),
+    passed: coerceNumber(record.passed, items.filter((item) => item.ok).length),
+    failed: coerceNumber(record.failed, items.filter((item) => !item.ok).length),
+  };
 };
 
 export function getSettings(): Promise<SettingsSnapshotDTO> {
@@ -340,167 +418,82 @@ export function updateSettings(revision: string, config: SettingsConfigDTO): Pro
   return apiRequest("/api/admin/v1/settings", { method: "PUT", body: { revision, config } }, decodeSettingsSnapshot);
 }
 
-type ListEgressNodesInput = {
-  page?: number;
-  pageSize?: number;
-  search?: string;
-  scope?: EgressScope | "";
-  enabled?: string;
-  probe?: string;
-  assignment?: string;
-  sortBy?: string;
-  sortOrder?: SortOrder;
-};
-
-export function listEgressNodes(input: ListEgressNodesInput = {}): Promise<EgressNodeListDTO> {
-  const query = new URLSearchParams({ page: String(input.page ?? 1), pageSize: String(input.pageSize ?? 20) });
-  if (input.search) query.set("search", input.search);
-  if (input.scope) query.set("scope", input.scope);
-  if (input.enabled) query.set("enabled", input.enabled);
-  if (input.probe) query.set("probe", input.probe);
-  if (input.assignment) query.set("assignment", input.assignment);
-  if (input.sortBy && input.sortOrder) {
+export function listEgressNodes(input?: { sortBy?: string; sortOrder?: SortOrder; scope?: EgressScope }): Promise<EgressNodeListDTO> {
+  const query = new URLSearchParams();
+  if (input?.sortBy && input.sortOrder) {
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
   }
-  return apiRequest(`/api/admin/v1/egress-nodes?${query}`, {}, decodeEgressNodeList);
+  if (input?.scope) query.set("scope", input.scope);
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return apiRequest(`/api/admin/v1/egress-nodes${suffix}`, {}, decodeEgressNodeListResilient);
 }
 
-export async function listAllEgressNodes(input: Omit<ListEgressNodesInput, "page" | "pageSize"> = {}): Promise<EgressNodeListDTO> {
-  const pageSize = 2000;
-  const first = await listEgressNodes({ ...input, page: 1, pageSize });
-  const items = [...first.items];
-  for (let page = 2; items.length < first.total; page += 1) {
-    const next = await listEgressNodes({ ...input, page, pageSize });
-    if (next.items.length === 0) break;
-    items.push(...next.items);
-  }
-  return { ...first, items, page: 1, pageSize, total: items.length };
+export function getEgressReport(scope?: EgressScope): Promise<EgressReportDTO> {
+  const suffix = scope ? `?scope=${encodeURIComponent(scope)}` : "";
+  return apiRequest(`/api/admin/v1/egress-nodes/report${suffix}`, {}, decodeEgressReportResilient);
+}
+
+export function testEgressNode(id: string): Promise<EgressProbeDTO> {
+  return apiRequest(`/api/admin/v1/egress-nodes/${id}/test`, { method: "POST" }, decodeEgressProbe);
+}
+
+export function testAllEgressNodes(scope?: EgressScope): Promise<EgressProbeBatchDTO> {
+  const suffix = scope ? `?scope=${encodeURIComponent(scope)}` : "";
+  return apiRequest(`/api/admin/v1/egress-nodes/test${suffix}`, { method: "POST" }, decodeEgressProbeBatch);
 }
 
 export function createEgressNode(input: EgressNodeInput): Promise<EgressNodeDTO> {
-  return apiRequest("/api/admin/v1/egress-nodes", { method: "POST", body: input }, decodeEgressNode);
+  return apiRequest("/api/admin/v1/egress-nodes", {
+    method: "POST",
+    body: {
+      ...input,
+      scope: input.scopes[0] ?? input.scope,
+      scopes: input.scopes,
+    },
+  }, decodeEgressNodeResilient);
+}
+
+export function createEgressNodesBatch(input: EgressBatchImportInput): Promise<EgressBatchImportResultDTO> {
+  return apiRequest("/api/admin/v1/egress-nodes/batch", {
+    method: "POST",
+    body: {
+      namePrefix: input.namePrefix,
+      scope: input.scopes[0] ?? input.scope,
+      scopes: input.scopes,
+      enabled: input.enabled,
+      proxyText: input.proxyText,
+      userAgent: input.userAgent ?? "",
+      cloudflareCookies: input.cloudflareCookies,
+    },
+  }, decodeEgressBatchImport);
 }
 
 export function updateEgressNode(id: string, input: EgressNodeInput): Promise<EgressNodeDTO> {
-  return apiRequest(`/api/admin/v1/egress-nodes/${id}`, { method: "PUT", body: input }, decodeEgressNode);
-}
-
-export function getEgressNodeProxyURL(id: string): Promise<{ proxyURL: string }> {
-  return apiRequest(`/api/admin/v1/egress-nodes/${id}/proxy-url/reveal`, { method: "POST" }, createObjectDecoder<{ proxyURL: string }>("egress proxy URL", { proxyURL: isString }));
-}
-
-export function listEgressProxyProfiles(input: { page?: number; pageSize?: number; search?: string } = {}): Promise<EgressProxyProfileListDTO> {
-	const query = new URLSearchParams({ page: String(input.page ?? 1), pageSize: String(input.pageSize ?? 20) });
-	if (input.search) query.set("search", input.search);
-	return apiRequest(`/api/admin/v1/egress-proxy-profiles?${query}`, {}, decodeEgressProxyProfiles);
-}
-
-export function createEgressProxyProfile(input: EgressProxyProfileInput): Promise<EgressProxyProfileDTO> {
-  return apiRequest("/api/admin/v1/egress-proxy-profiles", { method: "POST", body: input }, decodeEgressProxyProfile);
-}
-
-export function getEgressProxyProfile(id: string): Promise<EgressProxyProfileDTO> {
-	return apiRequest(`/api/admin/v1/egress-proxy-profiles/${id}`, {}, decodeEgressProxyProfile);
-}
-
-export function updateEgressProxyProfile(id: string, input: EgressProxyProfileInput): Promise<EgressProxyProfileDTO> {
-  return apiRequest(`/api/admin/v1/egress-proxy-profiles/${id}`, { method: "PUT", body: input }, decodeEgressProxyProfile);
-}
-
-export function deleteEgressProxyProfile(id: string): Promise<{ deleted: boolean }> {
-  return apiRequest(`/api/admin/v1/egress-proxy-profiles/${id}`, { method: "DELETE" }, decodeBooleanResult<{ deleted: boolean }>("deleted"));
-}
-
-export function getEgressProxyProfileURL(id: string): Promise<{ proxyURL: string }> {
-  return apiRequest(`/api/admin/v1/egress-proxy-profiles/${id}/proxy-url/reveal`, { method: "POST" }, createObjectDecoder<{ proxyURL: string }>("egress proxy profile URL", { proxyURL: isString }));
+  return apiRequest(`/api/admin/v1/egress-nodes/${id}`, {
+    method: "PUT",
+    body: {
+      ...input,
+      scope: input.scopes[0] ?? input.scope,
+      scopes: input.scopes,
+    },
+  }, decodeEgressNodeResilient);
 }
 
 export function deleteEgressNode(id: string): Promise<{ deleted: boolean }> {
   return apiRequest(`/api/admin/v1/egress-nodes/${id}`, { method: "DELETE" }, decodeBooleanResult<{ deleted: boolean }>("deleted"));
 }
 
-export function deleteEgressNodes(ids: string[]): Promise<{ deleted: number }> {
-  return apiRequest("/api/admin/v1/egress-nodes", { method: "DELETE", body: { ids } }, createObjectDecoder<{ deleted: number }>("egress node batch delete", { deleted: isNumber }));
+export function setEgressNodesEnabled(ids: string[], enabled: boolean): Promise<{ updated: number; enabled: boolean }> {
+  return apiRequest("/api/admin/v1/egress-nodes/batch-enabled", {
+    method: "POST",
+    body: { ids, enabled },
+  }, createObjectDecoder("egress batch enabled", { updated: isNumber, enabled: isBoolean }));
 }
 
-export function updateEgressNodesEnabled(ids: string[], enabled: boolean): Promise<{ updated: number }> {
-  return apiRequest("/api/admin/v1/egress-nodes/batch", { method: "PATCH", body: { ids, enabled } }, createObjectDecoder<{ updated: number }>("egress node batch update", { updated: isNumber }));
-}
-
-export function previewUnhealthyEgressNodes(): Promise<EgressUnhealthyCleanupPreviewDTO> {
-  return apiRequest("/api/admin/v1/egress-nodes/cleanup-preview", {}, createObjectDecoder<EgressUnhealthyCleanupPreviewDTO>("egress node cleanup preview", {
-    nodes: isNumber, boundAccounts: isNumber, subscriptionManaged: isNumber,
-  }));
-}
-
-export function cleanupUnhealthyEgressNodes(): Promise<{ deleted: number }> {
-  return apiRequest("/api/admin/v1/egress-nodes/cleanup", { method: "POST" }, createObjectDecoder<{ deleted: number }>("egress node cleanup", { deleted: isNumber }));
-}
-
-export function refreshEgressClearance(id: string): Promise<{ refreshed: boolean }> {
-  return apiRequest(`/api/admin/v1/egress-nodes/${id}/refresh-clearance`, { method: "POST" }, decodeBooleanResult<{ refreshed: boolean }>("refreshed"));
-}
-
-export function testEgressNode(id: string): Promise<EgressProbeResultDTO> {
-  return apiRequest(`/api/admin/v1/egress-nodes/${id}/test`, { method: "POST" }, decodeEgressProbeResult);
-}
-
-export function testEgressNodes(ids?: string[]): Promise<EgressProbeBatchResultDTO> {
-  return apiRequest("/api/admin/v1/egress-nodes/test", { method: "POST", body: { ids: ids ?? [] } }, decodeEgressProbeBatchResult);
-}
-
-type ListEgressSourcesInput = {
-  page?: number;
-  pageSize?: number;
-  search?: string;
-  scope?: EgressScope;
-};
-
-export function listEgressSources(input?: ListEgressSourcesInput): Promise<EgressSourceListDTO> {
-  if (!input) return apiRequest("/api/admin/v1/egress-sources", {}, decodeEgressSourceList);
-  const query = new URLSearchParams({ page: String(input.page ?? 1), pageSize: String(input.pageSize ?? 20) });
-  if (input.search) query.set("search", input.search);
-  if (input.scope) query.set("scope", input.scope);
-  return apiRequest(`/api/admin/v1/egress-sources?${query}`, {}, decodeEgressSourceList);
-}
-
-export function createEgressSource(input: EgressSourceInput): Promise<EgressSourceDTO> {
-  return apiRequest("/api/admin/v1/egress-sources", { method: "POST", body: input }, decodeEgressSource);
-}
-
-export function updateEgressSource(id: string, input: EgressSourceInput): Promise<EgressSourceDTO> {
-  return apiRequest(`/api/admin/v1/egress-sources/${id}`, { method: "PUT", body: input }, decodeEgressSource);
-}
-
-export function deleteEgressSource(id: string): Promise<{ deleted: boolean }> {
-  return apiRequest(`/api/admin/v1/egress-sources/${id}`, { method: "DELETE" }, decodeBooleanResult<{ deleted: boolean }>("deleted"));
-}
-
-export function syncEgressSource(id: string): Promise<EgressImportResultDTO> {
-  return apiRequest(`/api/admin/v1/egress-sources/${id}/sync`, { method: "POST" }, decodeEgressImportResult);
-}
-
-export function importEgressText(input: { name: string; scope: EgressScope; accountCapacity: number; content: string }): Promise<EgressImportResultDTO> {
-  return apiRequest("/api/admin/v1/egress-imports", { method: "POST", body: input }, decodeEgressImportResult);
-}
-
-export function getEgressOperationsConfig(): Promise<EgressOperationsConfigDTO> {
-  return apiRequest("/api/admin/v1/egress-operations", {}, decodeEgressOperationsConfig);
-}
-
-export function updateEgressOperationsConfig(input: Omit<EgressOperationsConfigDTO, "updatedAt">): Promise<EgressOperationsConfigDTO> {
-  return apiRequest("/api/admin/v1/egress-operations", { method: "PUT", body: input }, decodeEgressOperationsConfig);
-}
-
-export function rebalanceEgressAccounts(): Promise<EgressRebalanceResultDTO> {
-  return apiRequest("/api/admin/v1/egress-operations/rebalance", { method: "POST" }, decodeEgressRebalanceResult);
-}
-
-export function assignEgressAccounts(nodeID: string, provider: "grok_build" | "grok_web" | "grok_console", ids: string[], mode: "manual" | "auto" = "manual"): Promise<{ assigned: number }> {
-  return apiRequest(`/api/admin/v1/egress-nodes/${nodeID}/accounts`, { method: "POST", body: { provider, ids, mode } }, createObjectDecoder<{ assigned: number }>("egress account assignment", { assigned: isNumber }));
-}
-
-export function unassignEgressAccounts(provider: "grok_build" | "grok_web" | "grok_console", ids: string[]): Promise<{ assigned: number }> {
-  return apiRequest("/api/admin/v1/egress-nodes/accounts", { method: "DELETE", body: { provider, ids } }, createObjectDecoder<{ assigned: number }>("egress account assignment", { assigned: isNumber }));
+export function clearEgressNodesErrors(ids: string[]): Promise<{ cleared: number }> {
+  return apiRequest("/api/admin/v1/egress-nodes/batch-clear-errors", {
+    method: "POST",
+    body: { ids },
+  }, createObjectDecoder("egress batch clear errors", { cleared: isNumber }));
 }

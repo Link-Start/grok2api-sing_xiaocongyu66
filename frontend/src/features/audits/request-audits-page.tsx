@@ -106,7 +106,7 @@ export function RequestAuditsPage() {
   });
   const accountFilterOptionsQuery = useQuery({
     queryKey: ["accounts", "audit-filter", debouncedAccountFilterOptionsSearch],
-    queryFn: () => listAccounts({ page: 1, pageSize: AUDIT_FILTER_PAGE_SIZE, search: auditFilterOptionSearch(debouncedAccountFilterOptionsSearch) }),
+    queryFn: () => listAccounts({ page: 1, pageSize: AUDIT_FILTER_PAGE_SIZE, provider: "grok_build", search: auditFilterOptionSearch(debouncedAccountFilterOptionsSearch) }),
     enabled: accountFilterOptionsOpen,
     staleTime: 60_000,
   });

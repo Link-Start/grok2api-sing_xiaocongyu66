@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { AudioLines, Box, ChevronDown, Eye, FileStack, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Network, Settings, ShieldCheck, Sparkles, Sun, Users, Video } from "lucide-react";
+import { AudioLines, Box, ChevronDown, Eye, FileStack, Image, KeyRound, Languages, LayoutDashboard, LogOut, Menu, MessageSquareText, Monitor, Moon, MoreHorizontal, Network, Settings, Sparkles, Sun, Users, Video } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";

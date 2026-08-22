@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, Link2, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, TimerOff, Trash2, TriangleAlert, Webhook } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link2, MoreHorizontal, Pencil, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Webhook } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -33,9 +33,6 @@ import { cn } from "@/shared/lib/cn";
 import { formatDateTime, formatNumber } from "@/shared/lib/format";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
 import {
-  acceptWebAccountTerms,
-  cleanupAccounts,
-  clearAccountCooldown,
   convertWebAccountsToBuild,
   dedupSSOByEmail,
   deleteAccount,
@@ -180,11 +177,11 @@ export function AccountsPage() {
       if (!editing) throw new Error(t("errors.generic"));
       const input: AccountUpdateInput = {
         name: values.name,
+        enabled: values.enabled,
         priority: values.priority,
         maxConcurrent: values.maxConcurrent,
         minimumRemaining: values.minimumRemaining,
       };
-      if (values.enabled !== editing.enabled) input.enabled = values.enabled;
       if (editing.provider !== "grok_build") {
         if (values.clearCloudflareCookies) input.clearCloudflareCookies = true;
         else if (values.cloudflareCookies.trim()) input.cloudflareCookies = values.cloudflareCookies;
@@ -194,9 +191,7 @@ export function AccountsPage() {
     onSuccess: () => {
       invalidateAccountData();
       setEditing(null);
-      if (account.modelSyncFailed) toast.warning(t("accounts.updatedWithModelSyncFailure"));
-      else if (account.enabledDoesNotClearCooldown) toast.warning(t("accounts.enabledDoesNotClearCooldown"));
-      else toast.success(t("accounts.updated"));
+      toast.success(t("accounts.updated"));
     },
     onError: showError,
   });
@@ -225,15 +220,6 @@ export function AccountsPage() {
     onSuccess: () => {
       invalidateAccountData();
       toast.success(t("accounts.authRefreshed"));
-    },
-    onError: showError,
-  });
-
-  const clearCooldownMutation = useMutation({
-    mutationFn: clearAccountCooldown,
-    onSuccess: () => {
-      invalidateAccountData();
-      toast.success(t("accounts.cooldownCleared"));
     },
     onError: showError,
   });
@@ -343,10 +329,6 @@ export function AccountsPage() {
       importAbortRef.current = null;
       setQuickImportOpen(false);
       setQuickImportTokens("");
-      if (result.failed > 0) {
-        toast.warning(t("accounts.importedWithFailures", result));
-        return;
-      }
       if (result.syncFailed > 0) {
         toast.warning(t("accounts.importedWithSyncFailures", result));
         return;
@@ -549,7 +531,7 @@ export function AccountsPage() {
   function submitQuickImport(): void {
     const value = quickImportTokens.trim();
     if (!value) return;
-    const filename = provider === "grok_build" ? "grok-build-refresh-tokens.txt" : provider === "grok_console" ? "grok-console-sso-tokens.txt" : "grok-web-sso-tokens.txt";
+    const filename = provider === "grok_console" ? "grok-console-sso-tokens.txt" : "grok-web-sso-tokens.txt";
     importMutation.mutate([new File([value], filename, { type: "text/plain" })]);
   }
 
@@ -632,35 +614,22 @@ export function AccountsPage() {
 
   const summary = summaryQuery.data;
   const recoveringAccounts = summary?.recovering ?? 0;
-  const cooldownAccounts = summary?.recovery.cooldown ?? 0;
-  const waitingResetAccounts = summary?.recovery.waitingReset ?? 0;
-  const probingAccounts = summary?.recovery.probing ?? 0;
-  const disabledAccounts = summary?.issues.disabled ?? 0;
-  const invalidAccounts = summary?.issues.reauthRequired ?? 0;
-  const riskAccounts = summary?.risk ?? 0;
-  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts;
-  const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0 };
-  const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0 };
-  const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0 };
+  const attentionAccounts = summary?.attention ?? 0;
+  const abnormalAccounts = recoveringAccounts + attentionAccounts;
+  const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
+  const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
+  const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0, reauthRequired: 0, disabled: 0 };
+  const webPools = summary?.webPools ?? {
+    basic: { total: 0, available: 0 },
+    super: { total: 0, available: 0 },
+    heavy: { total: 0, available: 0 },
+    auto: { total: 0, available: 0 },
+  };
+  const consoleQuota = summary?.consoleQuota ?? {
+    total: 0, available: 0, healthy: 0, rotating: 0, exhausted: 0, remaining: 0, capacity: 0,
+  };
   const summaryLoading = summaryQuery.isPending;
   const summaryUnavailable = summaryQuery.isError;
-  const abnormalBreakdown = [
-    { label: t("accounts.statusCooldown"), count: cooldownAccounts, tone: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
-    { label: t("accounts.waitingReset"), count: waitingResetAccounts, tone: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
-    { label: t("accounts.probing"), count: probingAccounts, tone: "bg-sky-500/10 text-sky-700 dark:text-sky-300" },
-    { label: t("accounts.riskFilter"), count: riskAccounts, tone: "bg-orange-500/10 text-orange-700 dark:text-orange-300" },
-    { label: t("accounts.statusDisabled"), count: disabledAccounts, tone: "bg-muted text-muted-foreground" },
-    { label: t("accounts.statusReauthRequired"), count: invalidAccounts, tone: "bg-red-500/10 text-red-700 dark:text-red-300" },
-  ];
-  const abnormalDetail = abnormalBreakdown.map((item) => `${item.label} ${formatNumber(item.count, i18n.language, 0)}`).join(" · ");
-  const abnormalDetailItems = summaryUnavailable
-    ? [{ label: "-", value: "", tone: "bg-muted text-muted-foreground" }]
-    : abnormalBreakdown
-      .filter((item) => item.count > 0)
-      .map((item) => ({ ...item, value: formatNumber(item.count, i18n.language, 0) }));
-  if (!summaryUnavailable && abnormalDetailItems.length === 0) {
-    abnormalDetailItems.push({ label: t("accounts.statusActive"), value: "", tone: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300", count: 0 });
-  }
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
   const providerReauthCount = summary?.providers[provider]?.reauthRequired ?? 0;
   const providerDisabledCount = summary?.providers[provider]?.disabled ?? 0;
@@ -682,52 +651,35 @@ export function AccountsPage() {
         <p className="sr-only">{t("console.accountsDescription")}</p>
       </header>
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <AccountMetricPanel tone="text-quota-product-1" icon={<SquareTerminal />} loading={summaryLoading} label={t("accounts.buildAccountCount")} value={summaryUnavailable ? "-" : formatNumber(buildSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(buildSummary.available, i18n.language, 0) })} />
-        <AccountMetricPanel tone="text-quota-product-2" icon={<Compass />} loading={summaryLoading} label={t("accounts.webAccountCount")} value={summaryUnavailable ? "-" : formatNumber(webSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(webSummary.available, i18n.language, 0) })} />
-        <AccountMetricPanel tone="text-quota-product-4" icon={<Webhook />} loading={summaryLoading} label={t("accounts.consoleAccountCount")} value={summaryUnavailable ? "-" : formatNumber(consoleSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(consoleSummary.available, i18n.language, 0) })} />
-        <AccountMetricPanel
-          tone={abnormalAccounts > 0 ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"}
-          icon={<TriangleAlert />}
-          loading={summaryLoading}
-          label={t("accounts.abnormalAccountCount")}
-          value={summaryUnavailable ? "-" : formatNumber(abnormalAccounts, i18n.language, 0)}
-          detail={abnormalDetail}
-          detailItems={abnormalDetailItems}
-        />
+        <AccountMetricPanel icon={<SquareTerminal />} loading={summaryLoading} label={t("accounts.buildAccountCount")} value={summaryUnavailable ? "-" : formatNumber(buildSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(buildSummary.available, i18n.language, 0) })} />
+        <AccountMetricPanel icon={<Compass />} loading={summaryLoading} label={t("accounts.webAccountCount")} value={summaryUnavailable ? "-" : formatNumber(webSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(webSummary.available, i18n.language, 0) })} />
+        <AccountMetricPanel icon={<Webhook />} loading={summaryLoading} label={t("accounts.consoleAccountCount")} value={summaryUnavailable ? "-" : formatNumber(consoleSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(consoleSummary.available, i18n.language, 0) })} />
+        <AccountMetricPanel icon={<TriangleAlert />} loading={summaryLoading} label={t("accounts.abnormalAccountCount")} value={summaryUnavailable ? "-" : formatNumber(abnormalAccounts, i18n.language, 0)} detail={t("accounts.abnormalAccountBreakdown", { recovering: formatNumber(recoveringAccounts, i18n.language, 0), attention: formatNumber(attentionAccounts, i18n.language, 0) })} />
       </section>
-      <div className="space-y-5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <Tabs value={provider} onValueChange={(value) => changeProvider(value as AccountProvider)}>
-            <TabsList>
-              <TabsTrigger value="grok_build" className="gap-1.5">
-                <SquareTerminal className="size-3.5 text-quota-product-1" />
-                <span>Grok Build</span>
-              </TabsTrigger>
-              <TabsTrigger value="grok_web" className="gap-1.5">
-                <Compass className="size-3.5 text-quota-product-2" />
-                <span>Grok Web</span>
-              </TabsTrigger>
-              <TabsTrigger value="grok_console" className="gap-1.5">
-                <Webhook className="size-3.5 text-quota-product-4" />
-                <span>Grok Console</span>
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild><Button size="sm"><Plus />{t("accounts.connectAccount")}</Button></DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {provider === "grok_build" ? <DropdownMenuItem onClick={() => void startDeviceLogin()}><ExternalLink />{t("accounts.deviceLogin")}</DropdownMenuItem> : null}
-              <DropdownMenuItem disabled={bulkTaskPending} onClick={() => setQuickImportOpen(true)}><ClipboardPaste />{t(provider === "grok_build" ? "accounts.quickImportRT" : "accounts.quickImportSSO")}</DropdownMenuItem>
-              <DropdownMenuItem disabled={bulkTaskPending} onClick={() => fileInputRef.current?.click()}><FileUp />{provider === "grok_build" ? t("accounts.importAuth") : provider === "grok_console" ? t("console.importFile") : t("accounts.importWebFile")}</DropdownMenuItem>
-              {hasProviderAccounts ? (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={openProviderExport}><Download />{t("accounts.exportAuth")}</DropdownMenuItem>
-                </>
-              ) : null}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+      <div className="space-y-6">
+        <Tabs value={provider} onValueChange={(value) => changeProvider(value as AccountProvider)}>
+          <TabsList>
+            <TabsTrigger value="grok_build">Grok Build</TabsTrigger>
+            <TabsTrigger value="grok_web">Grok Web</TabsTrigger>
+            <TabsTrigger value="grok_console">Grok Console</TabsTrigger>
+          </TabsList>
+        </Tabs>
+        {provider === "grok_web" ? (
+          <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolBasic")} total={webPools.basic.total} available={webPools.basic.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolSuper")} total={webPools.super.total} available={webPools.super.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolHeavy")} total={webPools.heavy.total} available={webPools.heavy.available} locale={i18n.language} />
+            <PoolMetricPanel loading={summaryLoading} unavailable={summaryUnavailable} label={t("accounts.poolAuto")} total={webPools.auto.total} available={webPools.auto.available} locale={i18n.language} />
+          </section>
+        ) : null}
+        {provider === "grok_console" ? (
+          <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <AccountMetricPanel icon={<Webhook />} loading={summaryLoading} label={t("accounts.consoleQuotaRemaining")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.remaining, i18n.language, 0)} detail={t("accounts.consoleQuotaCapacity", { capacity: formatNumber(consoleQuota.capacity, i18n.language, 0) })} />
+            <AccountMetricPanel icon={<Compass />} loading={summaryLoading} label={t("accounts.consoleQuotaHealthy")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.healthy, i18n.language, 0)} detail={t("accounts.consoleQuotaHealthyDetail")} />
+            <AccountMetricPanel icon={<RefreshCw />} loading={summaryLoading} label={t("accounts.consoleQuotaRotating")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.rotating, i18n.language, 0)} detail={t("accounts.consoleQuotaRotatingDetail")} />
+            <AccountMetricPanel icon={<TriangleAlert />} loading={summaryLoading} label={t("accounts.consoleQuotaExhausted")} value={summaryUnavailable ? "-" : formatNumber(consoleQuota.exhausted, i18n.language, 0)} detail={t("accounts.consoleQuotaExhaustedDetail")} />
+          </section>
+        ) : null}
         <input
           ref={fileInputRef}
           type="file"
@@ -920,11 +872,6 @@ export function AccountsPage() {
                           {provider === "grok_web" ? <DropdownMenuItem onClick={() => openBuildConversion([account.id])}><ArrowRight />{t("accounts.convertToBuild")}</DropdownMenuItem> : null}
                           {provider === "grok_web" ? <DropdownMenuItem onClick={() => openWebConsoleSync([account.id])}><ArrowRight />{t("webConsoleSync.action")}</DropdownMenuItem> : null}
                           {provider === "grok_build" ? <DropdownMenuItem onClick={() => tokenMutation.mutate(account.id)}><RotateCw />{t("accounts.refreshToken")}</DropdownMenuItem> : null}
-                          {account.cooldownUntil && new Date(account.cooldownUntil) > new Date() ? (
-                            <DropdownMenuItem onClick={() => clearCooldownMutation.mutate(account.id)} disabled={clearCooldownMutation.isPending}>
-                              <TimerOff />{t("accounts.clearCooldown")}
-                            </DropdownMenuItem>
-                          ) : null}
                           <DropdownMenuItem onClick={() => provider === "grok_build" ? billingMutation.mutate(account.id) : quotaMutation.mutate(account.id)}><RefreshCw />{provider === "grok_build" ? t("accounts.refreshBilling") : t("accounts.refreshModeQuota")}</DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => setDeleting(account)}><Trash2 />{t("common.delete")}</DropdownMenuItem>
@@ -1039,32 +986,19 @@ export function AccountsPage() {
       <Dialog open={quickImportOpen} onOpenChange={(open) => { setQuickImportOpen(open); if (!open) setQuickImportTokens(""); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t(provider === "grok_build" ? "accounts.quickImportRTTitle" : provider === "grok_console" ? "console.quickImportTitle" : "accounts.quickImportTitle")}</DialogTitle>
-            <DialogDescription>{t(provider === "grok_build" ? "accounts.quickImportRTDescription" : provider === "grok_console" ? "console.quickImportDescription" : "accounts.quickImportDescription")}</DialogDescription>
+            <DialogTitle>{t(provider === "grok_console" ? "console.quickImportTitle" : "accounts.quickImportTitle")}</DialogTitle>
+            <DialogDescription>{t(provider === "grok_console" ? "console.quickImportDescription" : "accounts.quickImportDescription")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="quick-account-tokens">{t(provider === "grok_build" ? "accounts.refreshTokens" : "accounts.ssoTokens")}</Label>
-              <Button type="button" variant="secondary" size="sm" disabled={importMutation.isPending} onClick={() => quickImportFileInputRef.current?.click()}><FileUp />{t("accounts.uploadTXT")}</Button>
-              <input
-                ref={quickImportFileInputRef}
-                type="file"
-                accept="text/plain,.txt"
-                className="hidden"
-                onChange={(event) => {
-                  void loadQuickImportFile(event.target.files?.[0]);
-                  event.target.value = "";
-                }}
-              />
-            </div>
+            <Label htmlFor="quick-sso-tokens">{t("accounts.ssoTokens")}</Label>
             <Textarea
-              id="quick-account-tokens"
+              id="quick-sso-tokens"
               className="min-h-56 font-mono"
               autoComplete="off"
               spellCheck={false}
               value={quickImportTokens}
               onChange={(event) => setQuickImportTokens(event.target.value)}
-              placeholder={t(provider === "grok_build" ? "accounts.refreshTokenPlaceholder" : "accounts.ssoTokenPlaceholder")}
+              placeholder={t("accounts.ssoTokenPlaceholder")}
             />
           </div>
           <DialogFooter>
@@ -1240,44 +1174,15 @@ function downloadAccountExport(blob: Blob): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function scopeSupportsAccountProvider(scope: EgressScope, provider: AccountProvider): boolean {
-  if (provider === "grok_build") return scope === "grok_build";
-  if (provider === "grok_web") return scope === "grok_web";
-  return scope === "grok_web" || scope === "grok_console";
-}
-
-function accountProviderPrimaryEgressScope(provider: AccountProvider): EgressScope {
-  return provider;
-}
-
-function AccountMetricPanel({ icon, label, value, detail, detailItems, loading, tone }: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-  detail: string;
-  detailItems?: Array<{ label: string; value: string; tone?: string }>;
-  loading: boolean;
-  tone: string;
-}) {
+function AccountMetricPanel({ icon, label, value, detail, loading }: { icon: ReactNode; label: string; value: string; detail: string; loading: boolean }) {
   return (
     <div className="min-h-28 rounded-lg bg-card p-4">
       <div className="flex items-center justify-between gap-3">
         <span className="text-xs text-muted-foreground">{label}</span>
         <span className="flex size-5 items-center justify-center text-muted-foreground [&_svg]:size-4">{icon}</span>
       </div>
-      <div className="mt-3 flex min-h-8 items-center text-2xl font-medium tracking-tight tabular-nums">{loading ? <Spinner /> : value}</div>
-      {detailItems ? (
-        <div className={cn("-ml-1.5 mt-1.5 flex min-h-5 flex-wrap gap-1 text-[11px] leading-4", loading && "invisible")} title={detail}>
-          {detailItems.map((item) => (
-            <span key={item.label} className={cn("inline-flex shrink-0 items-baseline gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5", item.tone ?? "bg-muted text-muted-foreground")}>
-              <span>{item.label}</span>
-              {item.value ? <span className="font-medium tabular-nums">{item.value}</span> : null}
-            </span>
-          ))}
-        </div>
-      ) : (
-        <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>{detail}</p>
-      )}
+      <div className="mt-3 flex min-h-7 items-center text-xl font-medium tabular-nums">{loading ? <Spinner /> : value}</div>
+      <p className={cn("mt-1 text-xs text-muted-foreground", loading && "invisible")}>{detail}</p>
     </div>
   );
 }
