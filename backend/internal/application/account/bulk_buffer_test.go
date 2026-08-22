@@ -144,7 +144,7 @@ func (r *bulkBufferRepoStub) UpdateObservedModel(context.Context, uint64, string
 func (r *bulkBufferRepoStub) MarkBuildAPIFallback(context.Context, uint64, bool) error {
 	return nil
 }
-func (r *bulkBufferRepoStub) UpdateHealth(context.Context, uint64, int, *time.Time, string, bool) error {
+func (r *bulkBufferRepoStub) UpdateHealth(context.Context, uint64, accountdomain.Provider, int, *time.Time, string, bool) error {
 	return nil
 }
 func (r *bulkBufferRepoStub) UpsertModelQuotaBlock(context.Context, accountdomain.ModelQuotaBlock) error {
